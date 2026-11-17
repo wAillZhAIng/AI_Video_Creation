@@ -10,6 +10,7 @@ from app.core.paths import safe_media_path
 from app.schemas_routing import TaskSlot, RouteSettings, RouteProfile, TaskCandidate
 from app.services.ai_services import service_snapshot
 from app.services.runtime_registry import file_sha, manifest_status
+from app.services.service_acceptance import accepted_evidence
 
 SLOTS={
  'script_planning':('剧本解析与镜头规划',['language_processing']),
@@ -195,7 +196,8 @@ def candidate(session,settings,service,slot,model_id=None):
     if service.module not in SLOTS[slot][1]:reasons.append('Service module does not support this slot')
     if service.provider=='cloud_draft':reasons.append('No execution adapter for draft cloud profile')
     if slot=='motion_driving':reasons.append('No verified motion-driving workflow adapter')
-    proof=_evidence(session,settings,service,model,slot) if not reasons else None
+    proof=(_evidence(session,settings,service,model,slot) or
+           accepted_evidence(settings,service,model,slot)) if not reasons else None
     if not proof:reasons.append('No matching real output evidence for current service/model/workflow')
     return TaskCandidate(service_id=service.id,model_id=model,name=service.name,provider=service.provider,module=service.module,
         is_cloud=snapshot['is_cloud'],enabled=service.enabled,eligible=not reasons,
