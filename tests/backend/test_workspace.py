@@ -130,6 +130,70 @@ def test_delete_dependency_and_path_protection(client,settings,tmp_path):
     assert outside.read_text()=='must survive'
 
 
+def test_project_cascade_handles_owned_postprocessing_and_preserves_external_references(client,settings):
+    with client.app.state.session_factory() as s:
+        project=m.Project(name='Deletion fixture')
+        other=m.Project(name='Independent project')
+        s.add_all([project,other]);s.flush()
+        shot=m.StoryboardShot(project_id=project.id,order=1)
+        run=m.StudioRun(project_id=project.id,status='waiting_review')
+        s.add_all([shot,run]);s.flush()
+        job=m.GenerationJob(project_id=project.id,shot_id=shot.id,provider='fixture',status='generated',prompt='fixture')
+        media=m.MediaProcessTask(project_id=project.id,shot_id=shot.id,kind='tts',slot='dialogue_generation',status='succeeded')
+        s.add_all([job,media]);s.flush()
+        source=m.VideoRevision(project_id=project.id,shot_id=shot.id,generation_job_id=job.id,
+            relative_path=f'fixtures/{job.id}.mp4',revision=1)
+        audio=m.AudioAsset(project_id=project.id,shot_id=shot.id,task_id=media.id,
+            relative_path=f'media_processing/{project.id}/{media.id}.wav',sha256='0'*64)
+        s.add_all([source,audio]);s.flush()
+        render=m.QualityRender(source_video_id=source.id,status='unknown',snapshot_json={'project_id':project.id})
+        s.add(render);s.flush()
+        render.relative_path=f'quality/{project.id}/{render.id}.mp4'
+        output=m.VideoRevision(project_id=project.id,shot_id=shot.id,generation_job_id=job.id,
+            relative_path=render.relative_path,revision=2,metadata_json={'quality_render_id':render.id})
+        s.add(output);s.flush();render.video_id=output.id
+        timeline=m.Assembly(project_id=other.id,name='External reference',timeline_json={'clips':[{'video_id':source.id}]})
+        route=m.RoutePolicy(scope='project',target_id=project.id,slot='video_upscale')
+        quality=m.QualityProfile(scope='shot',target_id=shot.id)
+        default=m.QualityProfile(scope='system',target_id='default')
+        s.add_all([timeline,route,quality,default]);s.flush()
+        dependents=[(type(item),item.id) for item in (run,job,source,output,render,media,audio,route,quality)]
+        project_id,other_id,timeline_id,render_id,source_id,default_id=(
+            project.id,other.id,timeline.id,render.id,source.id,default.id)
+        paths=[source.relative_path,output.relative_path,audio.relative_path]
+        s.commit()
+    for relative in paths:
+        target=settings.media_root/relative;target.parent.mkdir(parents=True,exist_ok=True)
+        target.write_bytes(b'synthetic deletion fixture')
+
+    plan,response=delete(client,'projects',[project_id],mode='trash',cascade=True)
+    assert response.status_code==409,response.text
+    assert {entry['id'] for entry in plan['blockers']}=={timeline_id,render_id}
+    with client.app.state.session_factory() as s:
+        s.get(m.Assembly,timeline_id).timeline_json={'clips':[]}
+        s.get(m.QualityRender,render_id).status='generated'
+        s.commit()
+    _,response=delete(client,'videos',[source_id],cascade=True)
+    assert response.status_code==409,response.text
+
+    plan,response=delete(client,'projects',[project_id],mode='trash',cascade=True)
+    assert response.status_code==200 and response.json()['status']=='completed',response.text
+    assert not plan['blockers']
+    task=response.json()['id']
+    with client.app.state.session_factory() as s:
+        assert s.get(m.Project,project_id) is None
+        assert all(s.get(model,identifier) is None for model,identifier in dependents)
+        assert s.get(m.Project,other_id) and s.get(m.Assembly,timeline_id) and s.get(m.QualityProfile,default_id)
+    for relative in paths:
+        assert not (settings.media_root/relative).exists()
+        assert (settings.media_root/'.recycle'/task/relative).is_file()
+    restored=client.post('/api/deletions/'+task+'/restore')
+    assert restored.status_code==200 and restored.json()['status']=='restored',restored.text
+    with client.app.state.session_factory() as s:
+        assert all(s.get(model,identifier) is not None for model,identifier in dependents)
+    assert all((settings.media_root/relative).is_file() for relative in paths)
+
+
 def test_masked_secret_is_not_saved_and_service_is_physically_removed(client):
     services=client.get('/api/settings/ai-services').json()
     service=services[0]

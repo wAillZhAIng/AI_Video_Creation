@@ -63,7 +63,8 @@ TABLE_RESOURCE.update({'shot_details':'_shot_details','character_aliases':'_alia
 TABLE_RESOURCE['screenplay_project_name_claims']='_screenplay_name_claims'
 MODELS={c.__table__.name:c for c in Base.registry.mappers for c in [c.class_]}
 ACTIVE={'queued','running','postprocessing','submitted','submitting','cancelling','unknown','reconciling','importing','parsing','waiting_review','waiting_design_review','waiting_visual_review','waiting_video_review','waiting_service_verification','rendering','ready'}
-JOB_TABLES={'generation_jobs','character_generation_jobs','assembly_renders','word_imports','production_visuals','production_runs','studio_runs'}
+JOB_TABLES={'generation_jobs','character_generation_jobs','assembly_renders','word_imports','production_visuals','production_runs','studio_runs',
+    'media_process_tasks','quality_renders'}
 JOB_TABLES.add('screenplay_generation_jobs')
 JOB_TABLES.add('video_analyses')
 OWNED={
@@ -85,8 +86,33 @@ OWNED['characters'].update({'character_reference_sets','character_reference_asse
 OWNED['screenplay_generation_jobs']={'screenplay_documents','screenplay_project_name_claims'}
 OWNED['projects'].update({'project_product_bindings','shot_product_bindings','project_production_preferences'})
 OWNED['storyboard_shots'].add('shot_product_bindings')
+OWNED['projects'].update({'media_process_tasks','audio_assets'})
+OWNED['storyboard_shots'].update({'media_process_tasks','audio_assets'})
+OWNED['media_process_tasks']={'audio_assets'}
+OWNED['video_revisions'].add('quality_renders')
 OWNED['products']={'product_images'}
 OWNED['reference_videos']={'video_analyses'}
+SCOPED_OWNERS={'projects':'project','storyboard_shots':'shot'}
+
+
+def _owns_child(parent, foreign_key, child, selected):
+    if isinstance(child,m.QualityRender):
+        # The source owns this processing task. Its resulting video revision
+        # is independently selectable and must also be included if it exists.
+        return foreign_key.parent.name=='source_video_id' and (
+            child.video_id is None or ('video_revisions',child.video_id) in selected)
+    return child.__table__.name in OWNED.get(parent,set())
+
+
+def _is_active_job(obj, selected):
+    table=obj.__table__.name
+    if table not in JOB_TABLES:return False
+    status=getattr(obj,'status','')
+    # The Studio scheduler stops at review. Project-wide removal still checks
+    # every owned child job separately before allowing this finished run.
+    if table=='studio_runs' and status=='waiting_review' and ('projects',obj.project_id) in selected:
+        return False
+    return status in ACTIVE
 
 
 def serialize(value):
@@ -134,7 +160,16 @@ def file_entries(obj):
             job=(obj.metadata_json or {}).get('generation_job_id','')
             owned=obj.source=='generated' and bool(job) and job in p
             reason='原始上传或归属未验证' if not owned else ''
-        elif table=='video_revisions': owned=bool(obj.generation_job_id and obj.generation_job_id in p)
+        elif table=='video_revisions':
+            quality_render=(obj.metadata_json or {}).get('quality_render_id')
+            owned=bool((obj.generation_job_id and obj.generation_job_id in p)
+                       or (quality_render and p==f'quality/{obj.project_id}/{quality_render}.mp4'))
+        elif table=='quality_renders':
+            owned=p==f"quality/{(obj.snapshot_json or {}).get('project_id')}/{obj.id}.mp4"
+        elif table=='audio_assets':
+            path=PurePosixPath(p)
+            owned=bool(obj.task_id and path.parent==PurePosixPath('media_processing',obj.project_id)
+                       and (path.stem==obj.task_id or path.stem.startswith(obj.task_id+'.')))
         elif table=='assembly_renders': owned=obj.id in p
         elif table=='final_compositions': owned=obj.id in p
         elif table=='character_batches': owned=obj.id in p
@@ -159,8 +194,8 @@ def file_entries(obj):
 
 def find_references(session):
     index={}
-    for resource,(model,_,_) in RESOURCES.items():
-        if resource=='files': continue
+    models=[model for resource,(model,_,_) in RESOURCES.items() if resource!='files']
+    for model in [*models,m.QualityRender,m.AudioAsset]:
         for obj in session.scalars(select(model)):
             for entry in file_entries(obj): index.setdefault(entry['path'],[]).append((obj.__table__.name,obj.id,entry))
     return index
@@ -176,6 +211,12 @@ def build_plan(session,settings,resource,ids,mode,cascade=False):
     while changed:
         changed=False
         for (table,identifier),obj in list(selected.items()):
+            if cascade and table in SCOPED_OWNERS:
+                for scoped in (m.QualityProfile,m.RoutePolicy):
+                    for child in session.scalars(select(scoped).where(
+                        scoped.scope==SCOPED_OWNERS[table],scoped.target_id==identifier)):
+                        key=(scoped.__tablename__,child.id)
+                        if key not in selected:selected[key]=child;changed=True
             if isinstance(obj,m.ProductImage) and mode!='keep' and cascade:
                 asset=session.get(m.ScreenplayInputAsset,obj.asset_id)
                 other=list(session.scalars(select(m.ProductImage).where(m.ProductImage.asset_id==obj.asset_id)))
@@ -189,7 +230,7 @@ def build_plan(session,settings,resource,ids,mode,cascade=False):
                     for child in session.scalars(select(cls).where(getattr(cls,fk.parent.name)==identifier)):
                         key=(child_table.name,child.id)
                         if key in selected:continue
-                        if child_table.name in OWNED.get(table,set()) and cascade:
+                        if cascade and _owns_child(table,fk,child,selected):
                             selected[key]=child;changed=True
                             if isinstance(child,m.ShotDetail) and table=='scenes':
                                 shot=session.get(m.StoryboardShot,child.shot_id)
@@ -224,8 +265,13 @@ def build_plan(session,settings,resource,ids,mode,cascade=False):
             for note in session.scalars(select(m.ContentNote).where(m.ContentNote.resource.in_(note_resources),m.ContentNote.record_id==identifier)):
                 selected[('content_notes',note.id)]=note
     for (table,identifier),obj in list(selected.items()):
-        if table in JOB_TABLES and getattr(obj,'status','') in ACTIVE:
+        if _is_active_job(obj,selected):
             blockers.append({'resource':TABLE_RESOURCE.get(table,table),'id':identifier,'reason':'任务仍在运行或排队，请先取消'})
+        if not cascade and table in SCOPED_OWNERS:
+            for scoped in (m.QualityProfile,m.RoutePolicy):
+                for child in session.scalars(select(scoped).where(
+                    scoped.scope==SCOPED_OWNERS[table],scoped.target_id==identifier)):
+                    blockers.append({'resource':scoped.__tablename__,'id':child.id,'parent_id':identifier,'reason':'需要明确级联处理子记录'})
         for detail in session.scalars(select(m.ShotDetail)):
             if identifier in str(detail.source_json.get('production',{})) and ('storyboard_shots',detail.shot_id) not in selected:
                 blockers.append({'id':detail.shot_id,'reason':'仍被镜头制作版本或视觉参考引用，请先解除绑定'})
@@ -237,7 +283,7 @@ def build_plan(session,settings,resource,ids,mode,cascade=False):
                 owner_cls=MODELS.get(owner.get('table'));parent=session.get(owner_cls,owner.get('id')) if owner_cls else None
                 if parent and (owner['table'],parent.id) not in selected:
                     dependencies.append({'resource':TABLE_RESOURCE.get(owner['table'],owner['table']),'id':parent.id,'reason':'此文件属于该记录；删除文件登记不会删除其所属记录'})
-                    if owner['table'] in JOB_TABLES and getattr(parent,'status','') in ACTIVE:blockers.append({'id':parent.id,'reason':'运行中的任务仍拥有此文件，请先取消任务'})
+                    if _is_active_job(parent,selected):blockers.append({'id':parent.id,'reason':'运行中的任务仍拥有此文件，请先取消任务'})
         affected_shots=[]
         if isinstance(obj,(m.ShotCharacter,m.DialogueLine)) or isinstance(obj,m.AudioEvent) and obj.shot_id:affected_shots=[obj.shot_id]
         elif isinstance(obj,m.AudioEvent) and obj.scene_id:affected_shots=list(session.scalars(select(m.ShotDetail.shot_id).where(m.ShotDetail.scene_id==obj.scene_id)))
@@ -253,7 +299,7 @@ def build_plan(session,settings,resource,ids,mode,cascade=False):
                     if (child_table.name,child.id) in selected:continue
                     item={'resource':TABLE_RESOURCE.get(child_table.name,child_table.name),'id':child.id,'label':label(child),'parent_id':identifier}
                     dependencies.append(item)
-                    blockers.append({**item,'reason':'需要明确级联处理子记录' if child_table.name in OWNED.get(table,set()) else '仍被其他业务引用，请先解除或重新关联'})
+                    blockers.append({**item,'reason':'需要明确级联处理子记录' if _owns_child(table,fk,child,selected) else '仍被其他业务引用，请先解除或重新关联'})
         if isinstance(obj,m.CharacterAsset):
             for v in session.scalars(select(m.CharacterVersion).where(m.CharacterVersion.standard_face_asset_id==identifier)):
                 if ('character_versions',v.id) not in selected:blockers.append({'id':v.id,'reason':'仍是人物标准脸，请建立新版本或解除引用'})
@@ -283,8 +329,7 @@ def build_plan(session,settings,resource,ids,mode,cascade=False):
             if isinstance(obj,m.ManagedFile):
                 owners=[ref for ref in obj.ownership_json if ref.get('table') in MODELS and session.get(MODELS[ref['table']],ref.get('id'))]
                 if len(owners)>1:external.extend(ref for ref in owners if (ref.get('table'),ref.get('id')) not in selected)
-            existing=files.get(p)
-            if existing: continue
+            if p in files: continue
             protected=entry['protected_reason']; size=0;mtime=None;exists=False
             try:
                 path=safe_file(settings.media_root,p);exists=path.exists()
