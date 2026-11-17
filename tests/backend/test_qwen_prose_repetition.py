@@ -1,6 +1,7 @@
 """CPU decoding contracts; no weights, inference, service calls, or GPU use."""
 from copy import deepcopy
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -36,6 +37,34 @@ def server(tmp_path):
 def request(server,**changes):
     return server.ChatRequest(model=server.MODEL_ID,messages=[{'role':'user','content':'Write the brief.'}],
                               **changes)
+
+
+@pytest.mark.parametrize('model_context,vram_context,expected_context',[
+    (16384,20000,16384),
+    (32768,12000,12000),
+])
+def test_omitted_output_limit_uses_remaining_context_and_vram(
+        server,model_context,vram_context,expected_context):
+    server.MAX_CONTEXT_TOKENS=32768
+    server.MAX_PROMPT_TOKENS=32767
+    server.VRAM_PREFLIGHT=True
+    server.MODEL.mkdir()
+    (server.MODEL/'config.json').write_text(json.dumps({'text_config':{
+        'max_position_embeddings':model_context,'head_dim':128,
+        'num_hidden_layers':24,'num_key_value_heads':4}}),encoding='utf-8')
+    weights=8*1024**3
+    server.weights_receipt={'total_weight_file_bytes':weights}
+    kv_bytes_per_token=4*24*4*128
+    free=weights+1024**3+kv_bytes_per_token*vram_context
+    torch=SimpleNamespace(cuda=SimpleNamespace(mem_get_info=lambda:(free,32*1024**3)))
+    prompt_tokens=3642
+
+    assert request(server).max_tokens is None
+    effective,memory=server.output_token_budget(torch,prompt_tokens,request(server).max_tokens)
+    assert effective==expected_context-prompt_tokens
+    assert memory['estimated_kv_cache_bytes']==expected_context*kv_bytes_per_token
+    explicit,_=server.output_token_budget(torch,prompt_tokens,request(server,max_tokens=3072).max_tokens)
+    assert explicit==3072
 
 
 def word_ids(text):

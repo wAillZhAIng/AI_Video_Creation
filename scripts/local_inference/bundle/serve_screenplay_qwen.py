@@ -70,7 +70,7 @@ class ChatRequest(BaseModel):
     model_config=ConfigDict(extra='forbid')
     model:str
     messages:list[dict]=Field(min_length=1,max_length=20)
-    max_tokens:int=Field(default=4096,ge=1,le=8192)
+    max_tokens:int|None=Field(default=None,ge=1,le=8192)
     temperature:float=Field(default=0.2,ge=0,le=2)
     stream:bool=False
     response_format:dict|None=None
@@ -235,22 +235,32 @@ def release_gpu_lease(lease):
                 fcntl.flock(lease.fileno(),fcntl.LOCK_UN)
         finally:lease.close()
 
-def validate_token_budget(prompt_tokens,max_output_tokens):
-    if prompt_tokens>MAX_PROMPT_TOKENS or prompt_tokens+max_output_tokens>MAX_CONTEXT_TOKENS:
-        raise ValueError(f'Input/output exceeds the local {MAX_CONTEXT_TOKENS}-token profile budget; reduce or split the request')
-
-def vram_preflight(torch,prompt_tokens,max_output_tokens):
-    if not VRAM_PREFLIGHT:return None
-    config=json.loads(_fixed_model_file('config.json').read_text(encoding='utf-8-sig'))['text_config']
+def output_token_budget(torch,prompt_tokens,requested_output_tokens):
+    """Select the remaining context and VRAM capacity when no output limit is requested."""
+    automatic=requested_output_tokens is None
+    check_vram=automatic or VRAM_PREFLIGHT
+    context_limit=MAX_CONTEXT_TOKENS
+    if check_vram:
+        config=json.loads(_fixed_model_file('config.json').read_text(encoding='utf-8-sig'))['text_config']
+        context_limit=min(context_limit,config.get('max_position_embeddings',context_limit))
+    available_context=context_limit-prompt_tokens
+    output_tokens=available_context if automatic else requested_output_tokens
+    if prompt_tokens>MAX_PROMPT_TOKENS or not 0<output_tokens<=available_context:
+        raise ValueError(f'Input/output exceeds the local {context_limit}-token context budget; reduce or split the request')
+    if not check_vram:return output_tokens,None
     head_dim=config.get('head_dim') or config['hidden_size']//config['num_attention_heads']
-    kv_bytes=2*2*config['num_hidden_layers']*config['num_key_value_heads']*head_dim*(prompt_tokens+max_output_tokens)
+    kv_bytes_per_token=2*2*config['num_hidden_layers']*config['num_key_value_heads']*head_dim
     weight_bytes=weights_receipt['total_weight_file_bytes']
     headroom=1024**3
     free,total=torch.cuda.mem_get_info()
+    if automatic:
+        available_vram=(free-weight_bytes-headroom)//kv_bytes_per_token-prompt_tokens
+        output_tokens=min(output_tokens,available_vram)
+    kv_bytes=kv_bytes_per_token*(prompt_tokens+max(output_tokens,1))
     estimate=weight_bytes+kv_bytes+headroom
     if free<estimate:
         raise ValueError(f'Local VRAM preflight requires an estimated {estimate} free bytes but only {free} are available; no model was loaded')
-    return {'free_bytes':free,'total_bytes':total,'estimated_weights_bytes':weight_bytes,
+    return output_tokens,{'free_bytes':free,'total_bytes':total,'estimated_weights_bytes':weight_bytes,
             'estimated_kv_cache_bytes':kv_bytes,'headroom_bytes':headroom,
             'result':'estimated_budget_available','guarantees_inference_success':False}
 
@@ -661,10 +671,9 @@ def infer(body):
         inputs=processor(text=[prompt],images=images or None,padding=True,return_tensors='pt',
             images_kwargs={'min_pixels':MIN_VISION_PIXELS,'max_pixels':MAX_VISION_PIXELS})
         prompt_tokens=int(inputs['input_ids'].shape[-1])
-        validate_token_budget(prompt_tokens,body.max_tokens)
+        output_tokens,memory_receipt=output_token_budget(torch,prompt_tokens,body.max_tokens)
         grids=inputs.get('image_grid_thw')
         image_grids=grids.tolist() if grids is not None else []
-        memory_receipt=vram_preflight(torch,prompt_tokens,body.max_tokens)
         inference_phase='loading_model'
         model=Qwen3VLForConditionalGeneration.from_pretrained(str(MODEL),local_files_only=True,
               dtype=torch.bfloat16,device_map={'':'cuda:0'},attn_implementation='sdpa')
@@ -680,7 +689,7 @@ def infer(body):
         generation_kwargs.update(prose_kwargs)
         inference_phase='generating'
         with torch.inference_mode():
-            outputs=model.generate(**inputs,max_new_tokens=body.max_tokens,max_time=480,**generation_kwargs)
+            outputs=model.generate(**inputs,max_new_tokens=output_tokens,max_time=480,**generation_kwargs)
         generated=outputs[:,prompt_tokens:]
         result=processor.batch_decode(generated,skip_special_tokens=True,clean_up_tokenization_spaces=False)[0]
         raw_result=processor.batch_decode(generated,skip_special_tokens=False,clean_up_tokenization_spaces=False)[0] if stops else result
@@ -688,7 +697,7 @@ def infer(body):
         eos=model.generation_config.eos_token_id
         eos_ids=set(eos if isinstance(eos,list) else [eos])
         ended=bool(generated.shape[-1] and int(generated[0,-1]) in eos_ids)
-        finish=generation_finish_reason(ended,matched_stop,int(generated.shape[-1]),body.max_tokens,repeat_guard)
+        finish=generation_finish_reason(ended,matched_stop,int(generated.shape[-1]),output_tokens,repeat_guard)
         if repeat_guard is not None:prose_receipt.update(guard=repeat_guard.receipt())
         format_receipt=validate_guided_output(result,prepared_format,guided_stats,ended,finish,int(generated.shape[-1]))
         response={'id':'localchat_'+uuid.uuid4().hex,'object':'chat.completion','model':MODEL_ID,
@@ -699,14 +708,15 @@ def infer(body):
             'image_sha256':[hashlib.sha256(image.tobytes()).hexdigest() for image in images],
             'image_grid_thw':image_grids,'min_pixels':MIN_VISION_PIXELS,'max_pixels':MAX_VISION_PIXELS,
             'max_image_edge':MAX_IMAGE_EDGE,'prepared_image_dimensions':[[image.width,image.height] for image in images],
-            'max_output_tokens':body.max_tokens,'generation_time_limit_seconds':480,'finish_reason':finish,
+            'max_output_tokens':output_tokens,'generation_time_limit_seconds':480,'finish_reason':finish,
             'seed':seed,'seed_source':'request' if body.seed is not None else 'fixed_default',
             'chat_template_control':thinking_receipt,'stop_sequences':stops,'matched_stop':matched_stop,
             'decoding':'sampling' if sampling_kwargs['do_sample'] else 'greedy',
             'sampling_parameters':sampling_kwargs,'requested_temperature':body.temperature,
             'prose_repetition_control':prose_receipt,
             'context_budget':{'max_model_len':MAX_CONTEXT_TOKENS,'max_prompt_tokens':MAX_PROMPT_TOKENS,
-                              'actual_prompt_tokens':prompt_tokens,'requested_output_tokens':body.max_tokens},
+                              'actual_prompt_tokens':prompt_tokens,'requested_output_tokens':body.max_tokens,
+                              'effective_output_tokens':output_tokens},
             'vram_preflight':memory_receipt,'gpu_slot':'exclusive_local_qwen','attention_control':attention_receipt,
             'response_format_control':format_receipt,
             'device':torch.cuda.get_device_name(),'torch':torch.__version__,'offline':True,

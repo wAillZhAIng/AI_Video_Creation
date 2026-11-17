@@ -16,6 +16,8 @@ import wave
 ROOT=Path(__file__).resolve().parents[1]
 MODEL=Path('E:/Models/Factory/Qwen3-VL-2B-Instruct')
 MODEL_ID='Qwen/Qwen3-VL-2B-Instruct'
+MAX_CONTEXT_TOKENS=10000
+MAX_PROMPT_TOKENS=6500
 SCRIPT_SHA=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 os.environ.update({'HF_HUB_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1','HF_HUB_DISABLE_TELEMETRY':'1',
  'HF_HOME':'E:/Models/.cache/huggingface','TOKENIZERS_PARALLELISM':'false','OMP_NUM_THREADS':'4',
@@ -36,7 +38,7 @@ class ChatRequest(BaseModel):
     model_config=ConfigDict(extra='forbid')
     model:str
     messages:list[dict]=Field(min_length=1,max_length=20)
-    max_tokens:int=Field(default=4096,ge=1,le=8192)
+    max_tokens:int|None=Field(default=None,ge=1,le=8192)
     temperature:float=Field(default=0.2,ge=0,le=2)
     stream:bool=False
     response_format:dict|None=None
@@ -121,6 +123,26 @@ def prepare(messages):
     if chars>100000:raise ValueError('Text exceeds local context limit')
     return converted,images
 
+def output_token_budget(torch,prompt_tokens,requested_output_tokens):
+    """Use the deployment's remaining context and VRAM when no limit is requested."""
+    automatic=requested_output_tokens is None
+    context_limit=MAX_CONTEXT_TOKENS
+    if automatic:
+        config=json.loads((MODEL/'config.json').read_text(encoding='utf-8-sig'))['text_config']
+        context_limit=min(context_limit,config.get('max_position_embeddings',context_limit))
+    available_context=context_limit-prompt_tokens
+    output_tokens=available_context if automatic else requested_output_tokens
+    if prompt_tokens>MAX_PROMPT_TOKENS or not 0<output_tokens<=available_context:
+        raise ValueError(f'Input/output exceeds the local {context_limit}-token context budget; reduce or split the request')
+    if not automatic:return output_tokens
+    head_dim=config.get('head_dim') or config['hidden_size']//config['num_attention_heads']
+    kv_bytes_per_token=2*2*config['num_hidden_layers']*config['num_key_value_heads']*head_dim
+    free,_=torch.cuda.mem_get_info()
+    remaining=free-(MODEL/'model.safetensors').stat().st_size-1024**3
+    available_vram=remaining//kv_bytes_per_token-prompt_tokens
+    if available_vram<1:raise ValueError('Local VRAM preflight found no space for generation after loading the prompt')
+    return min(output_tokens,available_vram)
+
 def infer(body):
     global weight_verified,loaded
     if body.model!=MODEL_ID or body.stream:raise ValueError('Fixed local model and nonstreaming requests only')
@@ -142,7 +164,7 @@ def infer(body):
         inputs=processor(text=[prompt],images=images or None,padding=True,return_tensors='pt',
             images_kwargs={'min_pixels':64*32*32,'max_pixels':128*32*32})
         prompt_tokens=int(inputs['input_ids'].shape[-1])
-        if prompt_tokens>6500 or prompt_tokens+body.max_tokens>10000:raise ValueError('Input/output exceeds the bounded 16GB local inference budget; reduce or split the request')
+        output_tokens=output_token_budget(torch,prompt_tokens,body.max_tokens)
         grids=inputs.get('image_grid_thw')
         image_grids=grids.tolist() if grids is not None else []
         model=Qwen3VLForConditionalGeneration.from_pretrained(str(MODEL),local_files_only=True,
@@ -150,20 +172,21 @@ def infer(body):
         loaded=True;loaded_seconds=time.monotonic()-started
         inputs=inputs.to('cuda:0')
         with torch.inference_mode():
-            outputs=model.generate(**inputs,max_new_tokens=body.max_tokens,max_time=480,do_sample=False)
+            outputs=model.generate(**inputs,max_new_tokens=output_tokens,max_time=480,do_sample=False)
         generated=outputs[:,prompt_tokens:]
         result=processor.batch_decode(generated,skip_special_tokens=True,clean_up_tokenization_spaces=False)[0]
         eos=model.generation_config.eos_token_id
         eos_ids=set(eos if isinstance(eos,list) else [eos])
         ended=bool(generated.shape[-1] and int(generated[0,-1]) in eos_ids)
-        finish='stop' if ended else 'length' if generated.shape[-1]>=body.max_tokens else 'time_limit'
+        finish='stop' if ended else 'length' if generated.shape[-1]>=output_tokens else 'time_limit'
         return {'id':'localchat_'+uuid.uuid4().hex,'object':'chat.completion','model':MODEL_ID,
           'choices':[{'index':0,'message':{'role':'assistant','content':result},'finish_reason':finish}],
           'usage':{'prompt_tokens':prompt_tokens,'completion_tokens':int(generated.shape[-1]),'total_tokens':int(outputs.shape[-1])},
           'factory_receipt':{'model_id':MODEL_ID,'model_directory':str(MODEL),'input_image_count':len(images),
             'image_sha256':[hashlib.sha256(image.tobytes()).hexdigest() for image in images],
             'image_grid_thw':image_grids,'min_pixels':64*32*32,'max_pixels':128*32*32,
-            'max_output_tokens':body.max_tokens,'generation_time_limit_seconds':480,'finish_reason':finish,
+            'requested_output_tokens':body.max_tokens,'max_output_tokens':output_tokens,
+            'generation_time_limit_seconds':480,'finish_reason':finish,
             'device':torch.cuda.get_device_name(),'torch':torch.__version__,'offline':True,
             'load_seconds':round(loaded_seconds,3),'elapsed_seconds':round(time.monotonic()-started,3),
             'peak_cuda_allocated_bytes':torch.cuda.max_memory_allocated(),'script_sha256':SCRIPT_SHA}}

@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+from decimal import Decimal
 from pathlib import Path
 import httpx
 from sqlalchemy import select, update
@@ -256,6 +257,7 @@ observations:[素材中真实可见的线索],uncertainties:[需要用户确认�
 所有人物/场景/分镜key唯一，引用必须存在；对白的说话人必须出现在本镜participants。各人物profile中只用文字和整数，不用嵌套对象；衣服与固定身份分开。wardrobe_states的每个人物值必须是对象，例如 {"chen_ning":{"description":"深蓝工作服"}}；prop_states每项必须是对象，例如 [{"name":"记录本","state":"合上"}]，不能仅写字符串。每个分镜必须有画面和摄影，声音单独记录。禁止虚构原视频对白；创作对白应标为建议。
 输出长度要适合用户目标时长，不要把剧情写成不可解析的长段落。'''
     system+='\n制作资料关联：每项服装状态需填写 wardrobe_key，指向 designs 中同一人物的 kind=wardrobe 记录；每项道具状态需填写 prop_key，指向 kind=prop 记录。所有引用编号必须存在、唯一，不能跨人物混用。跨场景共用的服装和可携道具设计必须设 scene_key=null，场景专属设计只能由对应场景镜头引用。状态、名称和描述分开保存；不确定的道具状态标待确认，不要补造动作。target_duration 数值的单位为秒。'
+    system+='\n动作节拍仅引用本镜 participants 中的原样 character_key。每镜独立从第 0 秒计时，不使用全片累计秒数。必须满足 0 <= start_seconds < end_seconds <= duration_seconds。例如时长为 5 秒的镜头可以使用 0 至 2 秒。'
     if job.snapshot_json.get('products'):
         system+='\n本次为产品营销剧本。可无人出镜，characters可以为空，shots.participants/dialogues也可为空；不要为满足格式凭空添加演员。每个镜头必须增加products:[{product_id:实际所选完整ID,visible_state:可见状态,display_features:应展示的已知特征,on_screen_text:屏幕文字,logo_review_required:true}]。顶层marketing:{hook,target_audience,display_sequence,call_to_action,evidence_sources}。旁白建议用audio_events kind=voice描述，不把无人旁白强行归给画面人物。所有商品名称、产品ID、卖点证据来自给定资料；价格、功效、参数、认证不得猜测。形状、比例、颜色、包装保持参考，Logo/包装字样需原图后期图层或人工核对，不能保证生成准确复现。模板：'+job.snapshot_json['input_request']['marketing_template']+'\n所选真实产品资料（只含创作需要的语义字段，校验值仍由任务保存）：'+canonical(products_for_model)
         # A syntactically valid exemplar is necessary for small local models:
@@ -416,6 +418,47 @@ def _unreviewed_model_content(value,job_id):
     return result
 
 
+def _normalize_cumulative_beat_times(ir,people):
+    """Rebase one consistent full screenplay timeline before strict validation."""
+    scene_orders={scene['key']:scene.get('order') for scene in ir['scenes']}
+    if any(type(order) is not int or order<1 for order in scene_orders.values()):return
+    offset=Decimal(0)
+    last_order=0
+    edits=[]
+    for shot in ir['shots']:
+        scene_key=shot.get('scene_key')
+        order=scene_orders.get(scene_key,0) if isinstance(scene_key,str) else 0
+        duration=shot.get('duration_seconds')
+        if not order or order<last_order or type(duration) not in (int,float):return
+        duration=Decimal(str(duration))
+        if not duration.is_finite() or not 1<=duration<=60:return
+        end_of_shot=offset+duration
+        beats=shot['production'].get('beats',[])
+        participants=shot.get('participants',[])
+        if not isinstance(beats,list) or not isinstance(participants,list):return
+        cast={person['character_key'] for person in participants if isinstance(person,dict) and isinstance(person.get('character_key'),str)} & people
+        has_cumulative_beat=False
+        for beat in beats:
+            if not isinstance(beat,dict):return
+            actor=beat.get('character_key')
+            start,end=beat.get('start_seconds'),beat.get('end_seconds')
+            if not isinstance(actor,str) or actor not in cast or any(type(value) not in (int,float) for value in (start,end)):return
+            start,end=Decimal(str(start)),Decimal(str(end))
+            if not start.is_finite() or not end.is_finite() or not offset<=start<end<=end_of_shot:return
+            if offset:
+                edits.append((beat,float(start-offset),float(end-offset)))
+                has_cumulative_beat=has_cumulative_beat or end>duration
+        if offset and beats and not has_cumulative_beat:return
+        offset=end_of_shot
+        last_order=order
+    if edits:
+        for beat,start,end in edits:
+            beat['start_seconds']=start
+            beat['end_seconds']=end
+        ir['parse_warnings'].append({'kind':'screenplay_cumulative_beat_times',
+            'message':'模型使用了全片累计动作时间，已换算为各镜头从第 0 秒开始的时间；请核对节拍。'})
+
+
 def normalize_ir(session,job,raw,source):
     if not isinstance(raw,dict):raise ValueError('模型未返回JSON对象')
     raw=_unreviewed_model_content(raw,job.id)
@@ -468,7 +511,7 @@ def normalize_ir(session,job,raw,source):
         profile={key:('；'.join(value) if isinstance(value,list) and all(isinstance(item,str) for item in value) else value) for key,value in profile.items()}
         if any((not isinstance(value,(str,int)) or isinstance(value,bool)) and not (key=='age' and value is None) and not (key=='original_adult' and isinstance(value,bool)) for key,value in profile.items()):raise ValueError('人物资料只能包含独立文字字段和可选年龄')
         if profile.get('age') not in (None,'') and (not isinstance(profile['age'],int) or isinstance(profile['age'],bool) or profile['age']<0):raise ValueError('年龄可省略；填写时需为非负整数')
-        if profile.get('age')=='':profile.pop('age')
+        if profile.get('age') in (None,''):profile.pop('age',None)
         profile['character_id']='spchar_'+sha((namespace+':'+person['key']).encode())[:24]
         person['profile']=profile
         person.setdefault('source',['generation:'+job.id])
@@ -508,9 +551,11 @@ def normalize_ir(session,job,raw,source):
             shot['production']['prop_states']=[{'description':value} if isinstance(value,str) else value for value in props]
         shot['production']['visual_ids']=[];shot['production']['require_visual_review']=True
         shot['reviewed_edit']=False
+        if set(shot['production'].get('wardrobe_states',{}))-people:raise ValueError('造型状态引用未定义人物')
+    if job.scope=='all':_normalize_cumulative_beat_times(ir,people)
+    for shot in ir['shots']:
         for beat in shot['production'].get('beats',[]):
             if beat.get('character_key') not in people or beat.get('end_seconds',0)>shot.get('duration_seconds',0):raise ValueError('动作节拍人物或时长不属于当前镜头')
-        if set(shot['production'].get('wardrobe_states',{}))-people:raise ValueError('造型状态引用未定义人物')
     for design in ir['designs']:
         if not isinstance(design.get('key'),str) or not 1<=len(design['key'])<=100:raise ValueError('制作设定编号无效')
         if design.get('character_key') and design['character_key'] not in people:raise ValueError('服装引用未定义人物')
@@ -635,11 +680,11 @@ async def _call_provider(settings,session,job,media_parts,source,*,snapshot=None
                 if enriched is not source:source.update(enriched)
                 job.receipt_json={**job.receipt_json,'source':copy.deepcopy(source)};session.commit()
         if base_messages is None:base_messages=prompt_messages(job,media_parts,source)
-        output_limit=int(snapshot['settings'].get('max_tokens',8192))
-        if not snapshot.get('is_cloud'):output_limit=min(output_limit,3072)
         request_messages=base_messages if not output_chunks else _continuation_messages(base_messages,_continuation_context_tail(output_chunks))
         body={'model':snapshot['model_id'],'messages':request_messages,
-            'temperature':.35,'max_tokens':output_limit,'stream':False}
+            'temperature':.35,'stream':False}
+        if snapshot.get('is_cloud'):
+            body['max_tokens']=int(snapshot['settings'].get('max_tokens',8192))
         timeout=httpx.Timeout(None)
         attempt_index=len(history)+1
         attempt={'attempt_index':attempt_index,'service_id':snapshot['service_id'],'service_revision':snapshot['service_revision'],'model_id':snapshot['model_id'],

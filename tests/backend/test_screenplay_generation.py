@@ -371,6 +371,43 @@ def test_ir_rejects_unowned_dialogue_duplicate_shot_and_out_of_range_beat(factor
                 continue
             with pytest.raises(ValueError):service.normalize_ir(session,job,raw,{})
 
+@pytest.mark.parametrize('durations,offsets,overrides',[
+    ([3,4,4,4],[0,3,7,11,15],{}),
+    ([1.1,1.2,1.3,1.4],[0,1.1,2.3,3.6,5],{}),
+    ([3,4,4,4],[0,3,7,11,15],{2:(0,4)}),
+    ([3,4,4,4],[0,3,7,11,15],{1:(3,4)}),
+],ids=['cumulative','decimal','mixed','ambiguous'])
+def test_generation_rebases_only_consistent_full_screenplay_beat_timing(factory,settings,model,durations,offsets,overrides):
+    raw=raw_ir()
+    raw['project']['target_duration']=offsets[-1]
+    raw['characters'][0]['profile']['age']=None
+    raw['characters'][1]['profile']['age']=0
+    template=raw['shots'][0]
+    raw['shots']=[]
+    for index,duration in enumerate(durations):
+        shot=copy.deepcopy(template)
+        shot.update(key=f'T{index+1}',duration_seconds=duration)
+        beat=shot['production']['beats'][0]
+        start,end=overrides.get(index,offsets[index:index+2])
+        beat.update(start_seconds=start,end_seconds=end)
+        raw['shots'].append(shot)
+    with factory() as session:
+        job=service.create_generation(session,settings,payload(model),capability_test=True)
+        if overrides:
+            with pytest.raises(ValueError,match='动作节拍人物或时长不属于当前镜头'):
+                service.normalize_ir(session,job,raw,{})
+            return
+        normalized=service.normalize_ir(session,job,raw,{})
+    assert normalized['project']['shot_total_duration_seconds']==offsets[-1]
+    assert 'age' not in normalized['characters'][0]['profile']
+    assert normalized['characters'][1]['profile']['age']==0
+    assert any(warning['kind']=='screenplay_cumulative_beat_times' for warning in normalized['parse_warnings'])
+    for index,(original,shot) in enumerate(zip(raw['shots'],normalized['shots'])):
+        assert original['production']['beats'][0]['start_seconds']==offsets[index]
+        beat=shot['production']['beats'][0]
+        assert (beat['character_key'],beat['start_seconds'],beat['end_seconds'])==('A',0,durations[index])
+        assert beat['action']==original['production']['beats'][0]['action']
+
 def test_shot_revision_preserves_all_other_content_and_stable_character_ids(factory,settings,model):
     identifier=make_ready(factory,settings,model)
     with factory() as session:
@@ -424,7 +461,8 @@ def test_real_export_failure_retries_saved_ir_without_calling_model(factory,sett
         assert result.status=='awaiting_review' and result.receipt_json==before
         assert len(service.documents(session,identifier))==2
 
-def test_worker_calls_actual_adapter_contract_and_exports_docx(factory,settings,model,monkeypatch):
+@pytest.mark.parametrize('is_cloud',[False,True],ids=['local','cloud'])
+def test_worker_calls_actual_adapter_contract_and_exports_docx(factory,settings,model,monkeypatch,is_cloud):
     seen=[]
     async def ensure(snapshot):seen.append(('ensure',snapshot['model_id']))
     monkeypatch.setitem(sys.modules,'app.services.screenplay_runtime',SimpleNamespace(ensure_local_service=ensure))
@@ -433,7 +471,15 @@ def test_worker_calls_actual_adapter_contract_and_exports_docx(factory,settings,
         return httpx.Response(200,json={'id':'unit-response','choices':[{'message':{'content':json.dumps(raw_ir(),ensure_ascii=False)}}],
             'usage':{'completion_tokens':100}},request=httpx.Request('POST','http://127.0.0.1:8771/v1/chat/completions'))
     monkeypatch.setattr(service,'service_request',call)
-    with factory() as session:job=service.create_generation(session,settings,payload(model),capability_test=True);identifier=job.id
+    with factory() as session:
+        if is_cloud:
+            row=session.get(m.AIService,model)
+            row.provider='openai_compatible'
+            row.base_url='https://example.com/v1'
+            row.settings_json={**row.settings_json,'max_tokens':4608}
+            session.commit()
+        job=service.create_generation(session,settings,payload(model,allow_cloud_costs=is_cloud),capability_test=True)
+        identifier=job.id
     asyncio.run(service.process_job(settings,factory,identifier))
     with factory() as session:
         job=service.get_job(session,identifier)
@@ -443,8 +489,14 @@ def test_worker_calls_actual_adapter_contract_and_exports_docx(factory,settings,
         assert service.sha(response_file.read_bytes())==job.receipt_json['provider_response_sha256']
         assert json.loads(response_file.read_text('utf-8'))['id']=='unit-response'
         assert session.scalar(select(func.count()).select_from(m.Project))==0
-        assert seen[1][0:2]==('POST','/chat/completions')
-        assert seen[1][2]['model']=='Qwen/Qwen3-VL-2B-Instruct'
+        assert seen[-1][0:2]==('POST','/chat/completions')
+        body=seen[-1][2]
+        assert body['model']=='Qwen/Qwen3-VL-2B-Instruct'
+        if is_cloud:
+            assert body['max_tokens']==4608
+        else:
+            assert seen[0]==('ensure','Qwen/Qwen3-VL-2B-Instruct')
+            assert 'max_tokens' not in body
 
 
 def test_provider_length_response_continues_exactly_once_and_keeps_multimodal_context(factory,settings,model,monkeypatch):
