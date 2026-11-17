@@ -196,6 +196,60 @@ def test_created_project_deletion_preview_handles_name_claim_and_keeps_source_wo
         assert (settings.media_root/document.relative_path).is_file()
 
 
+def test_delete_history_recycles_versions_and_keeps_original_and_shared_input(factory,settings):
+    from app.schemas_screenplay_generation import BatchDeleteScreenplay
+    from app.services.content_manager import build_plan,restore_task
+
+    data=BytesIO()
+    Image.new('RGB',(64,64),'gray').save(data,format='PNG')
+    with factory() as session:
+        asset=upload_asset(session,settings,'image','source.png',data.getvalue())
+        source_path=settings.media_root/asset.relative_path
+        parent=Job(id='spjob_aaa_parent',idempotency_key='delete-fixture-parent',request_sha256='0'*64,
+            project_name='Uploaded image history',input_mode='image',input_asset_id=asset.id,
+            creative_prompt='Synthetic',status='awaiting_review')
+        session.add(parent)
+        session.flush()
+        child=Job(id='spjob_zzz_child',idempotency_key='delete-fixture-child',request_sha256='0'*64,
+            project_name=parent.project_name,input_mode='image',input_asset_id=asset.id,
+            parent_job_id=parent.id,creative_prompt='Synthetic revision',status='failed')
+        other=Job(id='spjob_external',idempotency_key='delete-fixture-other',request_sha256='0'*64,
+            project_name='Other project',input_mode='image',creative_prompt='Synthetic external',status='queued',
+            snapshot_json={'input_assets':[{'id':asset.id,'relative_path':asset.relative_path}]})
+        session.add_all([child,other])
+        session.flush()
+        document=Doc(id='spdoc_owned',job_id=parent.id,version=1,
+            relative_path=f'screenplay_jobs/{parent.id}/documents/spdoc_owned.docx',
+            sha256='0'*64,screenplay_sha256='0'*64)
+        artifact=f'screenplay_jobs/{child.id}/source_frames/frame_00.jpg'
+        child.receipt_json={'source':{'frames':[{'relative_path':artifact}]}}
+        session.add(document)
+        session.commit()
+        for relative in (document.relative_path,artifact):
+            path=settings.media_root/relative
+            path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_bytes(b'Synthetic history artifact')
+
+        blocked=build_plan(session,settings,'screenplay_jobs',[parent.id],'trash',cascade=True)
+        assert any(item['id']==child.id for item in blocked['blockers'])
+        assert (settings.media_root/document.relative_path).is_file()
+        selected=[parent.id,child.id]
+        result=service.batch_delete(session,settings,BatchDeleteScreenplay(ids=selected))
+        assert [row['id'] for row in result]==selected and all(row['ok'] for row in result)
+        task=session.get(m.DeletionTask,result[0]['deletion_task_id'])
+        assert task.status=='completed' and task.mode=='trash'
+        assert not (settings.media_root/document.relative_path).exists()
+        assert not (settings.media_root/artifact).exists()
+        assert source_path.read_bytes()==data.getvalue()
+        assert session.get(m.ScreenplayInputAsset,asset.id) and session.get(Job,other.id)
+        assert all(session.get(Job,identifier) is None for identifier in selected)
+
+        assert restore_task(session,settings,task)['status']=='restored'
+        assert session.get(Job,child.id).parent_job_id==parent.id
+        assert (settings.media_root/document.relative_path).is_file()
+        assert (settings.media_root/artifact).is_file()
+
+
 def test_text_only_has_no_visual_observation_and_duration_conflict_is_visible(factory,settings,model):
     with factory() as session:
         job=service.create_generation(session,settings,payload(model),capability_test=True)

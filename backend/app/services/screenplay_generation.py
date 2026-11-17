@@ -8,7 +8,7 @@ import re
 import time
 from pathlib import Path
 import httpx
-from sqlalchemy import select, func, update
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from app import models as m
 from app.core.errors import AppError
@@ -1091,98 +1091,32 @@ def batch_cancel(session, settings, payload):
 
 
 def batch_delete(session, settings, payload):
-    import shutil
-    from sqlalchemy import update as sql_update
-    from app.models.screenplay_generation import (ScreenplayGenerationJob as Job,
-        ScreenplayDocument as Document, ScreenplayInputAsset as Asset,
-        ScreenplayProjectNameClaim as NameClaim)
-    from app.core.paths import safe_media_path
-    results = []
-    ids_to_delete = list(payload.ids)
-    for job_id in ids_to_delete:
-        job = session.get(Job, job_id)
-        if job is None:
-            results.append({'id': job_id, 'ok': False, 'error': 'job_not_found'})
-            continue
+    """Keep the legacy response shape while sharing the recoverable deletion path."""
+    from app.schemas_screenplay import DeleteExecute
+    from app.services.content_manager import build_plan, execute_delete
+
+    requested=list(dict.fromkeys(payload.ids))
+    existing=set(session.scalars(select(Job.id).where(Job.id.in_(requested))))
+    selected=[identifier for identifier in requested if identifier in existing]
+    response={'ok':False,'error':'job_not_found'}
+    if selected:
         try:
-            # 1. Nullify self-referential parent_job_id on child jobs that point here
-            #    (only if parent is not also in the delete batch — those will be deleted too)
-            children = session.scalars(select(Job).where(Job.parent_job_id == job_id)).all()
-            for child in children:
-                if child.id not in ids_to_delete:
-                    child.parent_job_id = None
-            session.flush()
-
-            # 2. Nullify project_product_bindings.source_job_id FK
-            try:
-                from app.models import project_product_bindings as ppb_model
-                session.execute(
-                    sql_update(ppb_model.ProjectProductBinding)
-                    .where(ppb_model.ProjectProductBinding.source_job_id == job_id)
-                    .values(source_job_id=None)
-                )
-            except Exception:
-                # model path may differ; fall back to raw SQL
-                from sqlalchemy import text
-                session.execute(
-                    text('UPDATE project_product_bindings SET source_job_id = NULL WHERE source_job_id = :jid'),
-                    {'jid': job_id}
-                )
-            session.flush()
-
-            # 3. Delete on-disk documents and job directory
-            docs = session.scalars(select(Document).where(Document.job_id == job_id)).all()
-            try:
-                job_dir = settings.media_root / 'screenplay_jobs' / job_id
-                if job_dir.exists():
-                    shutil.rmtree(job_dir, ignore_errors=True)
-            except Exception:
-                pass
-            for doc in docs:
-                if doc.relative_path:
-                    try:
-                        p = safe_media_path(settings.media_root, doc.relative_path)
-                        if p.exists():
-                            p.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-            # 4. Remove orphaned input asset file
-            if job.input_asset_id:
-                asset = session.get(Asset, job.input_asset_id)
-                if asset:
-                    sibling_count = session.scalar(
-                        select(func.count(Job.id)).where(
-                            Job.input_asset_id == asset.id,
-                            Job.id != job_id
-                        )
-                    )
-                    if sibling_count == 0:
-                        if asset.relative_path:
-                            try:
-                                p = safe_media_path(settings.media_root, asset.relative_path)
-                                if p.exists():
-                                    p.unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                        session.delete(asset)
-                        session.flush()
-
-            # 5. Delete DB rows: documents → name claim → job
-            for doc in docs:
-                session.delete(doc)
-            session.flush()
-            claim = session.scalar(select(NameClaim).where(NameClaim.job_id == job_id))
-            if claim:
-                session.delete(claim)
-                session.flush()
-            session.delete(job)
-            session.commit()
-            results.append({'id': job_id, 'ok': True})
-        except Exception as exc:
+            plan=build_plan(session,settings,'screenplay_jobs',selected,'trash',cascade=True)
+            if plan['blockers']:
+                reasons=list(dict.fromkeys(item['reason'] for item in plan['blockers']))
+                raise AppError(409,'delete_dependencies','；'.join(reasons))
+            # BatchDeleteScreenplay already validates the input list, with a
+            # separate legacy limit of 200 IDs from the generic preview API.
+            operation=DeleteExecute.model_construct(resource='screenplay_jobs',ids=selected,
+                mode='trash',cascade=True,fingerprint=plan['fingerprint'],confirm=True,expected_revision=1)
+            task=execute_delete(session,settings,operation)
+            response={'ok':task['status'] in {'completed','files_failed'},'deletion_task_id':task['id']}
+            if task['error']:response['error']=task['error']
+        except AppError as exc:
             session.rollback()
-            results.append({'id': job_id, 'ok': False, 'error': str(exc)[:400]})
-    return results
+            response={'ok':False,'error':exc.message}
+    return [{'id':identifier,**(response if identifier in existing else {'ok':False,'error':'job_not_found'})}
+            for identifier in requested]
 
 
 def batch_resume(session, settings, payload):

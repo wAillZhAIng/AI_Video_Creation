@@ -1,5 +1,5 @@
 // Isolated UI/API contracts; these fixtures do not stand in for real model tests.
-import {cleanup,render,screen,waitFor} from '@testing-library/react';
+import {cleanup,render,screen,waitFor,within} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import {MemoryRouter} from 'react-router-dom';
 import {afterEach,beforeEach,expect,it,vi} from 'vitest';
@@ -26,6 +26,44 @@ beforeEach(()=>{eligible=true;job=baseJob();mocked.mockImplementation(async(url,
 afterEach(()=>{cleanup();mocked.mockReset();});
 function mount(search=''){render(<MemoryRouter initialEntries={['/screenplay-generation'+search]}><ScreenplayGenerationPage/></MemoryRouter>);}
 async function fillText(user:ReturnType<typeof userEvent.setup>){await user.type(screen.getByLabelText('项目备注 / 项目名称'),' 原样项目 ');await user.type(screen.getByLabelText('创作提示词'),'写实短片');await user.type(screen.getByLabelText('故事梗概 / 创意素材'),'记录员核对记录。');}
+
+it.each(['completed','files_failed'])('updates only the deleted history job after %s',async(status)=>{
+  const other={...baseJob(),id:'job-2',project_name:'保留的剧本'};
+  const original=mocked.getMockImplementation()!;
+  let deleted=false;
+  mocked.mockImplementation(async(url,init)=>{
+    if(url==='/api/screenplay/jobs')return deleted?[other]:[job,other];
+    if(url==='/api/deletions/preview')return {mode:'trash',cascade:true,fingerprint:'history-plan',record_count:2,file_count:1,total_bytes:32,exclusive_bytes:32,records:[],dependencies:[],blockers:[],files:[],space_note:''};
+    if(url==='/api/deletions/execute'){
+      deleted=true;
+      return {id:'delete-history-1',status,result:{records_deleted:2},error:status==='files_failed'?'部分文件清理失败，可重试':null};
+    }
+    return original(url,init);
+  });
+
+  const user=userEvent.setup();
+  mount('?job=job-1');
+  await screen.findByRole('heading',{name:'原样项目'});
+  await user.click(screen.getByRole('checkbox',{name:/选择任务\s+原样项目/}));
+  await user.click(screen.getByRole('button',{name:'删除所选 1 个'}));
+  await screen.findByRole('dialog',{name:'删除影响范围'});
+  expect(screen.getByLabelText('文件删除模式')).toHaveValue('trash');
+  expect(screen.getByLabelText('明确包含所选记录拥有的子记录')).toBeChecked();
+  const preview=mocked.mock.calls.find(([url])=>url==='/api/deletions/preview')!;
+  expect(JSON.parse(String(preview[1]?.body))).toEqual({resource:'screenplay_jobs',ids:['job-1'],mode:'trash',cascade:true});
+
+  await user.click(screen.getByRole('button',{name:'确认执行删除'}));
+  await screen.findByText(/已删除 1 个历史任务/);
+  const execution=mocked.mock.calls.find(([url])=>url==='/api/deletions/execute')!;
+  expect(JSON.parse(String(execution[1]?.body))).toMatchObject({resource:'screenplay_jobs',ids:['job-1'],mode:'trash',cascade:true,fingerprint:'history-plan',confirm:true,confirm_permanent:false});
+  expect(screen.queryByRole('checkbox',{name:/选择任务\s+原样项目/})).not.toBeInTheDocument();
+  expect(screen.queryByRole('heading',{name:'原样项目'})).not.toBeInTheDocument();
+  expect(screen.getByRole('checkbox',{name:'选择任务 保留的剧本'})).not.toBeChecked();
+  if(status==='files_failed'){
+    const dialog=screen.getByRole('dialog',{name:'删除影响范围'});
+    expect(within(dialog).getByRole('status')).toHaveTextContent('部分文件清理失败，可重试');
+  }
+});
 
 it('preserves the exact project name and sends only the current mutually exclusive image input',async()=>{
   const user=userEvent.setup();mount();await screen.findByRole('option',{name:/本地视觉语言模型 · qwen/});await fillText(user);

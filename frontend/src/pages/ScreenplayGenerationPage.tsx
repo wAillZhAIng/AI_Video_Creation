@@ -3,6 +3,7 @@ import {Link,useSearchParams} from 'react-router-dom';
 import {ArrowRight,Download,RefreshCw,Upload,FileText} from 'lucide-react';
 import {api,request} from '../lib/api';
 import {Badge,FormField,LoadingState,PageHeader} from '../components/ui';
+import {DeleteRecordsDialog} from '../components/DeleteRecordsDialog';
 import type {ScreenplayInputAsset,ScreenplayIRPreview,ScreenplayJob,ScreenplayMode,ScreenplayOptions,ScreenplayReferenceTarget,ScreenplayScope} from '../lib/screenplay-generation-contract';
 import {ProductLibraryPicker,ReferenceVideoPicker,type ProductSelection} from '../components/ScreenplayLibraryInputs';
 import '../screenplay-generation.css';
@@ -49,6 +50,7 @@ export function ScreenplayGenerationPage(){
   const [cloudCosts,setCloudCosts]=useState(false),[paidFallback,setPaidFallback]=useState(false),[cloudMedia,setCloudMedia]=useState(false);
   const [loading,setLoading]=useState(true),[busy,setBusy]=useState(''),[error,setError]=useState(''),[notice,setNotice]=useState(''),[jobLoading,setJobLoading]=useState(false);
   const [selectedIds,setSelectedIds]=useState<Set<string>>(new Set());
+  const [deleteIds,setDeleteIds]=useState<string[]|null>(null);
   const [documentId,setDocumentId]=useState(''),[reviewed,setReviewed]=useState(false),[createProject,setCreateProject]=useState(false);
   const [referenceUse,setReferenceUse]=useState<'none'|'character'|'scene'>('none'),[referenceTarget,setReferenceTarget]=useState('');
   const [revisionScope,setRevisionScope]=useState<ScreenplayScope>('all'),[revisionTarget,setRevisionTarget]=useState(''),[revisionInstruction,setRevisionInstruction]=useState('');
@@ -57,9 +59,18 @@ export function ScreenplayGenerationPage(){
   const retrySubmission=useRef<{fingerprint:string;key:string}|null>(null);
   const resumeSubmission=useRef<{fingerprint:string;key:string}|null>(null);
   const alive=useRef(true),identity=useRef(selectedId),submission=useRef<{fingerprint:string;key:string}|null>(null),revisionSubmission=useRef<{fingerprint:string;key:string}|null>(null),busyRef=useRef(false);
+  const historyRefresh=useRef(0);
   identity.current=selectedId;
   useEffect(()=>{alive.current=true;return()=>{alive.current=false;};},[]);
-  async function refresh(){const [nextOptions,nextHistory]=await Promise.all([request<ScreenplayOptions>('/api/screenplay/options'),request<ScreenplayJob[]>('/api/screenplay/jobs')]);if(alive.current){setOptions(nextOptions);setHistory(nextHistory);}}
+  async function refresh(){
+    const revision=++historyRefresh.current;
+    const [nextOptions,nextHistory]=await Promise.all([request<ScreenplayOptions>('/api/screenplay/options'),request<ScreenplayJob[]>('/api/screenplay/jobs')]);
+    if(!alive.current||revision!==historyRefresh.current)return;
+    setOptions(nextOptions);
+    setHistory(nextHistory);
+    const visibleIds=new Set(nextHistory.map(item=>item.id));
+    setSelectedIds(ids=>new Set([...ids].filter(id=>visibleIds.has(id))));
+  }
   useEffect(()=>{let current=true;void refresh().catch(e=>{if(current)setError(String(e));}).finally(()=>{if(current)setLoading(false);});return()=>{current=false;};},[]);
   useEffect(()=>{
     const controller=new AbortController();let timer:ReturnType<typeof setTimeout>|undefined;
@@ -192,20 +203,27 @@ export function ScreenplayGenerationPage(){
       }
     }catch(e){if(alive.current)setError(String(e));}finally{busyRef.current=false;if(alive.current)setBusy('');}
   }
-  async function batchDeleteJobs(){
-    if(busyRef.current||selectedIds.size===0)return;
-    if(!window.confirm(`确认删除所选 ${selectedIds.size} 个任务吗？此操作不可撤销，会同步删除历史记录、Word 文档和磁盘上对应的素材文件夹。`))return;
-    busyRef.current=true;setBusy('batch-delete');setError('');setNotice('');
-    try{
-      const result=await request<{results:{id:string;ok:boolean;error?:string}[]}>('/api/screenplay/jobs/batch',{method:'DELETE',body:JSON.stringify({ids:[...selectedIds]})});
-      if(alive.current){
-        const ok=result.results.filter(r=>r.ok).map(r=>r.id),failed=result.results.filter(r=>!r.ok);
-        if(selectedId&&ok.includes(selectedId)){setSearch(current=>{const next=new URLSearchParams(current);next.delete('job');return next;});}
-        await refresh();
-        setSelectedIds(new Set());
-        setNotice(`已删除 ${ok.length} 个任务及对应的磁盘文件${failed.length?`；${failed.length} 个未成功`:''}。`);
-      }
-    }catch(e){if(alive.current)setError(String(e));}finally{busyRef.current=false;if(alive.current)setBusy('');}
+  function openBatchDelete(){
+    const ids=historySorted.filter(item=>selectedIds.has(item.id)).map(item=>item.id);
+    if(busyRef.current||!ids.length)return;
+    busyRef.current=true;
+    setBusy('batch-delete');setError('');setNotice('');setDeleteIds(ids);
+  }
+  function closeBatchDelete(){
+    busyRef.current=false;
+    setBusy('');setDeleteIds(null);
+  }
+  function completeBatchDelete(filesFailed:boolean){
+    if(!alive.current||!deleteIds)return;
+    const removed=new Set(deleteIds);
+    if(removed.has(identity.current)){
+      identity.current='';setJob(null);setJobLoading(false);
+      setSearch(current=>{const next=new URLSearchParams(current);next.delete('job');return next;},{replace:true});
+    }
+    setHistory(items=>items.filter(item=>!removed.has(item.id)));
+    setSelectedIds(ids=>new Set([...ids].filter(id=>!removed.has(id))));
+    setNotice(`已删除 ${removed.size} 个历史任务。${filesFailed?'部分文件清理失败，可在内容管理的删除任务与回收站中重试。':'可在内容管理的删除任务与回收站中查看处理结果。'}`);
+    void refresh().catch(e=>{if(alive.current)setError(String(e));});
   }
   async function batchResumeJobs(){
     if(busyRef.current||selectedIds.size===0)return;
@@ -267,7 +285,7 @@ export function ScreenplayGenerationPage(){
       <div className="screenplay-actions"><button className="button button-primary" disabled={!canGenerate}><FileText size={16}/>{busy==='generate'?'正在提交…':generating?'本次任务仍在执行':'生成剧本'}</button><button type="button" className="button button-secondary" disabled={!validInput||!effectiveService||!!busy||generating||cloud&&!cloudCosts||cloudMediaRequired&&!cloudMedia||service?.provider==='cloud_draft'||mode==='image'&&imageSource==='products'&&productSelections.length>1&&productMode==='separate'} onClick={()=>void generate(true)}>{busy==='test'?'正在提交测试…':'使用当前输入测试此模式能力'}</button><Link to="/settings">配置模型与服务</Link></div>
       {!validInput?<p className="form-hint">请填写项目名称、创作提示词和当前模式的素材；图片或视频需先上传保存。</p>:!candidate?.eligible?<p className="form-hint">此模式尚无有效生成证据。可先明确选择服务并执行一次真实能力测试，成功后再用于日常创作。</p>:null}
     </form>
-    <div className="screenplay-two-column"><section className="card"><div className="screenplay-review-header"><h2>剧本与历史版本</h2><button type="button" className="button button-secondary button-small" disabled={!!busy} onClick={()=>{void refresh().catch(e=>setError(String(e)));}}><RefreshCw size={14}/>刷新任务列表</button></div><div className="screenplay-job-list">{historySorted.map(item=><div key={item.id} className="screenplay-job-row"><input type="checkbox" aria-label={`选择任务 ${item.project_name}`} checked={selectedIds.has(item.id)} onChange={()=>toggleSelected(item.id)} disabled={!!busy}/><button type="button" disabled={!!busy} aria-current={item.id===selectedId} onClick={()=>selectJob(item.id)}><strong>{item.project_name}</strong><span>{modeLabels[item.input_mode]} · {labels[item.status]||item.status}{item.parent_job_id?' · 独立修订':''}</span><small>{item.created_at?new Date(item.created_at).toLocaleString():item.id}</small></button></div>)}</div>{historySorted.length>0?<div className="screenplay-batch-bar"><label className="screenplay-batch-select-all"><input type="checkbox" aria-label="全选/取消全选" checked={selectedIds.size===historySorted.length&&historySorted.length>0} onChange={toggleSelectAll} disabled={!!busy}/>全选（{selectedIds.size}/{historySorted.length}）</label>{selectedIds.size>0?<><button type="button" className="button button-secondary button-small" disabled={!!busy} onClick={()=>void batchCancelJobs()}>{busy==='batch-cancel'?`正在中止 ${selectedIds.size} 个…`:`中止所选 ${selectedIds.size} 个`}</button><button type="button" className="button button-secondary button-small" disabled={!!busy} onClick={()=>void batchResumeJobs()}>{busy==='batch-resume'?`正在继续 ${selectedIds.size} 个…`:`继续所选 ${selectedIds.size} 个`}</button><button type="button" className="button button-danger button-small" disabled={!!busy} onClick={()=>void batchDeleteJobs()}>{busy==='batch-delete'?`正在删除 ${selectedIds.size} 个…`:`删除所选 ${selectedIds.size} 个`}</button><button type="button" className="button button-secondary button-small" disabled={!!busy} onClick={clearSelection}>取消选择</button></>:null}</div>:null}{!history.length&&!loading?<p>还没有生成任务。所有版本会在这里保留。</p>:null}</section>
+    <div className="screenplay-two-column"><section className="card"><div className="screenplay-review-header"><h2>剧本与历史版本</h2><button type="button" className="button button-secondary button-small" disabled={!!busy} onClick={()=>{void refresh().catch(e=>setError(String(e)));}}><RefreshCw size={14}/>刷新任务列表</button></div><div className="screenplay-job-list">{historySorted.map(item=><div key={item.id} className="screenplay-job-row"><input type="checkbox" aria-label={`选择任务 ${item.project_name}`} checked={selectedIds.has(item.id)} onChange={()=>toggleSelected(item.id)} disabled={!!busy}/><button type="button" disabled={!!busy} aria-current={item.id===selectedId} onClick={()=>selectJob(item.id)}><strong>{item.project_name}</strong><span>{modeLabels[item.input_mode]} · {labels[item.status]||item.status}{item.parent_job_id?' · 独立修订':''}</span><small>{item.created_at?new Date(item.created_at).toLocaleString():item.id}</small></button></div>)}</div>{historySorted.length>0?<div className="screenplay-batch-bar"><label className="screenplay-batch-select-all"><input type="checkbox" aria-label="全选/取消全选" checked={selectedIds.size===historySorted.length&&historySorted.length>0} onChange={toggleSelectAll} disabled={!!busy}/>全选（{selectedIds.size}/{historySorted.length}）</label>{selectedIds.size>0?<><button type="button" className="button button-secondary button-small" disabled={!!busy} onClick={()=>void batchCancelJobs()}>{busy==='batch-cancel'?`正在中止 ${selectedIds.size} 个…`:`中止所选 ${selectedIds.size} 个`}</button><button type="button" className="button button-secondary button-small" disabled={!!busy} onClick={()=>void batchResumeJobs()}>{busy==='batch-resume'?`正在继续 ${selectedIds.size} 个…`:`继续所选 ${selectedIds.size} 个`}</button><button type="button" className="button button-danger button-small" disabled={!!busy} onClick={openBatchDelete}>{busy==='batch-delete'?`正在删除 ${selectedIds.size} 个…`:`删除所选 ${selectedIds.size} 个`}</button><button type="button" className="button button-secondary button-small" disabled={!!busy} onClick={clearSelection}>取消选择</button></>:null}</div>:null}{!history.length&&!loading?<p>还没有生成任务。所有版本会在这里保留。</p>:null}</section>
       <section className="card screenplay-review" aria-label="剧本审核">
         {jobLoading?<LoadingState label="读取剧本任务…"/>:!job?<p>选择历史任务，或先生成一份剧本。</p>:<>
           <div className="screenplay-review-header"><div><h2>{job.project_name}</h2><Badge tone={job.status==='approved'?'success':job.status==='failed'||job.status==='unknown'?'warning':'neutral'}>{pollLabel}</Badge></div><button type="button" className="button button-secondary button-small" disabled={!!busy} onClick={editInput}>返回修改创作输入</button></div>
@@ -301,5 +319,6 @@ export function ScreenplayGenerationPage(){
         </>}
       </section>
     </div>
+    {deleteIds?<DeleteRecordsDialog resource="screenplay_jobs" ids={deleteIds} initialMode="trash" initialCascade onClose={closeBatchDelete} onRecordsDeleted={completeBatchDelete}/>:null}
   </div>;
 }

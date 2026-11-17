@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from datetime import datetime
+from graphlib import TopologicalSorter
 from pathlib import Path, PurePosixPath
 from sqlalchemy import select, inspect, DateTime, LargeBinary
 from app import models as m
@@ -115,6 +116,17 @@ def _is_active_job(obj, selected):
     return status in ACTIVE
 
 
+def _ordered_records(records, *, reverse=False):
+    """Order tables by FK dependencies and screenplay revisions by lineage."""
+    tables={table.name:index for index,table in enumerate(Base.metadata.sorted_tables)}
+    parents={entry['id']:entry['values'].get('parent_job_id') for entry in records
+             if entry['table']=='screenplay_generation_jobs'}
+    dependencies={identifier:[parent] if parent in parents else [] for identifier,parent in parents.items()}
+    lineage={identifier:index for index,identifier in enumerate(TopologicalSorter(dependencies).static_order())}
+    return sorted(records,key=lambda entry:(tables[entry['table']],
+        lineage[entry['id']] if entry['table']=='screenplay_generation_jobs' else 0),reverse=reverse)
+
+
 def serialize(value):
     return json.loads(json.dumps(value,default=lambda x:x.isoformat() if isinstance(x,datetime) else None,ensure_ascii=False))
 
@@ -154,6 +166,13 @@ def file_entries(obj):
     if isinstance(obj,m.VoiceLibraryAsset) and obj.preview_relative_path:paths.append(obj.preview_relative_path)
     if isinstance(obj,m.CharacterBatch) and obj.contact_sheet_path: paths.append(obj.contact_sheet_path)
     if isinstance(obj,m.VideoRevision): paths.extend(obj.thumbnail_paths_json or [])
+    if isinstance(obj,m.ScreenplayGenerationJob):
+        source=(obj.receipt_json or {}).get('source') or {}
+        derivatives=[frame.get('relative_path') for frame in (source.get('frames') or []) if isinstance(frame,dict)]
+        derivatives.append(source.get('audio_relative_path'))
+        directory=PurePosixPath('screenplay_jobs',obj.id,'source_frames')
+        paths.extend(relative for relative in derivatives if isinstance(relative,str)
+                     and PurePosixPath(relative).parent==directory)
     for p in paths:
         owned=False;reason='文件归属未验证'
         if table=='character_assets':
@@ -189,6 +208,8 @@ def file_entries(obj):
         elif table=='screenplay_documents':
             owned=obj.id in p
             reason='生成Word归属未验证' if not owned else ''
+        elif table=='screenplay_generation_jobs':
+            owned=True  # Selected above from this job's own derivative receipt paths.
         yield {'path':p,'owned':owned,'protected_reason':reason if not owned else ''}
 
 
@@ -337,7 +358,8 @@ def build_plan(session,settings,resource,ids,mode,cascade=False):
             except AppError as exc:protected=exc.message
             if external:protected='其他有效记录共用'
             # Historical generation reference snapshots also keep source images alive.
-            for cls,field in [(m.GenerationJob,'reference_assets_json'),(m.CharacterGenerationJob,'snapshot_json')]:
+            for cls,field in [(m.GenerationJob,'reference_assets_json'),(m.CharacterGenerationJob,'snapshot_json'),
+                              (m.ScreenplayGenerationJob,'snapshot_json'),(m.ScreenplayGenerationJob,'receipt_json')]:
                 for job in session.scalars(select(cls)):
                     if (cls.__tablename__,job.id) not in selected and p in json.dumps(getattr(job,field),ensure_ascii=False):protected='历史或运行任务仍引用此文件'
             files[p]={'path':p,'bytes':size,'mtime_ns':mtime,'exists':exists,'protected':bool(protected),'reason':protected,'shared_references':external,'verified_owned':entry['owned']}
@@ -448,7 +470,6 @@ def execute_delete(session,settings,payload):
             record.ownership_json=[{'table':t,'id':i} for t,i,_ in find_references(session).get(f['path'],[]) if (t,i) not in selected]
             record.metadata_json={'deletion_task_id':task.id,'verified_owned':f['verified_owned'],'reason':f['reason'],'original_bytes':f['bytes']}
         # Reverse FK order; rollback leaves every file untouched on database failure.
-        order={table.name:i for i,table in enumerate(Base.metadata.sorted_tables)}
         from app.services.screenplay import touch_shot
         invalidated=set()
         for record in plan['records']:
@@ -470,7 +491,7 @@ def execute_delete(session,settings,payload):
             remaining=list(session.scalars(select(m.ProductImage).where(m.ProductImage.product_id==identifier,m.ProductImage.id.not_in(removed_product_images)).order_by(m.ProductImage.order,m.ProductImage.id)))
             if product.cover_image_id in removed_product_images:product.cover_image_id=remaining[0].id if remaining else None
             product.revision+=1
-        for item in sorted(plan['records'],key=lambda x:order[x['table']],reverse=True):
+        for item in _ordered_records(plan['records'],reverse=True):
             obj=session.get(MODELS[item['table']],item['id'])
             if obj:session.delete(obj);session.flush()
         task.status='files_pending';task.result_json={'records_deleted':len(plan['records']),'files':{}}
@@ -491,8 +512,7 @@ def restore_task(session,settings,task):
             if dest.exists():raise AppError(409,'restore_conflict','原位置已有文件，未覆盖')
             if not src.exists():raise AppError(409,'recycle_missing','回收站文件缺失，不能完整恢复')
             dest.parent.mkdir(parents=True,exist_ok=True);src.replace(dest);moved.append((dest,src))
-        order={table.name:i for i,table in enumerate(Base.metadata.sorted_tables)}
-        for item in sorted(task.plan_json['records'],key=lambda x:order[x['table']]):
+        for item in _ordered_records(task.plan_json['records']):
             cls=MODELS[item['table']]
             if session.get(cls,item['id']):raise AppError(409,'record_conflict','记录已存在，不能覆盖恢复')
             values=dict(item['values'])
