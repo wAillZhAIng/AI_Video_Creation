@@ -16,7 +16,7 @@ from app.models import Character, Project, ScriptRevision, WordImport
 from app.schemas_screenplay import ImportConfirm
 from app.services.cinematic_import import build_ir
 from app.services.content_manager import safe_file
-from app.services.word_screenplay import (block_lines, commit_import, match_characters,
+from app.services.word_screenplay import (block_lines, commit_import, duration_review_issues, match_characters,
     parse_blocks, read_blocks, summary, validate_preview)
 
 
@@ -174,15 +174,15 @@ async def import_word(session, settings, filename, data, *, project_id=None,
         # A changed screenplay targeting a project is an explicit new revision,
         # not a second hidden project or an overwrite of existing approved work.
         raise AppError(409,'new_revision_required','目标项目已有内容；请明确 new_revision=true 以保存新剧本版本')
+    preview=match_characters(session,build_ir(blocks,parse_blocks))
     batch=WordImport(filename=filename,sha256=sha,status='parsing',relative_path='',blocks_json=blocks)
     session.add(batch);session.flush()
     batch.relative_path=f'word_imports/{batch.id}/original.docx'
     destination=safe_file(settings.media_root,batch.relative_path)
     destination.parent.mkdir(parents=True,exist_ok=True);destination.write_bytes(data)
-    preview=match_characters(session,build_ir(blocks,parse_blocks))
     parser={'mode':'local_source_preserving_rules','language_model_called':False}
     issues=ambiguities(session,preview)
-    if issues:
+    if issues and not duration_review_issues(preview):
         extracted,parser=await language_extract(session,settings,project_id,blocks,allow_cloud_costs,allow_paid_fallback)
         if extracted is not None:preview=match_characters(session,extracted);issues=ambiguities(session,preview)
     preview['content_fingerprint']=fingerprint;preview['semantic_parser']=parser

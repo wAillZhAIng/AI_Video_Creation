@@ -9,10 +9,12 @@ from sqlalchemy import func, select
 
 from app import models as m
 from app.services.studio_import import content_fingerprint, language_extract
+from app.services.word_duration import parse_shot_duration
 from app.services.word_screenplay import read_blocks
 
 
-def screenplay(*, same_scene=False, second_weather='雨', extra_line='', name='赵舟', stable='studio_zhaozhou', aspect_ratio='16:9'):
+def screenplay(*, same_scene=False, second_weather='雨', extra_line='', name='赵舟', stable='studio_zhaozhou',
+               aspect_ratio='16:9', durations=('时长：5秒', '时长：5秒')):
     doc=Document();doc.add_heading('自动化三人剧本',0)
     lines=['项目基本信息','项目名称：自动化夜班','画幅：'+aspect_ratio,'人物设定']
     for n,person in enumerate([name,'周青','罗宁']):
@@ -27,7 +29,7 @@ def screenplay(*, same_scene=False, second_weather='雨', extra_line='', name='�
         lines += [f'场景 {n+1} {room}','地点：'+room,'时间：夜','天气：'+('雨' if n==0 else second_weather),
             '灯光：低亮度顶灯','环境声：雨水击打金属棚顶',f'分镜 {n+1} 三人核对',
             '出场人物：'+name+'、周青、罗宁','画面：三位成年人围在桌旁，记录本始终合上',
-            '时长：5秒','运镜：固定','表演：'+name+'｜动作=手扶合上的记录本；位置=左侧；情绪=克制',
+            durations[n],'运镜：固定','表演：'+name+'｜动作=手扶合上的记录本；位置=左侧；情绪=克制',
             '表演：周青｜动作=指向桌上记录本；位置=中间；情绪=专注',
             '表演：罗宁｜动作=看向周青并点头；位置=右侧；情绪=认真',
             '对白：'+name+'：记录在这里。','对白：周青：我来核对。','对白：罗宁：收到。']
@@ -39,6 +41,102 @@ def screenplay(*, same_scene=False, second_weather='雨', extra_line='', name='�
 def upload(client, data=None, **form):
     return client.post('/api/studio/import',files={'file':('自动化.docx',data or screenplay())},data={
         'auto_start':'false',**{k:str(v).lower() if isinstance(v,bool) else str(v) for k,v in form.items()}})
+
+
+@pytest.mark.parametrize(('value', 'expected'), [
+    ('8', 8), ('大约 8 秒', 8), ('８.５ Ｓ', 8.5), ('0分8.5秒', 8.5), ('1 minute', 60), ('00:08', 8),
+    ('00:00–00:08｜8秒', 8), ('00:56—01:04（8 seconds）', 8),
+    ('00:00:56,250 --> 00:01:04,750', 8.5), ('0～8秒', 8), ('8s 至 16s｜时长：8s', 8),
+])
+def test_read_word_duration_formats(value, expected):
+    assert parse_shot_duration(value) == expected
+
+
+@pytest.mark.parametrize('value', [
+    '0秒', '-8秒', '90秒', '1.2.3秒', '01:80', '8–12秒', '00:08–00:00',
+    '00:56–01:04｜7秒', '00:56–01:04｜待定', '00:00–00:08｜0秒',
+])
+def test_ambiguous_or_invalid_word_durations_are_not_silently_parsed(value):
+    with pytest.raises(ValueError):
+        parse_shot_duration(value)
+
+
+def test_studio_import_keeps_elapsed_seconds_and_source_for_each_shot(client):
+    response = upload(client, screenplay(durations=('时长：00:00–00:08｜8秒', '镜头时长（秒）：01:04–01:12｜8秒')))
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result['status'] == 'imported' and not result['parser']['language_model_called']
+    with client.app.state.session_factory() as db:
+        for shot_id in result['shot_ids']:
+            assert db.get(m.StoryboardShot, shot_id).duration_seconds == 8
+            detail = db.scalar(select(m.ShotDetail).where(m.ShotDetail.shot_id == shot_id))
+            assert detail.source_json['provenance']['duration_seconds']['state'] == 'explicit'
+
+
+def test_studio_import_understands_duration_columns_in_word_tables(client):
+    doc = Document()
+    doc.add_heading('时间码表格', 0)
+    table = doc.add_table(rows=0, cols=5)
+    for row in (
+        ('Scene', 'Shot', 'Duration (s)', 'Visual', 'Camera'),
+        ('工作室', '桌边', '00:08.000 --> 00:13.400', '窗边的台灯亮起', '固定'),
+        ('', '窗边', '00:13.400—00:21.400（8秒）', '窗帘缓慢摆动', '固定'),
+    ):
+        for cell, value in zip(table.add_row().cells, row):
+            cell.text = value
+    content = BytesIO()
+    doc.save(content)
+    response = upload(client, content.getvalue())
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result['status'] == 'imported'
+    with client.app.state.session_factory() as db:
+        assert [db.get(m.StoryboardShot, shot).duration_seconds for shot in result['shot_ids']] == [5.4, 8]
+
+
+def test_conflicting_durations_require_review_and_can_be_corrected(client, monkeypatch):
+    from app.services import studio_import
+
+    async def unexpected_model_call(*args, **kwargs):
+        pytest.fail('Unresolved durations should go directly to preview')
+
+    monkeypatch.setattr(studio_import, 'language_extract', unexpected_model_call)
+    invalid = '00:56–01:04｜7秒'
+    response = upload(client, screenplay(durations=('时长：1..2秒', '时长：' + invalid)), auto_start=True)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result['status'] == 'pending_review' and not result['pipeline']
+    assert any('第 1 镜' in issue for issue in result['issues'])
+    assert any('第 2 镜' in issue and invalid in issue for issue in result['issues'])
+    with client.app.state.session_factory() as db:
+        for model in (m.Project, m.StoryboardShot, m.StudioRun):
+            assert db.scalar(select(func.count()).select_from(model)) == 0
+    preview = result['preview']
+    assert preview['shots'][1]['provenance']['duration_seconds']['source_text'] == invalid
+    api = result['preview_url']
+    blocked = client.post(api + '/confirm', json={'revision': result['revision'], 'duplicate_strategy': 'new_project'})
+    assert blocked.status_code == 422, blocked.text
+    for shot in preview['shots']:
+        shot['duration_seconds'] = 8
+        shot['suggested'].remove('duration_seconds')
+    edited = client.put(api + '/preview', json={'revision': result['revision'], 'preview': preview})
+    assert edited.status_code == 200 and not edited.json()['issues'], edited.text
+    saved = client.post(api + '/confirm', json={'revision': edited.json()['revision'], 'duplicate_strategy': 'new_project'})
+    assert saved.status_code == 200 and len(saved.json()['shot_ids']) == 2, saved.text
+
+
+def test_word_schema_error_returns_fields_without_staging_an_untracked_file(client, settings):
+    doc = Document(BytesIO(screenplay()))
+    heading = next(p for p in doc.paragraphs if p.text.startswith('分镜 1 '))
+    heading.text = '分镜 1 ' + '长' * 241
+    content = BytesIO()
+    doc.save(content)
+    response = upload(client, content.getvalue())
+    assert response.status_code == 422, response.text
+    error = response.json()['error']
+    assert error['code'] == 'word_screenplay_invalid'
+    assert ['shots', 0, 'title'] in [field['loc'] for field in error['details']['fields']]
+    assert not list((settings.media_root / 'word_imports').glob('*/original.docx'))
 
 
 def test_one_upload_creates_graph_and_every_explicit_identity_trait(client):

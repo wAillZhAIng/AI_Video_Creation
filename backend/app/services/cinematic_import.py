@@ -5,6 +5,11 @@ suggestions and unknown prose is retained for review.
 """
 import copy
 import re
+import unicodedata
+
+from pydantic import ValidationError
+
+from app.core.errors import AppError
 from app.schemas_cinematic import ScreenplayIR
 from app.services.cinematic_rules import rules_bundle,field_provenance
 
@@ -15,10 +20,18 @@ def paragraph(text,source):return {'id':source,'kind':'paragraph','style':'Compa
 def normalize_blocks(blocks,rules):
     result=[];notes=[];names=[];scene=False;shot=False;in_people=False
     aliases={name.casefold():canonical for canonical,values in rules['aliases'].items() for name in values}
+
+    def canonical_field(label):
+        key = unicodedata.normalize('NFKC', label).strip().casefold()
+        base = re.sub(r'\s*\(\s*(?:秒|s|sec(?:s|onds?)?)\s*\)$', '', key)
+        if aliases.get(base) == '时长' or base in {'镜头时长', '分镜时长', 'shot duration'}:
+            return '时长'
+        return aliases.get(key, label)
+
     for block in blocks:
         if block['kind']=='table':
             rows=block['rows'];headers=rows[0] if rows else []
-            canon=[aliases.get(h.strip().casefold(),h.strip()) for h in headers]
+            canon=[canonical_field(h.strip()) for h in headers]
             if any(v in canon for v in ['场景','分镜']) and len(rows)>1:
                 for n,values in enumerate(rows[1:],1):
                     data=dict(zip(canon,values));source=f"{block['id']}:row:{n}"
@@ -64,7 +77,7 @@ def normalize_blocks(blocks,rules):
             text='分镜 '+numbers.get(shot_heading[1],shot_heading[1])+' '+(shot_heading[2] or '待命名镜头');shot=True
         parts=re.split('[:：]',text,maxsplit=1)
         if len(parts)==2:
-            key,value=parts[0].strip(),parts[1].strip();canonical=aliases.get(key.casefold(),key)
+            key,value=parts[0].strip(),parts[1].strip();canonical=canonical_field(key)
             if canonical not in ['人物','场景','分镜']:text=canonical+'：'+value
             speaking=re.match(r'^(.+?)(?:说道|说|问|答|低声说|says)$',key)
             if speaking and speaking[1].strip() in names:text='对白：'+speaking[1].strip()+'：'+value
@@ -122,7 +135,9 @@ def build_ir(blocks,legacy_parser):
         if 'duration_seconds' in shot['suggested']:shot['duration_seconds']=rules['defaults']['duration_seconds']
         if 'camera_move' in shot['suggested']:shot['camera_move']=rules['defaults']['camera_move']
         shot['production']={'scene_state_key':'state_'+shot['scene_key'],'wardrobe_states':{},'prop_states':[],'beats':[],'start_state':shot.get('photography',{}).get('start_state',''),'end_state':shot.get('photography',{}).get('end_state','')}
-        shot['provenance']={k:field_provenance(shot.get(k),shot['source'],'suggested' if k in shot['suggested'] or set(shot['source'])&inferred else 'explicit') for k in ['title','visual_prompt','duration_seconds','camera_move']}
+        shot['provenance']={**{
+            k:field_provenance(shot.get(k),shot['source'],'suggested' if k in shot['suggested'] or set(shot['source'])&inferred else 'explicit')
+            for k in ['title','visual_prompt','duration_seconds','camera_move']}, **shot.get('provenance', {})}
         for person in shot['participants']:
             wardrobe=next((d for d in ir['designs'] if d.get('character_key')==person['character_key']),None)
             perf=person['performance']
@@ -132,7 +147,12 @@ def build_ir(blocks,legacy_parser):
     extract_production_fields(ir,normalized,rules)
     for design in ir['designs']:
         design['provenance']={key:field_provenance(value,design['source']) for key,value in design['spec'].items()}
-    return ScreenplayIR.model_validate(ir).model_dump()
+    try:
+        return ScreenplayIR.model_validate(ir).model_dump()
+    except ValidationError as exc:
+        errors = exc.errors(include_url=False, include_context=False, include_input=False)[:8]
+        fields = '、'.join('.'.join(map(str, error['loc'])) for error in errors)
+        raise AppError(422, 'word_screenplay_invalid', f'文档内容未通过剧本校验，请核对 {fields}。', {'fields': errors}) from exc
 
 
 def extract_production_fields(ir,blocks,rules):

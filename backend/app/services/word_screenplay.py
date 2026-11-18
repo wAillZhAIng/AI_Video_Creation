@@ -9,7 +9,9 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 from sqlalchemy import select, func
 from app.core.errors import AppError
+from app.services.cinematic_rules import field_provenance
 from app.services.imports import parse_uploaded_document
+from app.services.word_duration import parse_shot_duration
 from app.models import (Character, CharacterVersion, CharacterAlias, WordImport, Project, ScriptRevision,
     SourceDocument, Scene, StoryboardShot, ShotDetail, ShotCharacter, DialogueLine, AudioEvent)
 from app.schemas import ShotCreate
@@ -147,8 +149,19 @@ def parse_blocks(blocks):
             elif key in ('运镜','镜头运动'):
                 shot['camera_move']=value;shot['suggested']=[x for x in shot['suggested'] if x!='camera_move']
             elif key in ('时长','建议时长'):
-                match=re.search(r'[\d.]+',value)
-                if match: shot['duration_seconds']=float(match[0]);shot['suggested']=[x for x in shot['suggested'] if x!='duration_seconds']
+                if not value:
+                    continue
+                provenance = shot.setdefault('provenance', {})
+                try:
+                    shot['duration_seconds'] = parse_shot_duration(value)
+                except ValueError as exc:
+                    provenance['duration_seconds'] = {
+                        **field_provenance(value, [source], 'conflict', str(exc)), 'source_text': value[:240]}
+                    if 'duration_seconds' not in shot['suggested']:
+                        shot['suggested'].append('duration_seconds')
+                else:
+                    provenance['duration_seconds'] = field_provenance(shot['duration_seconds'], [source])
+                    shot['suggested'] = [x for x in shot['suggested'] if x != 'duration_seconds']
             elif key in camera_fields: shot['photography'][camera_fields[key]]=value
             elif key=='表演':
                 bits=re.split('[｜|]',value,maxsplit=1)
@@ -211,6 +224,17 @@ def match_characters(session,preview):
     return preview
 
 
+def duration_review_issues(preview):
+    issues = []
+    for index, shot in enumerate(preview.get('shots', []), 1):
+        provenance = (shot.get('provenance') or {}).get('duration_seconds', {})
+        if isinstance(provenance, dict) and provenance.get('state') == 'conflict' and 'duration_seconds' in shot.get('suggested', []):
+            reason = provenance.get('reason') or '请填写实际秒数'
+            source = str(provenance.get('source_text', ''))[:120]
+            issues.append(f'第 {index} 镜的时长待核对。{reason}。原文「{source}」。')
+    return issues
+
+
 def validate_preview(session,p):
     issues=[]
     if p.get('versions'):
@@ -252,7 +276,7 @@ def validate_preview(session,p):
             if not isinstance(line.get('text'),str) or not line['text'].strip() or len(line['text'])>20000:issues.append('对白文本无效')
         try: ShotCreate(order=1,scene_title=shot.get('title',''),duration_seconds=shot.get('duration_seconds',5),visual_prompt=shot.get('visual_prompt',''),camera_move=shot.get('camera_move',''))
         except ValueError: issues.append('分镜标题、时长或摄影参数无效')
-    return issues
+    return [*issues, *duration_review_issues(p)]
 
 
 def summary(p):
