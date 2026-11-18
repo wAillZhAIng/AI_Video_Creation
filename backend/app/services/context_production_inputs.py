@@ -8,7 +8,7 @@ import re
 from sqlalchemy import select
 from app import models as m
 from app.core.errors import AppError
-from app.services.cinematic_quality import generation_inputs_hash, production_context, shot_preflight
+from app.services.cinematic_quality import generation_inputs_hash, production_context, shot_preflight, unbound_prop_notes
 from app.services.cinematic_rules import fingerprint
 from app.services.identity_references import actor_references, reference_manifest, verified_image
 from app.services.motion_references import resolve_motion_references
@@ -192,12 +192,21 @@ def collect_context_inputs(session, settings, shot, *, prompt_override=None, ins
         if value and str(value).strip():
             parts.append(f'{label}：{value}')
     people = []
+    wardrobe_states = production.get('wardrobe_states', {})
+    wardrobe_entities = {entity.id for entity in entities if entity and entity.kind == 'wardrobe'}
     for p in participants:
         version = session.get(m.CharacterVersion, p.get('character_version_id'))
         identity = version.identity_json if version and version.approval_state == 'approved' else {}
         facts = {key: identity[key] for key in ('fixed_identity', 'description', 'default_clothing', 'profile') if key in identity}
         performance = {k: v for k, v in (p.get('performance_json') or {}).items() if k != 'reference_audio_asset_id'}
-        people.append({'名称': p['name'], '人物描述': facts, '表演': performance})
+        entry = {'名称': p['name'], '人物描述': facts, '表演': performance}
+        wardrobe = wardrobe_states.get(p['character_id'], {})
+        if wardrobe and wardrobe.get('entity_id') not in wardrobe_entities:
+            notes = {key: value for key, value in wardrobe.items()
+                     if key not in {'entity_id', 'wardrobe_key', 'source_ids'} and value}
+            if notes:
+                entry['服装状态'] = notes
+        people.append(entry)
     product_names = {ref['product_id']: ref['product_name'] for ref in library_refs}
     product_directions = [{'商品': ref['product_name'], '图片': f"<Picture {ref['picture_index']}>"}
                           for ref in prop_refs] or [
@@ -207,10 +216,11 @@ def collect_context_inputs(session, settings, shot, *, prompt_override=None, ins
     prop_entities = {entity.id: entity.name for entity in entities if entity and entity.kind == 'prop'}
     prop_states = [
         {'道具': prop_entities[state['entity_id']], **{key: state[key] for key in (
-            'holder', 'hand', 'location', 'state', 'visible_state', 'open_state', 'wetness', 'damage',
+            'holder', 'hand', 'location', 'state', 'visible_state', 'open_state', 'wetness', 'damage', 'description',
         ) if key in state}}
         for state in production.get('prop_states', []) if state.get('entity_id') in prop_entities
     ]
+    prop_notes = unbound_prop_notes(production, prop_entities)
     lines = [{'说话人': actor_names.get(line['participant_id']), '台词': line['text'], '表达': line['delivery_json']}
              for line in bundle['dialogues'] if line['text'].strip()]
     if not lines and shot.dialogue:
@@ -223,7 +233,7 @@ def collect_context_inputs(session, settings, shot, *, prompt_override=None, ins
     for label, value in (
         ('场景与材质', scene.environment_json if scene else None),
         ('摄影', effective_photography), ('人物', people), ('商品', product_directions),
-        ('道具镜头状态', prop_states),
+        ('道具镜头状态', prop_states), ('道具说明', prop_notes),
         ('对白', lines if audio_policy != 'skip' else None),
         ('声音事件', [{key: event.get(key) for key in ('kind','description','start_seconds','end_seconds','volume')}
                       for event in audio_events]),
@@ -232,7 +242,7 @@ def collect_context_inputs(session, settings, shot, *, prompt_override=None, ins
     ):
         if value:
             parts.append(f'{label}：{json.dumps(value, ensure_ascii=False, default=str)}')
-    if not any((user_prompt, shot.action, shot.narration, shot.location, lines, references, motion)):
+    if not any((user_prompt, shot.action, shot.narration, shot.location, lines, references, motion, prop_states, prop_notes)):
         raise AppError(422, 'context_prompt_required', '没有参考素材时，请填写本镜的生成要求')
     if motion and not any(ref.get('role') == 'identity' for ref in references):
         parts.append('动作参考仅提供动作、节奏和运镜。以明确绑定的人物文字设定为准，原片出镜者不自动关联为项目人物。')

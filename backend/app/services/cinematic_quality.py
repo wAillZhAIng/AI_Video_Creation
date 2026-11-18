@@ -6,6 +6,8 @@ from sqlalchemy import select
 from app import models as m
 from app.services.cinematic_rules import rules_bundle,fingerprint
 
+OPTIONAL_DESIGN_FINDINGS = {'wardrobe_undefined', 'prop_undefined'}
+
 
 def issue(code,severity,message,shot_key=None,source_ids=None,repair=None):
     return {'code':code,'severity':severity,'message':message,'shot_key':shot_key,'source_ids':source_ids or [],'repair':repair}
@@ -38,15 +40,23 @@ def inspect_ir(ir):
             if any(beat['start_seconds']<b['end_seconds'] and beat['end_seconds']>b['start_seconds'] for b in existing):findings.append(issue('overlapping_actions','review','同一人物的动作节拍重叠，需要明确是否同步',key,beat.get('source_ids',[]),'action'))
             existing.append(beat)
         for person,state in prod.get('wardrobe_states',{}).items():
-            design=designs.get(state.get('wardrobe_key'))
-            if design is None:findings.append(issue('wardrobe_undefined','blocker','本镜服装ID没有对应造型记录',key,state.get('source_ids',[]),'wardrobe'))
-            elif design.get('character_key') and design['character_key']!=person:findings.append(issue('wardrobe_owner','blocker','服装造型属于另一人物',key,state.get('source_ids',[]),'wardrobe'))
+            identifier=state.get('wardrobe_key')
+            design=designs.get(identifier)
+            if design is None:
+                if identifier:
+                    findings.append(issue('wardrobe_undefined','suggestion','本镜造型版本未匹配，制作使用剧本的服装说明',key,state.get('source_ids',[]),'wardrobe'))
+                continue
+            if design.get('character_key') and design['character_key']!=person:findings.append(issue('wardrobe_owner','blocker','服装造型属于另一人物',key,state.get('source_ids',[]),'wardrobe'))
             old=previous_looks.get(person);current={k:v for k,v in state.items() if k!='source_ids'}
             if old and old!=current and not reason:findings.append(issue('wardrobe_state_jump','review','相邻镜头服装/干湿等状态变化未说明原因',key,state.get('source_ids',[]),'wardrobe'))
             previous_looks[person]=current
         for state in prod.get('prop_states',[]):
-            identifier=state.get('prop_key');old=previous_props.get(identifier,{})
-            if identifier not in designs:findings.append(issue('prop_undefined','blocker','本镜道具ID尚未定义',key,state.get('source_ids',[]),'prop'))
+            identifier=state.get('prop_key')
+            if identifier not in designs:
+                if identifier:
+                    findings.append(issue('prop_undefined','suggestion','本镜道具版本未匹配，制作使用剧本的道具说明',key,state.get('source_ids',[]),'prop'))
+                continue
+            old=previous_props.get(identifier,{})
             for field in ('holder','hand','location','open_state','wetness','damage'):
                 if field in old and field in state and old[field]!=state[field] and not reason:
                     findings.append(issue('prop_state_jump','review',f'道具 {identifier} 的 {field} 从“{old[field]}”变成“{state[field]}”，未说明衔接',key,state.get('source_ids',[]),'prop'))
@@ -61,8 +71,11 @@ def production_context(session,shot):
     scene=session.get(m.Scene,detail.scene_id) if detail and detail.scene_id else None
     script=session.get(m.ScriptRevision,scene.script_revision_id) if scene and scene.script_revision_id else None
     production=(detail.source_json or {}).get('production',{}) if detail else {}
-    ids=[production.get('scene_state_id')]+[v.get('entity_id') for v in production.get('wardrobe_states',{}).values()]+[v.get('entity_id') for v in production.get('prop_states',[])]
+    scene_state_id=production.get('scene_state_id')
+    ids=[scene_state_id]+[v.get('entity_id') for v in production.get('wardrobe_states',{}).values()]+[v.get('entity_id') for v in production.get('prop_states',[])]
     entities=[session.get(m.ProductionEntity,k) for k in dict.fromkeys(ids) if k]
+    if scene_state_id and not any(entity and entity.id == scene_state_id for entity in entities):
+        production={**production,'scene_state_id':None}
     return detail,scene,script,production,entities
 
 
@@ -77,8 +90,8 @@ def database_ir(session,script,shots):
             c=session.get(m.Character,p.character_id);people[c.id]={'key':c.id,'name':c.display_name,'decision':'existing','profile':{},'source':[]}
             participants.append({'character_key':c.id,'performance':p.performance_json})
         production=copy.deepcopy(prod)
-        production['wardrobe_states']={k:{**v,'wardrobe_key':v.get('entity_id')} for k,v in prod.get('wardrobe_states',{}).items()}
-        production['prop_states']=[{**v,'prop_key':v.get('entity_id')} for v in prod.get('prop_states',[])]
+        production['wardrobe_states']={k:{**v,'wardrobe_key':v.get('entity_id') or v.get('wardrobe_key')} for k,v in prod.get('wardrobe_states',{}).items()}
+        production['prop_states']=[{**v,'prop_key':v.get('entity_id') or v.get('prop_key')} for v in prod.get('prop_states',[])]
         production['beats']=[{**v,'character_key':v.get('character_id',v.get('character_key'))} for v in prod.get('beats',[])]
         lines=[]
         for line in session.scalars(select(m.DialogueLine).where(m.DialogueLine.shot_id==shot.id)):
@@ -122,7 +135,8 @@ def shot_preflight(session,settings,shot,require_visual=True,*,context_inputs=Fa
     if enabled:
         siblings=list(session.scalars(select(m.StoryboardShot).join(m.ShotDetail,m.ShotDetail.shot_id==m.StoryboardShot.id).join(m.Scene,m.Scene.id==m.ShotDetail.scene_id).where(m.Scene.script_revision_id==script.id).order_by(m.StoryboardShot.order,m.StoryboardShot.id)))
         report=inspect_ir(database_ir(session,script,siblings))
-        findings.extend(f for f in report['findings'] if f['shot_key'] in [None,shot.id] and f['severity'] in ['blocker','review']
+        findings.extend(f for f in report['findings'] if f['shot_key'] in [None,shot.id]
+                        and (f['severity'] in ['blocker','review'] or f['code'] in OPTIONAL_DESIGN_FINDINGS)
                         and not(context_inputs and f['code']=='cast_unknown'))
     if not enabled and not context_inputs:findings.append(issue('legacy_rules','review','旧镜头未采用电影规范；须主动建立新修订以应用新规范',shot.id))
     image_participants=[p for p in bundle['participants'] if p['reference_asset_ids_json']] if context_inputs else bundle['participants']
@@ -147,7 +161,7 @@ def shot_preflight(session,settings,shot,require_visual=True,*,context_inputs=Fa
     except AppError as exc:
         findings.append(issue(exc.code,'blocker',exc.message,shot.id,repair='product'))
     for e in entities:
-        if e is None:findings.append(issue('design_missing','blocker','当前绑定的制作设定已不存在',shot.id))
+        if e is None:findings.append(issue('design_missing','suggestion','制作设定已不存在，制作使用本镜剧本说明',shot.id))
         elif e.project_id!=shot.project_id:findings.append(issue('design_project_mismatch','blocker','制作设定属于其他项目',shot.id))
         elif e.status!='approved':findings.append(issue('design_unreviewed','review',e.name+' v'+str(e.version)+'尚未审核确认',shot.id,repair='wardrobe' if e.kind=='wardrobe' else 'scene' if e.kind=='scene_state' else 'prop'))
     beats=prod.get('beats',[])
@@ -267,19 +281,44 @@ def inspect_generated(job,checks):
         {'check_type':'cinematic_visual_continuity','status':'not_configured','details':{'identity':'manual review required','hands_and_contact':'manual review required','flicker_motion':'manual review required','costume_scene_audio':'manual review required','numeric_film_quality_score':None}}]
 
 
+def unbound_prop_notes(production, prop_entity_ids):
+    """Read prop prose without turning a historical label into a reference."""
+    fields = ('name', 'description', 'holder', 'hand', 'location', 'state', 'visible_state',
+              'open_state', 'wetness', 'damage', 'dirt')
+    notes = []
+    for state in production.get('prop_states', []):
+        if state.get('entity_id') in prop_entity_ids:
+            continue
+        note = {key: state[key] for key in fields if state.get(key)}
+        if not note.get('description') and state.get('prop_key'):
+            # Older Word imports stored the entire sentence in prop_key.
+            note['description'] = state['prop_key']
+        if note:
+            notes.append(note)
+    return notes
+
+
 def physical_directions(context,performer_names=None):
     """Compile explicit contact constraints rather than expecting JSON to steer them."""
-    production=context.get('production',{});entities={e['id']:e for e in context.get('entities',[])};result=[]
+    production=context.get('production',{})
+    entities={e['id']:e for e in context.get('entities',[]) if e.get('kind') == 'prop'}
+    notes=unbound_prop_notes(production, entities)
+    result=['Screenplay prop notes: '+json.dumps(notes,ensure_ascii=False)] if notes else []
     contact_text=' '.join(str(b.get('action',''))+' '+str(b.get('contact_target','')) for b in production.get('beats',[]))+' '+str(context.get('action',''))
     handoff=bool(re.search(r'递|接收|交接|传递|接过|hand.?off|\bpass|\bgive|\breceiv|\btransfer|\btake',contact_text,re.I))
     for state in production.get('prop_states',[]):
-        entity=entities.get(state.get('entity_id'),{});name=entity.get('logical_id',state.get('prop_key','prop'))
+        entity=entities.get(state.get('entity_id'))
+        if entity is None:
+            continue
+        name=entity.get('logical_id',state.get('prop_key','prop'))
         holder=state.get('holder','specified holder');index=(performer_names or {}).get(holder)
         if index:holder=f'the performer from reference image {index} ({holder})'
         hand={'右手':'RIGHT hand','左手':'LEFT hand'}.get(state.get('hand'),state.get('hand','unspecified hand'))
         closure={'合上':'CLOSED, covers together, no visible inner pages','关闭':'CLOSED','打开':'OPEN'}.get(state.get('open_state'),state.get('open_state','unspecified'))
         ownership=(f'Initial state: {holder} holds it with the {hand} at {state.get("location","specified position")}. During the explicitly described handoff, the declared receiver may contact and receive this SAME single object; follow the timed giver/contact/release/receiver-hold beats, never create a second copy.' if handoff else f'Only {holder} holds this object, with the {hand}, at {state.get("location","specified position")}. Performers without any declared object assignment keep their hands free; other declared object holders retain their own separately assigned props. Preserve this static state; looking at an object does not mean taking or opening it.')
         result.append(f'CONTACT AND OBJECT COUNT: exactly ONE physical {name}, never duplicated. '+ownership+f' Object state: {closure}. Material and appearance: '+json.dumps(entity.get('spec',{}),ensure_ascii=False))
+        if state.get('description'):
+            result.append('Prop direction: '+str(state['description']))
     return '\n'.join(result)
 
 

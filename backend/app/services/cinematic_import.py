@@ -158,7 +158,7 @@ def build_ir(blocks,legacy_parser):
 def extract_production_fields(ir,blocks,rules):
     from app.services.word_screenplay import block_lines
     lookup={label:key for key,label in rules['field_labels'].items()}
-    current_design=None;current_shot=None;consumed=set()
+    current_design=None;current_shot=None;consumed=set();prop_notes=[]
     for text,source in block_lines(blocks):
         found=re.match(r'^(道具|服装|造型)\s+([\w-]+)\s+(.+)$',text)
         if found:
@@ -182,13 +182,12 @@ def extract_production_fields(ir,blocks,rules):
             prod=current_shot['production']
             if key=='状态变化原因':prod['state_change_reason']=value;consumed.add((source,text))
             elif key=='道具状态':
-                bits=[v.strip() for v in value.split('｜')];data={}
-                for pair in bits[1:]:
-                    part=re.split('[=＝]',pair,maxsplit=1)
-                    if len(part)==2:data[lookup.get(part[0],part[0])]=part[1]
-                prod['prop_states'].append({'prop_key':bits[0],**data,'source_ids':[source]})
+                if value:
+                    prop_notes.append((prod, value, source))
                 consumed.add((source,text))
             elif key=='造型状态':
+                if not value:
+                    consumed.add((source,text));continue
                 bits=[v.strip() for v in value.split('｜')]
                 person=next((p for p in ir['characters'] if p['name']==bits[0] or bits[0] in p['aliases']),None)
                 if person and len(bits)>=2:
@@ -208,4 +207,23 @@ def extract_production_fields(ir,blocks,rules):
                         if len(part)==2:beat[lookup.get(part[0],part[0])]=part[1]
                     prod['beats'].append(beat)
                     consumed.add((source,text))
+    prop_keys = {design['key'] for design in ir['designs'] if design['kind'] == 'prop'}
+    for production, value, source in prop_notes:
+        label, *fields = (part.strip() for part in re.split('[｜|]', value))
+        if label in prop_keys:
+            state = {'prop_key': label}
+            notes = []
+            for field in fields:
+                pair = re.split('[=＝]', field, maxsplit=1)
+                attribute = pair[0].strip()
+                key = lookup.get(attribute, attribute)
+                if len(pair) == 2 and key and key not in {'prop_key', 'entity_id', 'source_ids'}:
+                    state[key] = pair[1].strip()
+                elif field:
+                    notes.append(field)
+            if notes:
+                state['description'] = '｜'.join(notes)
+        else:
+            state = {'description': value}
+        production['prop_states'].append({**state, 'source_ids': [source]})
     ir['unrecognized']=[item for item in ir['unrecognized'] if (item.get('source'),item.get('text')) not in consumed]

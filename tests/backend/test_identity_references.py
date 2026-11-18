@@ -86,8 +86,9 @@ def test_provider_replaces_extra_template_slots_in_exact_numeric_order():
 
 
 def test_handoff_constraints_allow_receiver_contact_without_object_duplication():
-    context={'production':{'prop_states':[{'prop_key':'NOTEBOOK','holder':'giver','hand':'right'}],
-        'beats':[{'character_id':'giver','action':'passes notebook to receiver','contact_target':'receiver'}]},'entities':[]}
+    context={'production':{'prop_states':[{'entity_id':'notebook_version','prop_key':'NOTEBOOK','holder':'giver','hand':'right'}],
+        'beats':[{'character_id':'giver','action':'passes notebook to receiver','contact_target':'receiver'}]},
+        'entities':[{'id':'notebook_version','kind':'prop','logical_id':'NOTEBOOK'}]}
     directions=physical_directions(context)
     assert 'exactly ONE physical NOTEBOOK' in directions and 'receiver may contact and receive this SAME single object' in directions
     assert 'BOTH HANDS EMPTY' not in directions and 'Preserve this static state' not in directions

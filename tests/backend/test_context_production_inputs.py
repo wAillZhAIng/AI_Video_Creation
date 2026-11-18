@@ -61,6 +61,51 @@ def test_context_run_freezes_text_and_mode_without_intermediate_image(session, s
         assert restore_context_inputs(session, settings, shot, selected['inputs']) == ([], [])
 
 
+def test_legacy_prop_prose_and_missing_optional_designs_do_not_block_studio(session, settings):
+    from app.services.cinematic_quality import physical_directions, visual_inputs
+    from app.services.cinematic_rules import rules_bundle
+
+    project, shot = add_shot(session, 'Optional shot designs')
+    script = session.scalar(select(m.ScriptRevision).where(m.ScriptRevision.project_id == project.id))
+    rules = rules_bundle()
+    script.parsed_json = {'versions':rules['versions'], 'rules_snapshot':rules}
+    scene = m.Scene(project_id=project.id, script_revision_id=script.id, name='桌旁')
+    character = m.Character(slug='optional-cast', display_name='演示人物')
+    session.add_all([scene, character])
+    session.flush()
+    version = m.CharacterVersion(character_id=character.id, version=1, approval_state='approved')
+    session.add(version)
+    session.flush()
+    session.add(m.ShotCharacter(shot_id=shot.id, character_id=character.id, character_version_id=version.id))
+    prose = 'P01放回桌面中央，未开启。P02餐杯放在右侧，不移动。'
+    production = {'scene_state_id':'deleted-scene-state', 'wardrobe_states':{
+        character.id:{'entity_id':'deleted-outfit','description':'深蓝外套保持干燥'},
+    },'prop_states':[
+        {'prop_key':prose,'entity_id':None,'source_ids':['paragraph:9']},
+        {'description':'窗台上的花瓶保持原位'},
+    ]}
+    detail = m.ShotDetail(shot_id=shot.id, scene_id=scene.id, source_json={'production':production})
+    session.add(detail)
+    session.flush()
+
+    run = create_pipeline(session, settings, project.id, {'shot_ids':[shot.id], 'auto_start':False})
+    snapshot = run.snapshot_json['h3_context_by_shot'][shot.id]['inputs']
+    assert not snapshot['references']
+    assert snapshot['screenplay_snapshot']['cinematic']['preflight']['counts']['blocker'] == 0
+    assert {f['code'] for f in snapshot['screenplay_snapshot']['cinematic']['preflight']['findings']} >= {
+        'prop_undefined','wardrobe_undefined','design_missing',
+    }
+    assert '道具说明：' in snapshot['prompt'] and prose in snapshot['prompt'] and '窗台上的花瓶保持原位' in snapshot['prompt']
+    assert '服装状态' in snapshot['prompt'] and '深蓝外套保持干燥' in snapshot['prompt']
+    assert '道具镜头状态：' not in snapshot['prompt']
+    assert restore_context_inputs(session, settings, shot, snapshot) == ([], [])
+    visual = visual_inputs(session, shot)
+    assert visual['production']['scene_state_id'] is None
+    visual_directions = physical_directions(visual)
+    assert prose in visual_directions and 'exactly ONE' not in visual_directions
+    assert detail.source_json['production'] == production
+
+
 def test_explicit_native_canvas_is_frozen_and_local_text_has_no_app_character_cap(session, settings):
     project, shot = add_shot(session, 'Explicit local native canvas')
     long_prompt = 'A calm ocean. ' * 2500

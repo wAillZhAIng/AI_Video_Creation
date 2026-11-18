@@ -195,7 +195,8 @@ def test_saved_actual_text_ir_imports_without_missing_design_blockers(settings):
         pytest.skip('Real local generation artifact is not part of this checkout')
     report = json.loads(artifact.read_text(encoding='utf-8'))
     original = report['cases']['text_main_retry']['job']['screenplay']
-    assert any(f['code'] == 'wardrobe_undefined' for f in inspect_ir(original)['findings'])
+    assert not any(f['severity'] == 'blocker' and f['code'] in {'wardrobe_undefined', 'prop_undefined'}
+                   for f in inspect_ir(original)['findings'])
     repaired = bind_production_designs(original, 'actual-text-main-retry')
     assert repaired['designs'][:len(original['designs'])] == original['designs']
     # The saved real IR incorrectly scoped one character's wardrobe to each

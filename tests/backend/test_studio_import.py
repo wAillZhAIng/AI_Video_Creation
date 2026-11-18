@@ -231,6 +231,25 @@ def test_ambiguous_short_name_and_malformed_cast_stay_in_review():
     assert preview['shots'][0]['dialogues'][0]['character_key'] == preview['characters'][1]['key']
 
 
+def test_word_import_preserves_free_text_prop_directions_and_resolves_a_declared_key():
+    note = 'P01从手中转到桌面，未打开。P02水杯在桌角，保持直立。'
+    undeclared = '备用物件｜开合状态=关闭'
+    doc = Document()
+    for text in ('道具 P01 木盒', '正文剧情', '场景 1 桌面', '分镜 1 木盒和水杯',
+                 '画面：桌面摆着木盒和水杯。', '道具状态：'+note, '道具状态：'+undeclared,
+                 '道具状态：P01｜开合状态=合上', '道具状态：'):
+        doc.add_paragraph(text)
+    word = BytesIO()
+    doc.save(word)
+    preview = build_ir(read_blocks(word.getvalue(), 2_000_000), parse_blocks)
+    notes = preview['shots'][0]['production']['prop_states']
+    assert [{k:v for k,v in state.items() if k != 'source_ids'} for state in notes] == [
+        {'description':note}, {'description':undeclared}, {'prop_key':'P01', 'open_state':'合上'},
+    ]
+    assert all(state['source_ids'] for state in notes)
+    assert not any(item['text'] == '道具状态：' for item in preview['unrecognized'])
+
+
 def test_first_word_import_uses_the_selected_empty_project_without_revision_selection(client):
     project = client.post('/api/projects', json={'name': '空白项目'}).json()
     response = upload(client, project_id=project['id'])
