@@ -20,7 +20,7 @@ MODEL = "Qwen/Qwen3-VL-4B-Instruct"
 PINS = {
     "h3ir.prose": "4ad714c522e907e2990cc8f9f2bf68b82aaf31668bc98167a0ab5d4375746876",
     "h3ir.compile": "f96d893ff2b895c524329f11c10bed8999a5436d6c09ce64d95590819195772b",
-    "v3_profile": "918c0bf0aeb119824a8d1c9480afc54ee142c8a81c13bf802303d910f21725bf",
+    "v3_profile": "2a96d9d6847ca31a006406171ac488c87c14dee1e78f339ff11cedd998fd8932",
 }
 SECTIONS = ("subject_definitions", "summary", "retention_analysis", "detailed_description",
             "overall_soundscape", "non_diegetic_music")
@@ -251,7 +251,8 @@ def install():
     with _LOCK:
         prose = importlib.import_module("h3ir.prose")
         compiler = importlib.import_module("h3ir.compile")
-        if _INSTALLED is not None and compiler.compose_brief is _INSTALLED:
+        if _INSTALLED is not None and (compiler.compose_brief is _INSTALLED
+                or getattr(compiler.compose_brief, "__wrapped__", None) is _INSTALLED):
             return dict(_STATUS)
         prose_path, prose_source = _source(prose, "h3ir.prose")
         compiler_path, compiler_source = _source(compiler, "h3ir.compile")

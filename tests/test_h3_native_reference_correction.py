@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import h3ir.compile as compiler
 import h3ir.prose as prose
+import h3ir.repair as repair
 from h3ir.models import (AssetKind, Brief, DialogueLine, IRDocument, ManifestEntry,
                          Mode, ModeDecision, Plan, Role, SubjectPlan, Target)
 
@@ -76,7 +77,8 @@ class NativeReferenceCorrectionTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.directory=Path(self.temp.name)
         for owner,name in ((compiler,'_written_context'),(compiler,'validate'),
-                           (compiler,'repair_brief'),(prose,'fix_with_findings')):
+                           (compiler,'compose_brief'),(compiler,'repair_brief'),
+                           (repair,'_fix_labels'),(prose,'fix_with_findings')):
             replacement=patch.object(owner,name,inspect.unwrap(getattr(owner,name)))
             replacement.start();self.addCleanup(replacement.stop)
         token=profile._ACTIVE.set(None)
@@ -218,6 +220,63 @@ class NativeReferenceCorrectionTests(unittest.TestCase):
         self.assertEqual(profile._restore_camera_motion(self.corrected,sentence),self.corrected)
         multiple='detailed_description:\n[Shot 1] One scene.\n[Shot 2] Another scene.'
         self.assertEqual(profile._restore_camera_motion(multiple,sentence),multiple)
+
+    def test_native_loop_removes_missing_motion_and_voice_attribution(self):
+        original='the plush Christmas tree from <Picture 1>'
+        with_phantoms=(original+' and whose walking motion comes from <Video 1>'
+                       +' and whose voice is drawn from <Audio 1>')
+        self.missing=self.corrected.replace(original,with_phantoms,1)
+        doc,calls=self.compile([])
+
+        self.assertEqual(doc.source,'written',doc.provenance)
+        self.assertEqual(doc.prompt,self.corrected)
+        self.assertEqual(doc.provenance['fix_rounds'],0)
+        self.assertFalse(calls)
+        self.assertEqual([entry.label for entry in doc.plan.manifest],['<Picture 1>'])
+        self.assertIn('unattached <Audio 1>, <Video 1>',' '.join(doc.provenance['repairs']))
+
+    def test_native_loop_asks_for_unsupported_action_citation_to_be_corrected(self):
+        self.missing=self.corrected.replace('A static camera frames',
+            'Taking its composition from <Picture 9>, a static camera frames',1)
+        doc,calls=self.compile([self.corrected])
+
+        self.assertEqual(doc.source,'written',doc.provenance)
+        self.assertEqual(doc.prompt,self.corrected)
+        self.assertEqual(len(calls),1)
+        ask=calls[0][0][1]['content']
+        self.assertIn('[L3-phantom-media]',ask)
+        self.assertIn('Unattached tags to remove: <Picture 9>',ask)
+        self.assertIn('Taking its composition from <Picture 9>',ask)
+        self.assertNotIn('Taking its composition from <Picture 1>',ask)
+
+    def test_unknown_attachment_claim_that_survives_correction_is_blocked(self):
+        self.missing=self.corrected.replace('from <Picture 1>.','from <Picture 0>.',1)
+        doc,calls=self.compile([self.missing,self.missing])
+
+        self.assertEqual(len(calls),2)
+        self.assertEqual(doc.source,'draft')
+        self.assertIn('L3-phantom-media',doc.fallback_reason)
+
+    def test_media_repairs_preserve_real_attachments_and_spoken_or_onscreen_text(self):
+        original=('subject_definitions:\n<Subject 1> is the player from <Image 1>'
+                  ' and whose motion comes from <Video 1> and whose voice comes from <Audio 1>.\n'
+                  'detailed_description:\n[Shot 1] The camera arcs left and slowly tilts down. '
+                  '<d>[English]Play <Video 10>.</d> The label reads "<Picture 07>".\n')
+        repaired,changes=profile.repair_media_bindings(original,('<Picture 1>','<Video 1>','<Audio 1>'))
+
+        self.assertEqual(repaired,original.replace('<Image 1>','<Picture 1>'))
+        self.assertEqual(len(changes),1)
+        self.assertEqual(profile.written_media_tags(repaired),{'<Picture 1>','<Video 1>','<Audio 1>'})
+
+    def test_writer_guidance_uses_actual_inventory_and_leaves_caller_message_intact(self):
+        caller={'role':'user','content':[{'type':'text','text':'Handheld, then a crane shot.'}]}
+        messages=[{'role':'system','content':'Native compiler instructions.'},caller]
+        for labels,expected in (((), 'none'), (('<Picture 1>',), '<Picture 1>'),
+                                (('<Video 1>','<Audio 1>'), '<Video 1>, <Audio 1>')):
+            effective=profile.ground_writer_messages(messages,labels)
+            self.assertIn('Actual media attachments for this request: '+expected+'.',effective[0]['content'])
+            self.assertTrue(effective[0]['content'].endswith(messages[0]['content']))
+            self.assertEqual(effective[1],caller)
 
     def test_reference_and_existing_revision_findings_are_joint_native_errors(self):
         constraints=importlib.import_module(spec.name+'.revision_constraints')

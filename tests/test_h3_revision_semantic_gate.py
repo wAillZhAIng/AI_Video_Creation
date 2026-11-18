@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import h3ir.compile as compiler
 import h3ir.prose as prose
+import h3ir.repair as repair
 from h3ir.models import (AssetKind, Brief, Finding, IRDocument, ManifestEntry, Mode,
                          Plan, Role, SubjectPlan, Target)
 from h3ir.validate import Context
@@ -120,26 +121,24 @@ class NativeRevisionSemanticGateTests(unittest.TestCase):
         self.directory = Path(self.temp.name)
         # Other profile suites may already have installed scoped wrappers. Start
         # from native functions and restore exactly the prior objects afterward.
-        for name in ('_written_context', 'validate'):
-            native = inspect.unwrap(getattr(compiler, name))
-            replacement = patch.object(compiler, name, native)
+        for owner, name in ((compiler, '_written_context'), (compiler, 'validate'),
+                            (compiler, 'compose_brief'), (compiler, 'repair_brief'),
+                            (repair, '_fix_labels'), (prose, 'fix_with_findings')):
+            native = inspect.unwrap(getattr(owner, name))
+            replacement = patch.object(owner, name, native)
             replacement.start()
             self.addCleanup(replacement.stop)
-        fix = patch.object(prose, 'fix_with_findings', inspect.unwrap(prose.fix_with_findings))
-        fix.start()
-        self.addCleanup(fix.stop)
-        # These older fixtures deliberately omit manifest/native binding facts;
-        # exercise the semantic hook independently. Complete binding fixtures
-        # and the actual native correction loop live in the companion suite.
+        # Exercise the semantic hook independently of identity verification.
         binding = patch.object(profile, '_native_reference_verification', return_value=None)
         binding.start()
         self.addCleanup(binding.stop)
         token = profile._ACTIVE.set(None)
         self.addCleanup(profile._ACTIVE.reset, token)
         self.brief = Brief(intent=INSTRUCTION, seconds=124 / 24, shots=1, silent=True)
-        self.plan = SimpleNamespace(manifest=[], subjects=[], loras=[], task_types=[],
-                                    target=SimpleNamespace(effective_seconds=124 / 24),
-                                    label_counts=lambda: {'Picture': 2, 'Video': 0, 'Audio': 0})
+        self.plan = Plan(mode=Mode.REF2VA, target=Target(124 / 24, 124, (672, 384)),
+                         manifest=[ManifestEntry(i, f'<Picture {i}>', AssetKind.IMAGE, str(i) * 64,
+                                                 f'ref_image_{i}', Role.SUBJECT) for i in (1, 2)],
+                         subjects=[], speakers=[], shots=[], task_types=[])
         self.scope = {'directory': self.directory, 'reference_contract': contract(),
                       'compiler_documents': 0, 'reference_corrections': 0, 'binding_projections': 0}
 

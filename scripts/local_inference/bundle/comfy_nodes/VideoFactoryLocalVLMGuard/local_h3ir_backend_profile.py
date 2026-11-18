@@ -29,14 +29,18 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 import uuid
 
+from .media_bindings import ground_writer_messages, repair_media_bindings, written_media_tags
+
+
 VERSION='local-h3ir-qwen4b-v3'
-POLICY_REVISION='revision-framing-binding-camera-v6'
+POLICY_REVISION='written-media-bindings-v7'
 MODEL='Qwen/Qwen3-VL-4B-Instruct'
 MAX_OUTPUT=4096
 CARD_OUTPUT=3072
 _ACTIVE=ContextVar('factory_local_h3ir_profile',default=None)
 _STAGE=ContextVar('factory_local_h3ir_stage',default=None)
 _CALL=ContextVar('factory_local_h3ir_call',default=None)
+_COMPOSE_MEDIA=ContextVar('factory_local_h3ir_compose_media',default=None)
 _INSTALL_LOCK=threading.RLock()
 COMPILER_CALL_SHA256='114d98c174d3d34d020e63aacf6d2fbcc8afc28b4ab944abb794f9fc507122fa'
 SERIALIZER_SHA256='e03828302d1134ca5cef228c2c0e08cad92631ef7dc182e803c2de16248dc414'
@@ -46,8 +50,10 @@ STOCK_H3_SHA256='108ceff11e5a5c9a34a57bbc380447cf9941beb673a1bd421abc818de54ccd5
 WRITTEN_CONTEXT_SHA256='15934b25540728207199551947ce7b4a6de80cccf82ee7b96f529956387a0256'
 WRITTEN_VALIDATE_SHA256='b84ea591ee561790dce790dd81c90796cf4a631e1485e24a59d8e84e79c29c79'
 COMPILE_BRIEF_SHA256='c75bdd18e15b9e1a1ac1feb06457f241e24e68ff7f00d8a10113a3bdcbc9dfd8'
+COMPOSE_BRIEF_SHA256='ba398867bdff893f2dfac97cb23caa0e33a73fa7349a5e4956a66bc4ed0a3df0'
 FIX_WITH_FINDINGS_SHA256='0c9ac3ac2c296a507f07b1ea06c4eab12ea777eb8d2719d21bc87ff6205a6e59'
 REPAIR_BRIEF_SHA256='fa9740d40b41f6e66ae7b13750b457c4284768744c45e1386a534dd4f9b5026e'
+FIX_LABELS_SHA256='d0f6d472700a5f64b3e0d02a17c7ec3b5a762ec092cae1748d44fbe9897a0f40'
 _CAMERA_REPAIR='restored the frozen camera sentence in the numbered shot'
 _REFERENCE_FINDING_RULES=frozenset(('F2-duplicate-definition','F3-required-reference',
     'F4-conflicting-groups','F5-declared-group-binding','F6-declared-binding-projection',
@@ -591,19 +597,42 @@ def _install_revision_validation():
     """
     import h3ir.compile as compiler
     import h3ir.prose as prose
+    import h3ir.repair as repair
     from h3ir.models import Finding
     with _INSTALL_LOCK:
         original_context=compiler._written_context
         original_validate=compiler.validate
+        original_compose=compiler.compose_brief
         original_fix=inspect.unwrap(prose.fix_with_findings)
         original_repair=inspect.unwrap(compiler.repair_brief)
+        original_labels=inspect.unwrap(repair._fix_labels)
         if getattr(original_validate,'_factory_revision_validation_version',None)==POLICY_REVISION:return
         if (source_hash(inspect.unwrap(original_context))!=WRITTEN_CONTEXT_SHA256
                 or source_hash(inspect.unwrap(original_validate))!=WRITTEN_VALIDATE_SHA256
                 or source_hash(compiler.compile_brief)!=COMPILE_BRIEF_SHA256
+                or source_hash(inspect.unwrap(original_compose))!=COMPOSE_BRIEF_SHA256
                 or source_hash(original_repair)!=REPAIR_BRIEF_SHA256
+                or source_hash(original_labels)!=FIX_LABELS_SHA256
                 or source_hash(original_fix)!=FIX_WITH_FINDINGS_SHA256):
             raise LocalProfileFailure('The audited native written verification/correction path changed')
+
+        @functools.wraps(original_compose)
+        def compose_written(backend,brief,subjects,cards,target,labels,**kwargs):
+            if _ACTIVE.get() is None:
+                return original_compose(backend,brief,subjects,cards,target,labels,**kwargs)
+            token=_COMPOSE_MEDIA.set(labels)
+            try:
+                return original_compose(backend,brief,subjects,cards,target,labels,**kwargs)
+            finally:
+                _COMPOSE_MEDIA.reset(token)
+
+        @functools.wraps(original_labels)
+        def repair_labels(text,labels,result):
+            if _ACTIVE.get() is None:
+                return original_labels(text,labels,result)
+            repaired,actions=repair_media_bindings(text,labels)
+            result.repairs.extend(actions)
+            return repaired
 
         @functools.wraps(original_repair)
         def repair_written(*args,**kwargs):
@@ -637,6 +666,11 @@ def _install_revision_validation():
                 return findings
             plan=next((plan for item,plan in scope.get('written_plans',[]) if item is context),None)
             brief=next((brief for item,brief in scope.get('written_briefs',[]) if item is context),None)
+            if plan is not None and not any(item.rule=='L3-phantom-media' for item in findings):
+                missing=written_media_tags(prompt)-{entry.label for entry in plan.manifest}
+                if missing:
+                    findings.append(Finding('L3-phantom-media','ERROR',
+                        'These tags have no attached source: '+', '.join(sorted(missing))))
             additional=_revision_semantic_findings(prompt,scope,plan=plan)
             reference=_native_reference_verification(prompt,brief,plan,
                 scope.get('reference_contract'),scope.get('product_identity_verification'))
@@ -648,15 +682,26 @@ def _install_revision_validation():
         @functools.wraps(original_fix)
         def fix_written(backend,written,findings,*args,**kwargs):
             scope=_ACTIVE.get()
-            if scope is not None and any(f.rule in _REFERENCE_FINDING_RULES for f in findings):
-                # Count a real native correction invocation, never a validator
-                # call or the deterministic final projection.
-                scope['reference_corrections']=scope.get('reference_corrections',0)+1
+            if scope is not None:
+                if any(f.rule in _REFERENCE_FINDING_RULES for f in findings):
+                    # Count real native correction invocations, independent of projections.
+                    scope['reference_corrections']=scope.get('reference_corrections',0)+1
+                if any(f.rule=='L3-phantom-media' for f in findings):
+                    missing=written_media_tags(written)-set(kwargs.get('labels',()))
+                    help_text=(' Remove the claim that the action, voice or view came from the unattached source. '
+                               'Keep real attachment tags in their original roles and describe the requested '
+                               'camera movement, performance, or sound as generated content.')
+                    if missing:
+                        help_text=' Unattached tags to remove: '+', '.join(sorted(missing))+'.'+help_text
+                    findings=[Finding(f.rule,f.severity,f.msg+help_text) if f.rule=='L3-phantom-media' else f
+                              for f in findings]
             return original_fix(backend,written,findings,*args,**kwargs)
         validate_written._factory_revision_validation_version=POLICY_REVISION
         compiler._written_context=written_context
         compiler.validate=validate_written
+        compiler.compose_brief=compose_written
         compiler.repair_brief=repair_written
+        repair._fix_labels=repair_labels
         prose.fix_with_findings=fix_written
 
 
@@ -686,8 +731,15 @@ def _install_document_gate(namespace):
             if is_dataclass(brief):write_json(folder/'brief.json',asdict(brief))
             try:
                 if source!='written' or getattr(doc,'fallback_reason',None):
+                    reason=record['fallback_reason'] or ''
+                    validation=re.fullmatch(r'the written brief still failed after [0-9]{1,2} correction pass\(es\): '
+                                            r'([A-Za-z0-9_;, -]{1,300})',reason)
+                    rule_summary=''
+                    if validation:
+                        record['validation_rules']=re.split(r'[;,] ',validation[1])
+                        rule_summary=f'validation rules: {validation[1]}; '
                     raise LocalProfileBlocked('Compiler source gate BLOCKED '+repr(source)
-                        +'; requires actual source=written without fallback; evidence: '+str(folder))
+                        +'; requires actual source=written without fallback; '+rule_summary+'evidence: '+str(folder))
                 if scope.get('reference_contract') is not None:
                     try:doc=_audit_or_project(doc,brief,scope,folder)
                     except Exception as error:
@@ -1007,6 +1059,9 @@ def install(backend_class=None):
                        'seed':kwargs.get('seed'),'retries':kwargs.get('retries',2),**kwargs}
             call={'stage':deepcopy(stage),'original_messages':deepcopy(stage['original_messages'] if stage else messages),
                   'requested_parameters':deepcopy(requested),'effective_parameters':deepcopy(effective)}
+            media=_COMPOSE_MEDIA.get()
+            if media is not None and stage is None:
+                messages=ground_writer_messages(messages,media)
             token=_CALL.set(call)
             try:return original_chat(self,messages,**effective)
             except LocalProfileFailure:raise

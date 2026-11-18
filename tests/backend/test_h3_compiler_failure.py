@@ -65,6 +65,25 @@ def test_native_correction_rounds_report_multiple_semicolon_separated_rules(nati
     assert 'P1-no-style-opening; T1-no-shot' in message
 
 
+@pytest.mark.parametrize('bound', [True, False])
+def test_machine_rules_are_reported_on_linux_only_for_the_bound_job(native_failure, bound):
+    args, failure, _ = native_failure
+    failure['exception_message'] = (
+        "Compiler source gate BLOCKED 'draft'; requires actual source=written without fallback; "
+        "validation rules: L3-phantom-media; evidence: /private/receipt/compiler-001"
+    )
+    args[0]['error'] = 'Node 4 (VideoFactoryLocalH3IRCompile): LocalProfileBlocked: '+failure['exception_message']
+    if not bound:
+        args[0]['raw']['prompt'][3]['client_id'] = 'other-job'
+
+    message = _h3_source_gate_message(*args, read_local_receipt=False)
+
+    assert ('L3-phantom-media' in message) is bound
+    assert ('引用了未附加' in message) is bound
+    assert '视频尚未开始生成' in message
+    assert '/private/' not in message and '运镜说明' not in message
+
+
 @pytest.mark.parametrize('untrusted', ['client', 'graph', 'scope', 'time', 'reason', 'provider'])
 def test_h3_failure_does_not_use_unbound_or_untrusted_receipt(native_failure, untrusted):
     args, failure, receipt = native_failure

@@ -85,7 +85,8 @@
       "files": {
         "compile_node.py": "a89f2a3102cfba420c65e95a5c3da3022f0c16ad31a8f73fbb32c14aa4217ebe",
         "guard.py": "e3a31b15b9dd518d5935515a7859133f602cbcb76b6e7cab74fb08b49240546c",
-        "local_h3ir_backend_profile.py": "918c0bf0aeb119824a8d1c9480afc54ee142c8a81c13bf802303d910f21725bf",
+        "local_h3ir_backend_profile.py": "2a96d9d6847ca31a006406171ac488c87c14dee1e78f339ff11cedd998fd8932",
+        "media_bindings.py": "b5745146bee423787863511effd563a212409d25ec69277022cd9720d324b85c",
         "__init__.py": "c370a05a4818652bb47e77563953fafac0253cb32c0a96e6760349045f9ac24c",
         "revision_constraints.py": "eee6fa10dc17279f398c135184b913a23e8f31a8db946b27dd9ab73c0f550b92",
         "product_reference_validation.py": "443b70743c276caa012a22fdec4de85acee457b53cb4cbd3b55cb5f39c9f7179",
@@ -111,7 +112,7 @@
     {
       "name": "VideoFactoryWriterEnvelopeFormat",
       "files": {
-        "writer_format.py": "9d66b032e01b01ee9ca224571b6074ae197bb0d1e4547233d0c126944c8736bc",
+        "writer_format.py": "03f20737235e066286d5295bfaa9bfca7deb83fa3ca486561a8a19d6dabf0ac0",
         "__init__.py": "2457c40ecde2c9130e778e56c69061d1c52fd2909311a0513442b14e98a96fd9"
       }
     }

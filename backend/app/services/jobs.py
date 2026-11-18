@@ -26,7 +26,8 @@ _wan_poll_after: dict[str, float] = {}
 
 _SOURCE_GATE_ERROR = re.compile(
     r"Compiler source gate BLOCKED (?:'[a-z_]+'|None); "
-    r"requires actual source=written without fallback; evidence: ([^\r\n]+)"
+    r"requires actual source=written without fallback; "
+    r"(?:validation rules: (?P<rules>[A-Za-z0-9_;, -]{1,300}); )?evidence: (?P<evidence>[^\r\n]+)"
 )
 _REFERENCE_GATE_ERROR = 'Declared reference projection BLOCKED before H3 loading: '
 _REFERENCE_GATE_MESSAGE = ('本镜模型生成的 Context-IR 参考绑定未通过校验，视频尚未开始生成。'
@@ -41,17 +42,38 @@ _REVISION_RULE_HELP = {
 }
 _VALIDATION_RULE = (r'(?:[A-Z][0-9]{1,2}[a-z]?-[a-z0-9]+(?:-[a-z0-9]+)*|'
                     + '|'.join(re.escape(rule) for rule in _REVISION_RULE_HELP) + ')')
-_VALIDATION_REASON = re.compile(
-    rf'the written brief still failed after [0-9]{{1,2}} correction pass\(es\): '
-    rf'({_VALIDATION_RULE}(?:(?:; |, ){_VALIDATION_RULE}){{0,19}})'
-)
+_VALIDATION_RULES = rf'{_VALIDATION_RULE}(?:(?:; |, ){_VALIDATION_RULE}){{0,19}}'
+_VALIDATION_REASON = re.compile(rf'the written brief still failed after [0-9]{{1,2}} correction pass\(es\): ({_VALIDATION_RULES})')
+
+
+def _windows_source_gate_rules(evidence, events, profile, root):
+    try:
+        path = PureWindowsPath(evidence)
+        scope = _COMPILER_SCOPE.fullmatch(path.parent.name)
+        if not scope or path.name != 'compiler-001' or path.parent.parent != PureWindowsPath(root):
+            return None
+        scope_ms = datetime.strptime(scope[1], '%Y%m%d-%H%M%S-%fZ').replace(tzinfo=timezone.utc).timestamp() * 1000
+        if not events['execution_start']['timestamp'] <= scope_ms <= events['execution_error']['timestamp']:
+            return None
+        receipt_path = root / path.parent.name / 'compiler-001' / 'source-gate.json'
+        if receipt_path.resolve(strict=True) != receipt_path:
+            return None
+        with receipt_path.open('rb') as file:
+            receipt = json.loads(file.read(8192))
+        if (receipt.get('profile') != profile or receipt.get('source') != 'draft'
+                or receipt.get('required_source') != 'written' or receipt.get('status') != 'BLOCKED'):
+            return None
+        reason = _VALIDATION_REASON.fullmatch(receipt.get('fallback_reason') or '')
+        return reason[1] if reason else None
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        return None
 
 
 def _h3_source_gate_message(result, job_id, prompt_id, graph_sha, profile, *, read_local_receipt):
     """Explain a bound native error without displaying provider paths or arbitrary prose."""
     from app.services.h3_context_provider import WINDOWS_SCOPE_ROOT, graph_digest
 
-    generic = '本镜 Context-IR 编译未通过，视频尚未开始生成。请检查本镜的运镜说明与参考素材，再重试此镜。'
+    generic = '本镜 Context-IR 编译未通过，视频尚未开始生成。原输入和参考素材已保留，可重试此镜。'
     summary = result.get('error')
     fallback = None
     if isinstance(summary, str) and summary.startswith('Node 4 (VideoFactoryLocalH3IRCompile): '):
@@ -80,45 +102,31 @@ def _h3_source_gate_message(result, job_id, prompt_id, graph_sha, profile, *, re
     if not error:
         return fallback
 
-    if not read_local_receipt:
+    rule_summary = error['rules']
+    if not rule_summary and read_local_receipt:
+        rule_summary = _windows_source_gate_rules(error['evidence'], events, profile, WINDOWS_SCOPE_ROOT)
+    if not rule_summary or not re.fullmatch(_VALIDATION_RULES, rule_summary):
         return generic
-    try:
-        evidence = PureWindowsPath(error[1])
-        scope = _COMPILER_SCOPE.fullmatch(evidence.parent.name)
-        if not scope or evidence.name != 'compiler-001' or evidence.parent.parent != PureWindowsPath(WINDOWS_SCOPE_ROOT):
-            return generic
-        scope_ms = datetime.strptime(scope[1], '%Y%m%d-%H%M%S-%fZ').replace(tzinfo=timezone.utc).timestamp() * 1000
-        if not events['execution_start']['timestamp'] <= scope_ms <= failure['timestamp']:
-            return generic
-        receipt_path = WINDOWS_SCOPE_ROOT / evidence.parent.name / 'compiler-001' / 'source-gate.json'
-        if receipt_path.resolve(strict=True) != receipt_path:
-            return generic
-        with receipt_path.open('rb') as file:
-            receipt = json.loads(file.read(8192))
-        if (receipt.get('profile') != profile or receipt.get('source') != 'draft'
-                or receipt.get('required_source') != 'written' or receipt.get('status') != 'BLOCKED'):
-            return generic
-        reason = _VALIDATION_REASON.fullmatch(receipt.get('fallback_reason') or '')
-    except (AttributeError, KeyError, OSError, TypeError, ValueError):
-        return generic
-    if not reason:
-        return generic
-    rules = re.split(r'[;,] ', reason[1])
+    rules = re.split(r'[;,] ', rule_summary)
     revision_help = [_REVISION_RULE_HELP[rule] for rule in rules if rule in _REVISION_RULE_HELP]
     if revision_help:
         return ('本次修改尚未通过 Context-IR 正文核验，视频尚未开始生成：'
                 + '；'.join(revision_help) + '。原版本、配音和本次输入已保留。'
                 + '请核对修改要求和参考图后重试。'
-                + f'校验项为 {reason[1]}。')
+                + f'校验项为 {rule_summary}。')
+    if 'L3-phantom-media' in rules:
+        return ('本镜编译模型引用了未附加的图像、视频或音频，视频尚未开始生成。'
+                '原输入和参考素材已保留，可重试此镜。'
+                f'校验项为 {rule_summary}。')
     if 'P5-camera-no-motion-type' in rules:
         return ('本镜 Context-IR 编译缺少可识别的运镜类型，视频尚未开始生成。'
                 '请在本镜说明中明确运镜，例如轻推（Push In）、手持微晃（Shake Slightly）或固定机位（Static Shot），再重试此镜。'
-                f'校验项为 {reason[1]}。')
+                f'校验项为 {rule_summary}。')
     if 'P1-no-style-opening' in rules:
         return ('本地模型未按 Context-IR 要求把风格说明写在编号镜头之前，视频尚未开始生成。'
                 '镜头的原始输入和参考图已保留，可定向重试此镜。'
-                f'校验项为 {reason[1]}。')
-    return f'{generic}校验项为 {reason[1]}。'
+                f'校验项为 {rule_summary}。')
+    return f'{generic}校验项为 {rule_summary}。'
 
 
 def video_outputs(history):
