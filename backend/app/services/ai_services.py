@@ -311,7 +311,7 @@ async def probe_service(service, settings):
             result.update(status='unsupported',error='此云端档案没有执行适配器；未发请求，不能选择为已验证服务')
         elif service.provider=='local_runtime':
             from app.services.runtime_registry import manifest_status
-            runtime=manifest_status(service.settings_json.get('runtime_family',''),settings)
+            runtime=await asyncio.to_thread(manifest_status, service.settings_json.get('runtime_family', ''), settings)
             result.update(status='connected' if runtime['state']=='verified' else 'unavailable',runtime=runtime,
                 capabilities={slot:{'state':runtime['state'],'model_id':runtime.get('manifest',{}).get('model_id'),'source':'fixed deployment manifest and actual decoded smoke output'} for slot in runtime.get('manifest',{}).get('task_capabilities',[])})
         elif service.provider == 'ffmpeg':

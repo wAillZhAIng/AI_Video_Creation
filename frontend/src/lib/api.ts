@@ -65,6 +65,8 @@ function errorMessage(payload: unknown, fallback: string) {
   return String(value.message ?? value.error ?? fallback);
 }
 
+export const MODEL_CONNECTIONS_RECHECKED = 'video-factory:model-connections-rechecked';
+
 export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   const isForm = init.body instanceof FormData;

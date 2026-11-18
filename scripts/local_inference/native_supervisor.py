@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlsplit
 from urllib.error import HTTPError
 import uuid
 
+from native_recovery import archived_history, owned_worker_started_at, reconcile_previous_submissions
 from videofactory_native import (HERE, MANIFEST, PROFILE, QWEN_ID, check, environment, load,
                                  queue_idle, request_json, sha, write)
 
@@ -150,6 +151,8 @@ class QwenOwner:
                 if not idle_qwen(health,self.expected_sha):raise ValueError('Existing Qwen is busy, changed, or not this bundle')
                 self.owned_process(health)
                 return health
+            if self.process is not None and self.process.poll() is None:
+                raise ValueError('Managed Qwen is already starting; no duplicate started')
             with socket.socket() as listener:
                 if listener.connect_ex(('127.0.0.1',8772))==0:
                     raise ValueError('Port 8772 is occupied without verified health; no duplicate started')
@@ -200,6 +203,21 @@ class Runtime:
     def monitor_loop(self):
         while not self.stop.is_set():
             self.heartbeat=time.monotonic();self.stop.wait(.5)
+
+    def recover_idle_qwen(self):
+        if not self.admit.acquire(blocking=False):
+            return False
+        try:
+            if self.active or not queue_idle(self.comfy('/queue')):
+                return False
+            peer = self.config.get('peer_comfy_origin')
+            if peer and not queue_idle(request_json(peer, '/queue')):
+                return False
+            self.qwen.start()
+            self.startup_diagnostic = None
+            return True
+        finally:
+            self.admit.release()
 
     def status(self):
         checks=[];health=None;queue=None
@@ -402,6 +420,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json_response(403,{'error':'Client IP or browser Origin is not permitted by this native runtime'})
             if self.command=='GET' and route.path=='/video_factory/runtime':
                 return self.json_response(200,runtime.status())
+            if self.command == 'POST' and route.path == '/video_factory/recover-qwen':
+                if (not ipaddress.ip_address(self.client_address[0]).is_loopback
+                        or self.headers.get('Content-Length', '0') != '0'):
+                    return self.json_response(403, {'error': 'Only the local application can recover the managed Qwen'})
+                ready = runtime.recover_idle_qwen()
+                return self.json_response(200 if ready else 409, {'qwen_ready': ready})
+            if self.command == 'GET' and route.path.startswith('/video_factory/recovery/'):
+                receipt = runtime.recovered_interruptions.get(route.path.rsplit('/', 1)[-1])
+                return self.json_response(200, receipt) if receipt else self.json_response(404, {'error': 'No recovery receipt'})
+            if self.command == 'GET' and route.path.startswith('/history/'):
+                prompt_id = route.path.rsplit('/', 1)[-1]
+                case = runtime.recovered_history.get(prompt_id)
+                if case:
+                    return self.json_response(200, {prompt_id: archived_history(case, prompt_id)})
             if self.command=='GET' and route.path=='/video_factory/evidence':
                 values=parse_qs(route.query)
                 if set(values)!={'path'} or len(values['path'])!=1:raise ValueError('One native evidence path is required')
@@ -465,17 +497,9 @@ def serve(config):
     validate_listener(config)
     installation=check(config)
     if not installation['ready']:raise ValueError('Native installation checks failed; no models or services started')
-    # Do not adopt a live queue whose submission/ownership was not recorded here.
-    if not queue_idle(request_json(config['comfy_origin'],'/queue')):
-        raise ValueError('Comfy is busy; native supervisor will not adopt or re-submit existing work')
-    root=Path(config['runtime_root'])
-    for case in (root/'jobs').glob('*'):
-        if (case/'submission-intent.json').exists() and not (case/'supervisor-result.json').exists():
-            raise ValueError('An earlier native submission is unresolved; inspect its saved queue/history before restarting supervisor')
-        result=load(case/'supervisor-result.json') if (case/'supervisor-result.json').exists() else {}
-        if result and result.get('terminal_verified') is not True:
-            raise ValueError('Earlier native prompt lacks verified terminal history; inspect it manually, never re-submit blindly')
     runtime=Runtime(config,installation)
+    runtime.recovered_history, runtime.recovered_interruptions = reconcile_previous_submissions(
+        runtime, comfy_started_at=owned_worker_started_at(config))
     try:runtime.qwen.start()
     except Exception as error:
         # Keep the read-only diagnostic endpoint reachable. A foreign or busy

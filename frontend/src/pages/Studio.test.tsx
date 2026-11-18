@@ -80,6 +80,15 @@ describe('Studio UI contracts', () => {
   it('places one-click repair beside pause and reports real diagnosis and repair evidence',async()=>{
     const user=userEvent.setup();
     data.run={id:'run1',status:'running',nodes_json:[]};
+    const previous = mockRequest.getMockImplementation()!;
+    mockRequest.mockImplementation(async (url, init) => {
+      const result = await previous(url, init);
+      if (url !== '/api/studio/projects/p1/repair') return result;
+      return { ...(result as Record<string, unknown>), model_connections: [
+        { service_id: 'qwen', name: '本机 Qwen', model_id: 'Qwen3-VL-4B', status: 'recovered', message: '连接检查通过。' },
+        { service_id: 'speech', name: '独立配音', model_id: 'CosyVoice3', status: 'failed', message: '服务未响应。' },
+      ] };
+    });
     render(<MemoryRouter initialEntries={['/?project=p1']}><StudioPage/></MemoryRouter>);
     const repair=await screen.findByRole('button',{name:'一键修复'});
     const actionGroup=repair.closest<HTMLElement>('.studio-actions');
@@ -91,6 +100,9 @@ describe('Studio UI contracts', () => {
     const report=screen.getByText('一键修复诊断结果').closest('[role="status"]');
     expect(report).toHaveTextContent('prompt1');
     expect(report).toHaveTextContent('capability_unverified');
+    expect(report).toHaveTextContent('模型连接 1 / 2');
+    expect(report).toHaveTextContent(/本机 Qwen.*已恢复/);
+    expect(report).toHaveTextContent(/独立配音.*连接失败.*服务未响应/);
   });
 
   it('handles audio overrun at its exception with measured evidence and explicit application rather than blind retry',async()=>{
@@ -170,7 +182,7 @@ describe('Studio UI contracts', () => {
     await user.click(repair);
     const error=await screen.findByText(/当前本地后端尚未加载一键修复接口/);
     expect(error).toHaveTextContent('后端尚未加载一键修复接口（HTTP 404）');
-    expect(error).toHaveTextContent('同一 Windows 用户上下文中重启后端');
+    expect(error).toHaveTextContent('请更新并重启后端后重试');
     expect(repair).toBeEnabled();
   });
 

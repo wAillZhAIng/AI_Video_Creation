@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { NavLink, useLocation } from "react-router-dom";
-import { api } from "../lib/api";
+import { api, MODEL_CONNECTIONS_RECHECKED } from "../lib/api";
 import type { ProviderHealth, ProviderMode } from "../lib/types";
 import { Badge } from "./ui";
 
@@ -82,7 +82,12 @@ export function AppShell({ children }: { children: ReactNode }) {
   useEffect(() => {
     void refreshHealth();
     const timer = window.setInterval(refreshHealth, 30_000);
-    return () => { ++probeSequence.current; window.clearInterval(timer); };
+    window.addEventListener(MODEL_CONNECTIONS_RECHECKED, refreshHealth);
+    return () => {
+      ++probeSequence.current;
+      window.clearInterval(timer);
+      window.removeEventListener(MODEL_CONNECTIONS_RECHECKED, refreshHealth);
+    };
   }, [refreshHealth]);
 
   useEffect(() => setMenuOpen(false), [location.pathname]);

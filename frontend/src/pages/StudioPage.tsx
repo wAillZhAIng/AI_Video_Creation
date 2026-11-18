@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowRight, FileUp, RefreshCw, Plus, Play, Pause, FolderOpen, Wrench } from 'lucide-react';
-import { ApiError, api, request } from '../lib/api';
+import { ApiError, api, MODEL_CONNECTIONS_RECHECKED, request } from '../lib/api';
 import type { PipelineStart, StudioOverview } from '../lib/studio-contract';
 import { PageHeader, EmptyState, LoadingState, FormField } from '../components/ui';
 import { useStudio, StudioProjectPicker, StudioStatus, recordText, shotTime, studioAssetPath, studioVideoDuration } from '../lib/studio-ui';
@@ -21,9 +21,12 @@ import '../asset-library.css';
 
 const nodeLabels: Record<string, string> = { character_reference: '人物参考素材', character: '人物参考素材', scene_reference: '场景参考', scene: '场景参考', keyframe: '镜头关键画面', video: '分镜视频', tts: '角色配音', tts_optional: '可选配音', audio_mix: '对白混音', lip_sync: '口型同步', quality: '画质处理', quality_check: '视频技术检查', parse: 'Word 解析' };
 const repairStatusLabels:Record<string,string>={applied:'已执行',waiting:'等待',blocked:'受阻',skipped:'未执行',not_needed:'无需修复',unknown:'结果待核对',error:'诊断错误'};
-const gpuReasonLabels:Record<string,string>={health_busy:'本地模型正占用GPU',health_idle:'本地模型空闲',runtime_port_refused:'本地模型服务未运行',health_unreachable_and_no_managed_runtime_process:'健康检查超时，但进程登记确认本地模型未运行',health_unreachable_while_managed_runtime_process_is_alive:'健康检查超时且受管模型进程仍在运行',health_unreachable_and_runtime_process_state_unverified:'健康检查超时，模型进程状态无法确认',unexpected_runtime_identity_or_health_schema:'本地模型服务身份或健康数据异常'};
+const connectionStatusLabels: Record<string, string> = { connected: '已连接', recovered: '已恢复', busy: '运行中',
+  reachable: '有响应，待核对配置', unavailable: '运行时不可用', unsupported: '缺少适配器', failed: '连接失败' };
+const gpuReasonLabels:Record<string,string>={health_busy:'本地模型正占用GPU',health_idle:'本地模型空闲',runtime_port_refused:'默认剧本服务端口空闲',health_unreachable_and_no_managed_runtime_process:'健康检查超时，但进程登记确认本地模型未运行',health_unreachable_while_managed_runtime_process_is_alive:'健康检查超时且受管模型进程仍在运行',health_unreachable_and_runtime_process_state_unverified:'健康检查超时，模型进程状态无法确认',unexpected_runtime_identity_or_health_schema:'本地模型服务身份或健康数据异常'};
 type VoicePreparationState = { ready:boolean;dirty:boolean;loading:boolean;busy:boolean;blockingReasons:string[] };
-type StudioRepairReport = { run_status:string; gpu_gate:{state:'idle'|'busy'|'unknown';reason:string}; actions:{code:string;status:string;message:string;visual_id?:string;provider_job_id?:string|null;references?:{shot_id:string;reference_count:number;roles:Record<string,number>}[]}[]; blockers:{node_id?:string;kind?:string;status?:string;code?:string;message:string}[] };
+type StudioRepairReport = { run_status:string; gpu_gate:{state:'idle'|'busy'|'unknown';reason:string}; actions:{code:string;status:string;message:string;visual_id?:string;provider_job_id?:string|null;references?:{shot_id:string;reference_count:number;roles:Record<string,number>}[]}[]; blockers:{node_id?:string;kind?:string;status?:string;code?:string;message:string}[];
+  model_connections?: { service_id: string; name: string; model_id: string; status: string; message: string }[] };
 export function StudioPage() {
   const studio = useStudio();
   const { data, projectId, projects, loading } = studio;
@@ -138,13 +141,24 @@ export function StudioPage() {
     try {
       const report=await request<StudioRepairReport>(`/api/studio/projects/${projectId}/repair`,{method:'POST',body:'{}'});
       setRepairReport(report);
-      const repaired=report.actions.some(action=>action.status==='applied');
-      setNotice(repaired?'已完成针对性修复；后台保留原任务并继续处理。':'诊断已完成，结果与仍需处理的节点已显示在下方。');
+      const repaired = report.actions.some(action => action.status === 'applied')
+        || report.model_connections?.some(service => service.status === 'recovered');
+      setNotice(repaired ? '已完成恢复。模型连接与任务状态见下方。' : '检查已完成。模型连接与任务状态见下方。');
+      window.dispatchEvent(new Event(MODEL_CONNECTIONS_RECHECKED));
       await studio.refreshList();
       await studio.refreshAfterChange();
     } catch(e) {
+      if (e instanceof ApiError && e.code === 'studio_product_inputs_changed') {
+        const partial = (e.details as { repair_report?: StudioRepairReport } | undefined)?.repair_report;
+        if (partial) {
+          setRepairReport(partial);
+          window.dispatchEvent(new Event(MODEL_CONNECTIONS_RECHECKED));
+        }
+        setRepairError(e.message);
+        return;
+      }
       setRepairError(e instanceof ApiError && e.status===404
-        ? '当前本地后端尚未加载一键修复接口（HTTP 404）。请在保存该服务密钥的同一 Windows 用户上下文中重启后端，再重新点击。'
+        ? '当前本地后端尚未加载一键修复接口（HTTP 404）。请更新并重启后端后重试。'
         : `一键修复请求失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setBusy('');
@@ -154,6 +168,8 @@ export function StudioPage() {
   const nodes = Array.isArray(data?.run?.nodes_json) ? data.run.nodes_json as Record<string, unknown>[] : [];
   const videoCount = shots.filter(shot => shot.video?.relative_path).length;
   const finishedNodes = nodes.filter(node => ['succeeded', 'completed', 'reused', 'skipped'].includes(recordText(node.status))).length;
+  const connections = repairReport?.model_connections || [];
+  const connectedCount = connections.filter(service => ['connected', 'recovered', 'busy'].includes(service.status)).length;
   return <div className="studio-workspace">
     <PageHeader eyebrow="WORD → 制作准备 → 真实视频 → 成片" title="项目工作台" description="导入剧本建立人物、场景和分镜，按顺序核对制作设置和角色设置，再开始自动制作。在「脚本与分镜」编辑内容，在「成片审核」审核视频，通过「合成成片」导出成片。" actions={<button type="button" className="button button-secondary" disabled={preparationUnsettled||pageBusy||Boolean(pendingImport)} onClick={() => setNewProject(value => !value)}><Plus size={16}/>新建项目</button>}/>
     <div className="studio-toolbar"><StudioProjectPicker projects={projects} projectId={projectId} selectedName={data?.project.name} disabled={pageBusy||preparationUnsettled||Boolean(pendingImport)||quality.saving||quality.loading} onChange={studio.selectProject}/><button className="button button-secondary" disabled={pageBusy||preparationUnsettled} onClick={() => { void studio.refreshList(); void studio.refresh(); }}><RefreshCw size={15}/>刷新</button>{projectId ? <Link className="button button-primary" to={`/review?project=${encodeURIComponent(projectId)}`}>成片审核<ArrowRight size={16}/></Link> : null}</div>
@@ -203,11 +219,23 @@ export function StudioPage() {
         {!data.run || ['completed','cancelled','failed','completed_with_errors','waiting_review'].includes(data.run.status) || (productInputsChanged||framingState.requiresNewRun)&&['paused','exceptions'].includes(data.run.status) ? <button className="button button-primary" disabled={pageBusy||preparationUnsettled||productReferenceState.overBudget||!voiceReady||!shots.length||quality.loading||quality.saving||!quality.profile||!quality.supported||!framingReady||Boolean(modelState.hasCloud&&!cloudCosts)} onClick={() => void control('start')}><Play size={15}/>开始／增量续作</button> : null}
         {data.run?.status === 'paused'&&!productInputsChanged&&!framingState.requiresNewRun ? <button className="button button-primary" disabled={pageBusy||preparationUnsettled||!framingReady||Boolean(modelState.hasCloud&&!cloudCosts)} onClick={() => void control('resume')}><Play size={15}/>继续制作</button> : null}
         {data.run && !['completed','cancelled','paused','failed','completed_with_errors'].includes(data.run.status) ? <button className="button button-secondary" disabled={pageBusy} onClick={() => void control('pause')}><Pause size={15}/>暂停后续任务</button> : null}
-        {data.run ? <button type="button" className="button button-secondary" disabled={pageBusy} onClick={() => void oneClickRepair()}><Wrench size={15}/>{busy==='repair'?'正在诊断并修复…':'一键修复'}</button> : null}
+        {data.run ? <button type="button" className="button button-secondary" disabled={pageBusy} onClick={() => void oneClickRepair()}><Wrench size={15}/>{busy==='repair'?'正在检查并恢复模型…':'一键修复'}</button> : null}
         <Link className="button button-secondary" to={`/review?project=${encodeURIComponent(projectId)}`}>进入成片审核</Link></div></div>
         {repairError ? <p className="inline-notice warning" role="alert" aria-live="assertive">{repairError}</p> : null}
         {productInputsChanged?<p className="inline-notice">产品参考已更改。点击「开始／增量续作」使用新参考重新核对受影响镜头；已有视频保留。</p>:null}
-        {repairReport ? <div className="inline-notice studio-repair-report" role="status" aria-live="polite"><strong>一键修复诊断结果</strong><p>任务状态：{repairReport.run_status} · GPU门控：{repairReport.gpu_gate.state==='idle'?'空闲':repairReport.gpu_gate.state==='busy'?'占用':'状态未知'}（{gpuReasonLabels[repairReport.gpu_gate.reason]||repairReport.gpu_gate.reason}）</p>{repairReport.actions.map((action,index)=><div key={`${action.code}:${index}`}><p>{repairStatusLabels[action.status]||action.status} · {action.message}{action.provider_job_id?` · 服务任务 ${action.provider_job_id}`:''}</p>{action.references?.map(reference=><p key={reference.shot_id}>第 {shots.find(shot=>shot.id===reference.shot_id)?.order||'?'} 镜：{reference.reference_count} 张原图已完整编译（人物 {reference.roles.identity||0}、场景 {reference.roles.scene||0}、产品 {reference.roles.product||0}），未删除参考图。生成进度以对应关键画面节点为准。</p>)}</div>)}{repairReport.blockers.map((blocker,index)=><p key={`${blocker.node_id||blocker.code}:${index}`}>仍需处理：{nodeLabels[blocker.kind||'']||blocker.kind||'任务'} · {blocker.code||blocker.status} · {blocker.message}</p>)}</div> : null}
+        {repairReport ? <div className="inline-notice studio-repair-report" role="status" aria-live="polite">
+          <strong>一键修复诊断结果</strong>
+          {connections.length > 0 && <details open>
+            <summary>模型连接 {connectedCount} / {connections.length}</summary>
+            <ul>{connections.map(service => <li key={service.service_id}>
+              <strong>{service.name}</strong>{service.model_id ? ` · ${service.model_id}` : ''}
+              {' · '}{connectionStatusLabels[service.status] || service.status}。{service.message}
+            </li>)}</ul>
+          </details>}
+          <p>任务状态：{repairReport.run_status} · GPU门控：{repairReport.gpu_gate.state==='idle'?'空闲':repairReport.gpu_gate.state==='busy'?'占用':'状态未知'}（{gpuReasonLabels[repairReport.gpu_gate.reason]||repairReport.gpu_gate.reason}）</p>
+          {repairReport.actions.map((action,index)=><div key={`${action.code}:${index}`}><p>{repairStatusLabels[action.status]||action.status} · {action.message}{action.provider_job_id?` · 服务任务 ${action.provider_job_id}`:''}</p>{action.references?.map(reference=><p key={reference.shot_id}>第 {shots.find(shot=>shot.id===reference.shot_id)?.order||'?'} 镜：{reference.reference_count} 张原图已完整编译（人物 {reference.roles.identity||0}、场景 {reference.roles.scene||0}、产品 {reference.roles.product||0}），未删除参考图。生成进度以对应关键画面节点为准。</p>)}</div>)}
+          {repairReport.blockers.map((blocker,index)=><p key={`${blocker.node_id||blocker.code}:${index}`}>仍需处理：{nodeLabels[blocker.kind||'']||blocker.kind||'任务'} · {blocker.code||blocker.status} · {blocker.message}</p>)}
+        </div> : null}
         {!voiceReady&&!activeRun?<p className="studio-muted">{voiceState.dirty?'角色配音有未保存设置，请先保存。':voiceState.blockingReasons.join('；')||'正在检查制作前的角色配音配置…'}</p>:null}
         {data.run?.error_message ? <p className="inline-notice warning">{recordText(data.run.error_message)}</p> : null}
         {nodes.length ? <><p className="studio-muted">已结束 {finishedNodes} / {nodes.length} 个任务。以下为后端实际状态，等待参考素材的镜头会自动接续。</p><div className="studio-node-list">{nodes.map((node, index) => <div key={recordText(node.id)||index} className="studio-node"><strong>{nodeLabels[recordText(node.kind)] || recordText(node.kind)}<small>{recordText(node.target_name) || recordText(node.target_id)}</small></strong><StudioStatus status={recordText(node.status)}/><span>{recordText(node.error)}</span>{Number(node.attempts) > 0 ? <small>已尝试 {recordText(node.attempts)} 次</small> : null}</div>)}</div></> : <p className="studio-muted">暂无制作任务。上传 Word 或开始增量续作后，会在这里显示真实依赖与执行结果。</p>}

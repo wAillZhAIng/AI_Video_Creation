@@ -183,7 +183,7 @@ async def poll_job(settings, session_factory, job_id):
             raise AppError(502, "empty_video", "ComfyUI 返回的视频为空或不完整")
     with session_factory() as session:
         job = session.get(GenerationJob, job_id)
-        if job.status == "cancelled":
+        if not job or job.provider_job_id != provider_id or job.status not in {'queued', 'running'}:
             return
         previous = job.status
         job.status = result["status"]
@@ -423,7 +423,7 @@ async def process_video_tick(settings: Settings, session_factory):
             logger.warning("Job polling failure: %s (%s)", job_id,type(error).__name__)
             with session_factory() as session:
                 job = session.get(GenerationJob, job_id)
-                if not job:continue
+                if not job or job.status not in {'queued', 'running'}:continue
                 # Once a provider ID exists, any status/download/local error is
                 # not a provider-declared failure. Retain the ID and block a
                 # second billable POST until the original task is reconciled.

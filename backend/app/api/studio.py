@@ -78,6 +78,19 @@ def _run(session, project_id):
     return run
 
 
+def _requeue_failed_node(entry):
+    # Keep the definitive failure and its child for review. Output-only
+    # rechecks continue using the original submitted child.
+    entry['history'] = [*(entry.get('history') or []), {
+        'child_id': entry.get('child_id'), 'code': entry.get('code'),
+        'error': entry.get('error'), 'actor': 'local-user',
+    }]
+    retained_child = entry.get('child_id') if entry.get('code') == 'output_quality_failed' else None
+    entry.pop('context_dispatch_wait', None)
+    entry.pop('retry_after', None)
+    entry.update(status='pending', child_id=retained_child, error=None, code=None)
+
+
 @router.post('/projects/{project_id}/pause', response_model=StudioOverview)
 def pause(project_id: str, session: Session = Depends(get_db)):
     run = _run(session, project_id); nodes = copy.deepcopy(run.nodes_json)
@@ -187,14 +200,7 @@ def retry(project_id: str, payload: dict | None = None, session: Session = Depen
             raise AppError(409, 'studio_cloud_scope_changed', '云端服务或密钥设置已改变，请通过重新启动确认新服务的本轮费用范围')
         run.snapshot_json = {**run.snapshot_json, 'services': snapshots, 'service_errors': errors}
     for n in selected:
-        # A known definitive failure may be retried; preserve its real child ID
-        # in history, leaving other successful nodes and shot decisions intact.
-        n['history'] = [*n['history'], {'child_id': n.get('child_id'), 'code': n.get('code'), 'error': n.get('error'), 'actor': 'local-user'}]
-        # A paid cloud output failed locally: keep its ID for safe recheck.
-        retained_child = n.get('child_id') if n.get('code') == 'output_quality_failed' else None
-        n.pop('context_dispatch_wait', None)
-        n.pop('retry_after', None)
-        n.update(status='pending', child_id=retained_child, error=None, code=None)
+        _requeue_failed_node(n)
     run.nodes_json = nodes; run.status = 'queued'; run.error_message = None
     session.add(m.AuditEvent(object_type='studio_run', object_id=run.id, action='failed_nodes_retry_requested',
                              details_json={'node_ids': [n['id'] for n in selected], 'refreshed_context': refreshed}))
@@ -226,25 +232,48 @@ async def apply_quality(project_id: str, request: Request, payload: dict | None 
 
 async def _repair(project_id: str, request: Request, session: Session):
     """Diagnose a stuck run and resume only tasks with a known-safe next step."""
-    run = _run(session, project_id)
-    if run.snapshot_json.get('product_references_changed'):
-        raise AppError(409,'studio_product_inputs_changed','产品参考已变化，请点击「开始／增量续作」重新核对输入；一键修复不会继续旧输入')
     from app.services.gpu_gate import owned_model_status
     from app.services.studio_pipeline import RUN_TERMINAL, advance_pipeline
+    from app.services.studio_model_recovery import recover_model_connections, interrupted_context_nodes
 
+    original_run_id = _run(session, project_id).id
+    model_connections = await recover_model_connections(request.app, session)
     gpu = await owned_model_status()
     # Health checks yield while the worker or another request may persist a
     # child, pause, or input change. Never overwrite that newer durable state.
     session.expire_all()
     run = _run(session, project_id)
-    if run.snapshot_json.get('product_references_changed'):
-        raise AppError(409,'studio_product_inputs_changed','产品参考已变化，请点击「开始／增量续作」重新核对输入；一键修复不会继续旧输入')
+    recovery = {}
+    if (run.id == original_run_id and not run.snapshot_json.get('product_references_changed')
+            and run.status not in (RUN_TERMINAL - {'completed_with_errors'}) | {'paused'} and gpu['state'] == 'idle'):
+        recovery = await interrupted_context_nodes(session, run, model_connections)
+        session.expire_all()
+        run = _run(session, project_id)
+    def report(actions, blockers):
+        return {'project_id': project_id, 'run_id': run.id, 'run_status': run.status,
+                'gpu_gate': gpu, 'actions': actions, 'blockers': blockers, 'model_connections': model_connections}
+
+    if run.id != original_run_id or run.snapshot_json.get('product_references_changed'):
+        message = '本轮制作或参考输入已变化。请点击「开始／增量续作」核对当前输入。'
+        raise AppError(409, 'studio_product_inputs_changed', message, {'repair_report': report([], [])})
     blockers = []
     actions = []
     queued_visual = None
     queued_node = None
     recoverable_characters = []
     nodes = copy.deepcopy(run.nodes_json or [])
+    if recovery and run.status not in (RUN_TERMINAL - {'completed_with_errors'}) | {'paused'}:
+        requeued = _resume_context_after_connection_repair(session, request.app.state.settings, run, nodes, recovery)
+        if requeued:
+            run.nodes_json = nodes
+            run.status = 'queued'
+            run.error_message = None
+            sync_production_status(session, run)
+            session.add(m.AuditEvent(object_type='studio_run', object_id=run.id,
+                                    action='model_connection_nodes_requeued', details_json={'node_ids': requeued}))
+            session.commit()
+            actions.append({'code': 'model_connection_nodes_requeued', 'status': 'applied', 'node_ids': requeued,
+                            'message': f'已把 {len(requeued)} 个确认中断的本地分镜按原设置重新排队。'})
     from app.services.reference_budget_repair import inspect_reference_budget_repairs
     recoverable_keyframes,keyframe_diagnostics,keyframe_blockers=inspect_reference_budget_repairs(
         session,request.app.state.settings,run,nodes)
@@ -463,8 +492,49 @@ async def _repair(project_id: str, request: Request, session: Session):
     session.add(m.AuditEvent(object_type='studio_run', object_id=run.id,
         action='one_click_repair_diagnosed', details_json={
             'gpu_gate': gpu['state'], 'gpu_reason': gpu['reason'],
+            'model_connections': [{'service_id': item['service_id'], 'status': item['status']} for item in model_connections],
             'action_codes': [item['code'] for item in actions],
             'blocker_codes': [item['code'] for item in blockers]}))
     session.commit()
-    return {'project_id': project_id, 'run_id': run.id, 'run_status': run.status,
-            'gpu_gate': gpu, 'actions': actions, 'blockers': blockers}
+    return report(actions, blockers)
+
+
+def _resume_context_after_connection_repair(session, settings, run, nodes, recovery):
+    from app.core.paths import safe_media_path
+    from app.models.entities import utcnow
+    from app.services.cinematic_quality import generation_inputs_hash
+
+    requeued = []
+    for node in nodes:
+        if node['id'] not in recovery or node['status'] not in {'running', 'retrying', 'failed', 'exception', 'unknown'}:
+            continue
+        receipt = recovery[node['id']]
+        if node.get('child_id') != (receipt or {}).get('job_id'):
+            continue
+        shot = session.get(m.StoryboardShot, node['target_id'])
+        if not shot or shot.project_id != run.project_id or shot.status == 'deleted':
+            continue
+        job = session.get(m.GenerationJob, node['child_id']) if node.get('child_id') else None
+        input_hash = node.get('inputs_hash')
+        if job:
+            if (job.provider_job_id != receipt.get('prompt_id') or job.status not in {'queued', 'running', 'failed', 'unknown'}
+                    or session.scalar(select(m.VideoRevision.id).where(m.VideoRevision.generation_job_id == job.id).limit(1))):
+                continue
+            try:
+                folder = safe_media_path(settings.media_root, job.parameters_json['output_relative_dir'])
+                if folder.is_dir() and any(path.name.startswith(job.id) for path in folder.iterdir()):
+                    continue
+            except (AppError, OSError, KeyError):
+                continue
+        if (job and job.provider_job_id and not input_hash) or (input_hash and input_hash != generation_inputs_hash(session, shot)):
+            continue
+        if job and job.provider_job_id:
+            job.status = 'failed'
+            job.error_code = 'context_ir_worker_restarted'
+            job.error_message = '本机 ComfyUI 工作进程已重启，原任务未留下视频输出。'
+            job.finished_at = utcnow()
+            job.parameters_json = {**job.parameters_json, 'native_restart_recovery': receipt}
+            node.update(code=job.error_code, error=job.error_message)
+        _requeue_failed_node(node)
+        requeued.append(node['id'])
+    return requeued
