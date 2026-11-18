@@ -1,11 +1,15 @@
 """Isolated database/API contracts. These are not real model-generation evidence."""
 import asyncio
 import json
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from io import BytesIO
+from threading import Event
 
 from docx import Document
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 from app import models as m
 from app.services.studio_import import content_fingerprint, language_extract
@@ -41,6 +45,102 @@ def screenplay(*, same_scene=False, second_weather='雨', extra_line='', name='�
 def upload(client, data=None, **form):
     return client.post('/api/studio/import',files={'file':('自动化.docx',data or screenplay())},data={
         'auto_start':'false',**{k:str(v).lower() if isinstance(v,bool) else str(v) for k,v in form.items()}})
+
+
+def upload_new_project_file(client, data):
+    return client.post('/api/imports/file', files={'file': ('screenplay.docx', data)},
+                       data={'name': '并发导入测试'})
+
+
+def short_sqlite_wait(client):
+    engine = client.app.state.engine
+
+    @event.listens_for(engine, 'checkout')
+    def set_timeout(connection, _record, _proxy):
+        connection.execute('PRAGMA busy_timeout=20')
+
+    return engine
+
+
+@pytest.mark.parametrize('lock_mode', ['writer', 'reader'])
+def test_project_file_import_retries_a_sqlite_lock_with_one_saved_copy(client, settings, lock_mode):
+    engine = short_sqlite_wait(client)
+    lock_seen = Event()
+
+    @event.listens_for(engine, 'handle_error')
+    def observe_sqlite_error(context):
+        code = getattr(context.original_exception, 'sqlite_errorcode', 0)
+        if code & 0xff == sqlite3.SQLITE_BUSY:
+            lock_seen.set()
+
+    data = screenplay()
+    with closing(sqlite3.connect(engine.url.database)) as blocker, ThreadPoolExecutor(1) as pool:
+        blocker.execute('BEGIN IMMEDIATE' if lock_mode == 'writer' else 'BEGIN')
+        # A rollback-journal reader allows writes to start, but blocks commit.
+        if lock_mode == 'reader':
+            blocker.execute('SELECT count(*) FROM projects').fetchone()
+        request = pool.submit(upload_new_project_file, client, data)
+        try:
+            assert lock_seen.wait(4), 'SQLite should report a real busy error before the retry'
+        finally:
+            blocker.rollback()
+        response = request.result(timeout=8)
+    assert response.status_code == 201, response.text
+    imported = response.json()
+    original = settings.media_root / imported['source_uri']
+    assert original.read_bytes() == data
+    assert list((settings.media_root / 'imports').rglob('*.docx')) == [original]
+    with client.app.state.session_factory() as db:
+        assert list(db.scalars(select(m.Project.id))) == [imported['id']]
+        source, = db.scalars(select(m.SourceDocument))
+        assert source.source_uri == imported['source_uri']
+        receipt, = db.scalars(select(m.AuditEvent).where(m.AuditEvent.action == 'import_file'))
+        assert receipt.object_id == imported['id']
+
+
+@pytest.mark.parametrize('endpoint', ['project_file', 'studio_word'])
+def test_import_with_persistent_sqlite_lock_reports_busy_without_a_partial_import(client, settings, endpoint):
+    engine = short_sqlite_wait(client)
+    with closing(sqlite3.connect(engine.url.database)) as blocker:
+        blocker.execute('BEGIN IMMEDIATE')
+        try:
+            response = (upload_new_project_file if endpoint == 'project_file' else upload)(client, screenplay())
+        finally:
+            blocker.rollback()
+    assert response.status_code == 503, response.text
+    assert response.json()['error']['code'] == 'import_database_busy'
+    assert not list(settings.media_root.rglob('*.docx'))
+    with client.app.state.session_factory() as db:
+        for model in (m.Project, m.SourceDocument, m.WordImport):
+            assert db.scalar(select(func.count()).select_from(model)) == 0
+
+
+def test_word_import_does_not_hold_a_write_lock_while_the_language_model_waits(client, monkeypatch):
+    from app.services import studio_import
+
+    short_sqlite_wait(client)
+    model_waiting = Event()
+    resume_model = Event()
+
+    async def slow_extract(*args, **kwargs):
+        model_waiting.set()
+        assert await asyncio.to_thread(resume_model.wait, 8)
+        return None, {'mode': 'controlled_test', 'language_model_called': True}
+
+    monkeypatch.setattr(studio_import, 'language_extract', slow_extract)
+    with ThreadPoolExecutor(1) as pool:
+        document = screenplay(extra_line='无法确定角色的自由段落，需核对。')
+        pending = pool.submit(upload, client, document)
+        try:
+            assert model_waiting.wait(4)
+            with client.app.state.session_factory() as db:
+                assert db.scalar(select(func.count()).select_from(m.WordImport)) == 0
+            current = upload_new_project_file(client, document)
+            assert current.status_code == 201, current.text
+        finally:
+            resume_model.set()
+        word = pending.result(timeout=8)
+    assert word.status_code == 200 and word.json()['status'] == 'pending_review'
 
 
 @pytest.mark.parametrize(('value', 'expected'), [

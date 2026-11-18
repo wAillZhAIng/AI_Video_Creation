@@ -6,16 +6,20 @@ actually returns a validated, source-grounded extraction.
 """
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 
 from sqlalchemy import select
+from starlette.concurrency import run_in_threadpool
 
 from app.core.errors import AppError
 from app.core.secrets import redact, reveal
 from app.models import Character, Project, ScriptRevision, WordImport
+from app.models.entities import new_id
 from app.schemas_screenplay import ImportConfirm
 from app.services.cinematic_import import build_ir
 from app.services.content_manager import safe_file
+from app.services.import_persistence import persist_upload
 from app.services.word_screenplay import (block_lines, commit_import, duration_review_issues, match_characters,
     parse_blocks, read_blocks, summary, validate_preview)
 
@@ -114,6 +118,9 @@ async def language_extract(session, settings, project_id, blocks, allow_cloud_co
 每一行都必须有原文source_ids及其中逐字出现的非空quote，所有非空原文块都须至少引用一次，不能漏掉对白或人物设定。只能提取原文事实，不补写人物年龄、动作、对白或环境。原文未写镜头时可按事件连续性分镜，但须在uncertainties说明拆分依据和待确定的部分。同名身份、代词说话人或人物归属不能可靠确定时，必须写入uncertainties。每个场景至少一镜，多人物各自表演/对白分别输出。'''
     secret=reveal(service.encrypted_secret)
     receipt['language_model_called']=True
+    # The service snapshot and credential are enough for inference. Release the
+    # read transaction before waiting for an external reply.
+    session.rollback()
     try:
         response=await service_request(settings,snapshot,'POST','/chat/completions',secret,json={
             'model':snapshot['model_id'],'messages':[{'role':'system','content':instructions},
@@ -174,35 +181,60 @@ async def import_word(session, settings, filename, data, *, project_id=None,
         # A changed screenplay targeting a project is an explicit new revision,
         # not a second hidden project or an overwrite of existing approved work.
         raise AppError(409,'new_revision_required','目标项目已有内容；请明确 new_revision=true 以保存新剧本版本')
-    preview=match_characters(session,build_ir(blocks,parse_blocks))
-    batch=WordImport(filename=filename,sha256=sha,status='parsing',relative_path='',blocks_json=blocks)
-    session.add(batch);session.flush()
-    batch.relative_path=f'word_imports/{batch.id}/original.docx'
-    destination=safe_file(settings.media_root,batch.relative_path)
-    destination.parent.mkdir(parents=True,exist_ok=True);destination.write_bytes(data)
+    preview=build_ir(blocks,parse_blocks)
     parser={'mode':'local_source_preserving_rules','language_model_called':False}
-    issues=ambiguities(session,preview)
+    issues=ambiguities(session,match_characters(session,deepcopy(preview)))
     if issues and not duration_review_issues(preview):
+        session.rollback()
         extracted,parser=await language_extract(session,settings,project_id,blocks,allow_cloud_costs,allow_paid_fallback)
-        if extracted is not None:preview=match_characters(session,extracted);issues=ambiguities(session,preview)
+        if extracted is not None:preview=extracted
     preview['content_fingerprint']=fingerprint;preview['semantic_parser']=parser
-    batch.preview_json=preview;batch.status='pending_review';batch.revision=1
-    if issues:
-        batch.error_message='；'.join(issues)[:12000];session.commit()
-        return import_response(batch,session,issues=issues)
-    payload=ImportConfirm(revision=batch.revision,duplicate_strategy='new_revision' if new_revision else 'new_project',
-        project_id=project_id,reuse_approved=True)
-    result=commit_import(session,batch,payload)
-    if quality:
-        from app.schemas_quality import QualityProfileInput
-        from app.services.video_quality import save_profile
-        save_profile(session,'project',result['project_id'],QualityProfileInput(settings=quality),settings)
-    if auto_start:
-        from app.services.studio_voice import assert_voice_preparation
-        assert_voice_preparation(session,settings,result['project_id'],allow_cloud_costs,allow_paid_fallback)
-        from app.services.studio_pipeline import create_pipeline
-        run=create_pipeline(session,settings,result['project_id'],{'allow_cloud_costs':allow_cloud_costs,'allow_paid_fallback':allow_paid_fallback,
-            'source':'word_import','auto_start':True,'input_revision_id':result['script_id'],'shot_ids':result['shot_ids'],'quality':quality})
-        batch.result_json={**result,'pipeline_run_id':run.id}
-    session.commit()
-    return import_response(batch,session)
+    session.rollback()
+    return await run_in_threadpool(_persist_word_import, session, settings, filename, data, blocks, sha, preview,
+        project_id=project_id, new_revision=new_revision, auto_start=auto_start,
+        allow_cloud_costs=allow_cloud_costs, allow_paid_fallback=allow_paid_fallback, quality=quality)
+
+
+def _persist_word_import(session, settings, filename, data, blocks, sha, preview, *,
+        project_id, new_revision, auto_start, allow_cloud_costs, allow_paid_fallback, quality):
+    if not new_revision:
+        previous=previous_import(session,sha,preview['content_fingerprint'],project_id)
+        if previous:
+            return import_response(previous,session,reused=True)
+        session.rollback()
+
+    batch_id=new_id('import')
+    relative_path=f'word_imports/{batch_id}/original.docx'
+    destination=safe_file(settings.media_root,relative_path)
+
+    def stage_word_import():
+        batch=WordImport(id=batch_id,filename=filename,sha256=sha,status='pending_review',
+            relative_path=relative_path,blocks_json=blocks,revision=1)
+        session.add(batch)
+        session.flush()
+        if project_id and not session.get(Project,project_id):
+            raise AppError(404,'project_missing','目标项目不存在')
+        batch.preview_json=match_characters(session,deepcopy(preview))
+        issues=ambiguities(session,batch.preview_json)
+        if issues:
+            batch.error_message='；'.join(issues)[:12000]
+            return batch,issues
+
+        payload=ImportConfirm(revision=batch.revision,duplicate_strategy='new_revision' if new_revision else 'new_project',
+            project_id=project_id,reuse_approved=True)
+        result=commit_import(session,batch,payload)
+        if quality:
+            from app.schemas_quality import QualityProfileInput
+            from app.services.video_quality import save_profile
+            save_profile(session,'project',result['project_id'],QualityProfileInput(settings=quality),settings)
+        if auto_start:
+            from app.services.studio_voice import assert_voice_preparation
+            from app.services.studio_pipeline import create_pipeline
+            assert_voice_preparation(session,settings,result['project_id'],allow_cloud_costs,allow_paid_fallback)
+            run=create_pipeline(session,settings,result['project_id'],{'allow_cloud_costs':allow_cloud_costs,'allow_paid_fallback':allow_paid_fallback,
+                'source':'word_import','auto_start':True,'input_revision_id':result['script_id'],'shot_ids':result['shot_ids'],'quality':quality})
+            batch.result_json={**result,'pipeline_run_id':run.id}
+        return batch,issues
+
+    batch,issues=persist_upload(session,destination,data,stage_word_import)
+    return import_response(batch,session,issues=issues)

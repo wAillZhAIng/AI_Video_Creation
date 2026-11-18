@@ -16,6 +16,7 @@ from sqlalchemy import case, delete, func, inspect, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from PIL import Image, UnidentifiedImageError
+from starlette.concurrency import run_in_threadpool
 
 from app.core.config import Settings
 from app.core.db import get_db
@@ -39,6 +40,7 @@ from app.models import (
     SourceDocument,
     FinalComposition,
 )
+from app.models.entities import new_id
 from app.schemas import (
     ApprovalRequest,
     ResolveUnknownLocalGeneration,
@@ -63,6 +65,7 @@ from app.schemas import (
     CompositionRequest,
     FinalDryRunRequest,
 )
+from app.services.import_persistence import persist_upload
 from app.services.imports import (
     fetch_external_document,
     parse_uploaded_document,
@@ -290,31 +293,33 @@ async def import_file(
     request: Request,
     name: str = Form(..., min_length=1, max_length=200),
     file: UploadFile = File(...),
-    session: Session = Depends(get_db),
 ) -> dict[str, Any]:
     settings = settings_from(request)
     original_name = Path(file.filename or "upload").name
     data = await file.read(settings.import_max_bytes + 1)
+    return await run_in_threadpool(_save_imported_file, request.app.state.session_factory,
+                                   settings, name, original_name, data)
+
+
+def _save_imported_file(session_factory, settings: Settings, name: str, original_name: str,
+                        data: bytes) -> dict[str, Any]:
     text, mime = parse_uploaded_document(original_name, data, settings.import_max_bytes)
-    project = Project(
-        name=name,
-        source_type="file",
-        source_filename=original_name,
-        source_text=text,
-        status="draft",
-    )
-    session.add(project)
-    session.flush()
+    project_id = new_id("prj")
     extension = Path(original_name).suffix.lower()
-    destination = safe_media_path(settings.media_root, f"imports/{project.id}/{uuid.uuid4().hex}{extension}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(data)
-    project.source_uri = media_relative(settings.media_root, destination)
-    audit(session, "project", project.id, "import_file", {"filename": original_name, "mime_type": mime, "size_bytes": len(data)})
-    session.commit()
-    result = row_dict(project)
-    result["detected_mime_type"] = mime
-    return result
+    relative_path = f"imports/{project_id}/{uuid.uuid4().hex}{extension}"
+    destination = safe_media_path(settings.media_root, relative_path)
+    with session_factory() as session:
+        def stage_project():
+            project = Project(id=project_id, name=name, source_type="file", source_filename=original_name,
+                              source_text=text, source_uri=relative_path, status="draft")
+            session.add(project)
+            session.flush()
+            audit(session, "project", project.id, "import_file",
+                  {"filename": original_name, "mime_type": mime, "size_bytes": len(data)})
+            return project
+
+        project = persist_upload(session, destination, data, stage_project)
+        return {**row_dict(project), "detected_mime_type": mime}
 
 
 @router.post("/imports/url", status_code=status.HTTP_201_CREATED)
