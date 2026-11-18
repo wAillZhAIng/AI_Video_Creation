@@ -33,7 +33,7 @@
     "frontend/src/components/ProductionShotEditor.tsx": "dfa591581445e5e1bb521faf9d06e716cfc2e2608e6b995c86bb853683b3fd6e",
     "frontend/src/components/ProductionDesignForm.tsx": "58dec5f2a3daf1d7c3cd622ed56dfd706f0c8b1a8ebc37c2ba0f12137e7a6c0a",
     "frontend/src/components/ProductionVisualUpload.tsx": "933890e4d1792979a5d9fd32fb6959019f6fd11300cdea7215c64f988f4e0c4d",
-    "frontend/src/components/WordImportPanel.tsx": "c7199abab6bfb34e2eb1360cfc3762aab7a8d41797c8615032fc9dbc96610653",
+    "frontend/src/components/WordImportPanel.tsx": "4bb4f0bf18b81948403732bb9eda43bf113cd2f82d27ce9015b085e9f4bde7b8",
     "tests/backend/test_cinematic.py": "0dbb2fc846d78bf29451055ca6e0211ed5bb84f0468cbc2c52abd320929ccf54",
     "scripts/build_screenplay_templates.py": "3abec28f85bb1921ccc6788eb6b68845536705395d5ec6882a08f3587982733c",
     "backend/app/services/word_duration.py": "f6aa7019412261e8dcd58d3bdbd03022bddc29193dec5b3a1a9b6c3ed52b7666",

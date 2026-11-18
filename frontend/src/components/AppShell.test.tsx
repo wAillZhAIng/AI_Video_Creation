@@ -83,6 +83,14 @@ describe("AppShell provider truth labels", () => {
     expect(screen.queryByText('本地后端不可达')).not.toBeInTheDocument();
   });
 
+  it('shows Qwen processing when the video compiler is waiting to use the GPU',async()=>{
+    vi.spyOn(api,'getContextProviderHealth').mockResolvedValue(
+      {ok:false,connected:true,ready:false,busy:true,busy_reason:'qwen',mode:'real'});
+    render(<MemoryRouter><AppShell><p>测试内容</p></AppShell></MemoryRouter>);
+    expect(await screen.findByText('本地 Qwen 处理中')).toBeInTheDocument();
+    expect(screen.queryByText('本地模型未就绪')).not.toBeInTheDocument();
+  });
+
   it.each([['项目工作台','/'],['脚本与分镜','/storyboard'],['成片审核','/review'],['合成成片','/final']])('keeps the older current project when opening %s without carrying another module’s selection',async(label,path)=>{
     vi.spyOn(api,'getContextProviderHealth').mockResolvedValue({ok:true,connected:true,configured:true,provider:'comfyui_h3',mode:'real'});
     const user=userEvent.setup();

@@ -128,8 +128,12 @@ def test_word_import_does_not_hold_a_write_lock_while_the_language_model_waits(c
         return None, {'mode': 'controlled_test', 'language_model_called': True}
 
     monkeypatch.setattr(studio_import, 'language_extract', slow_extract)
+    unstructured = Document()
+    unstructured.add_paragraph('两位成年人走进商店，放下雨伞后在门口交谈。')
+    original = BytesIO()
+    unstructured.save(original)
     with ThreadPoolExecutor(1) as pool:
-        document = screenplay(extra_line='无法确定角色的自由段落，需核对。')
+        document = original.getvalue()
         pending = pool.submit(upload, client, document)
         try:
             assert model_waiting.wait(4)
@@ -141,6 +145,40 @@ def test_word_import_does_not_hold_a_write_lock_while_the_language_model_waits(c
             resume_model.set()
         word = pending.result(timeout=8)
     assert word.status_code == 200 and word.json()['status'] == 'pending_review'
+
+
+def test_structured_word_saves_existing_project_preview_without_waiting_for_a_model(client, monkeypatch):
+    from app.services import studio_import
+
+    async def unexpected_model_call(*args, **kwargs):
+        pytest.fail('Explicit shots and preserved production notes should go directly to preview')
+
+    monkeypatch.setattr(studio_import, 'language_extract', unexpected_model_call)
+    project = client.post('/api/projects', json={'name': '空白项目'}).json()
+    note = '正向视频提示词：角色在窗边交谈。'
+    response = upload(client, screenplay(extra_line=note), project_id=project['id'])
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body['status'] == 'pending_review' and body['parser']['language_model_called'] is False
+    assert any(item['text'] == note for item in body['preview']['unrecognized'])
+
+    preview = client.get(body['preview_url']).json()
+    saved = client.post(body['preview_url'] + '/confirm', json={
+        'revision': preview['revision'], 'duplicate_strategy': 'new_revision', 'project_id': project['id'],
+    })
+    assert saved.status_code == 200 and saved.json()['project_id'] == project['id'], saved.text
+    assert len(saved.json()['shot_ids']) == 2
+    assert len(client.get('/api/projects').json()) == 1
+
+
+def test_first_word_import_uses_the_selected_empty_project_without_revision_selection(client):
+    project = client.post('/api/projects', json={'name': '空白项目'}).json()
+    response = upload(client, project_id=project['id'])
+    assert response.status_code == 200 and response.json()['status'] == 'imported', response.text
+    assert response.json()['project_id'] == project['id']
+    assert len(client.get('/api/projects').json()) == 1
+    modified = upload(client, screenplay(second_weather='晴'), project_id=project['id'])
+    assert modified.status_code == 409 and modified.json()['error']['code'] == 'new_revision_required'
 
 
 @pytest.mark.parametrize(('value', 'expected'), [

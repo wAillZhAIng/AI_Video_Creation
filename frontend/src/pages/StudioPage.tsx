@@ -42,6 +42,9 @@ export function StudioPage() {
   const [importReviewBusy,setImportReviewBusy]=useState(false);
   const pendingImportRef=useRef(pendingImport);pendingImportRef.current=pendingImport;
   useEffect(()=>()=>{pendingImportRef.current=null;},[]);
+  useEffect(()=>{
+    if(pendingImport)document.getElementById('word-import-review')?.scrollIntoView?.({block:'start'});
+  },[pendingImport]);
   const audioResolutionScope=`${projectId}:${data?.run?.id||'none'}`;
   const audioResolutionScopeRef=useRef(audioResolutionScope);audioResolutionScopeRef.current=audioResolutionScope;
   const [audioResolutionState,setAudioResolutionState]=useState<{scope:string;nodes:Record<string,boolean>}>({scope:'',nodes:{}});
@@ -186,6 +189,19 @@ export function StudioPage() {
         <label className="studio-check"><input type="checkbox" checked={paidFallback} onChange={e=>setPaidFallback(e.target.checked)} disabled={pageBusy||preparationUnsettled||!cloudCosts}/><span>允许本次制作在已保存策略许可时回退到付费云端；仅开启云端调用不会自动授权付费回退。</span></label><div className="studio-import-bottom"><span>导入仅建立制作数据；确认配音与画质后再派发生成任务。</span><button className="button button-primary" disabled={pageBusy||preparationUnsettled||Boolean(pendingImport)||!file||quality.loading||quality.saving||!quality.profile||!quality.supported}><FileUp size={16}/>{busy === 'import' ? '正在解析并创建制作数据…' : '导入并配置制作'}</button></div>
       </form>
     </section>
+    {pendingImport?<div id="word-import-review">
+      <p className="inline-notice" role="status">{notice || 'Word 已保存，正在等待审核。'}</p>
+      <WordImportPanel key={pendingImport.id} importId={pendingImport.id} studioMode initialProjectId={pendingImport.projectId} onBusyChange={setImportReviewBusy} onClose={()=>{setPendingImport(null);setNotice('');}} onImported={async id=>{
+        const pending=pendingImport;
+        if(pendingImportRef.current?.id!==pending.id)return;
+        try{await request('/api/quality/profiles/project/'+id,{method:'PUT',body:JSON.stringify({settings:pending.quality,expected_revision:pending.qualityRevision})});}
+        catch(e){if(pendingImportRef.current?.id===pending.id)setError('剧本已导入，但画质配置未保存，请核对当前项目制作设置：'+String(e));}
+        if(pendingImportRef.current?.id!==pending.id)return;
+        if(id===projectId)await quality.load();
+        if(pendingImportRef.current?.id!==pending.id)return;
+        await studio.refreshList();if(id===projectId)await studio.refreshAfterChange();if(pendingImportRef.current?.id!==pending.id)return;studio.selectProject(id);setFocusPreparation(id);setPendingImport(null);setNotice('剧本已确认，尚未启动制作。请先配置角色配音并核对画质，再开始制作。');
+      }}/>
+    </div>:null}
     <section className="card studio-panel studio-preparation-step" aria-label="第二步 制作设置"><p className="studio-step-label">第二步</p><h2>制作设置</h2><p>选择本次画质，导入后核对角色配音，再开始制作。{projectId?'未覆盖的镜头继承项目设置；已接收任务和旧视频保留原快照。':'新项目使用下方设置，不会更改系统默认。'}</p>
       {projectId?<ProjectProductionModels eagerVideo key={`models:${projectId}`} projectId={projectId} disabled={pageBusy||voiceUnsettled||Boolean(pendingImport)||(activeRun&&data?.run?.status!=='paused')} onStateChange={onModelStateChange} onSaved={studio.refreshAfterChange}/>:null}
       {projectId?<ProjectShotFraming key={`framing:${projectId}:${data?.run?.id||'none'}:${data?.run?.status||'none'}`} projectId={projectId} disabled={pageBusy||Boolean(pendingImport)||quality.saving} onStateChange={onFramingStateChange} onSaved={(ratio,uniform)=>{if(uniform)quality.setSettings(previous=>({...previous,aspect_ratio:ratio}));}}/>:null}
@@ -199,17 +215,7 @@ export function StudioPage() {
     {projectId&&data?.project.id===projectId?<ProjectProductPreparation key={`products:${projectId}`} projectId={projectId} shots={shots.map(shot=>({id:shot.id,order:shot.order,title:shot.title}))} disabled={pageBusy||Boolean(pendingImport)||(activeRun&&data?.run?.status!=='paused')} onStateChange={onProductReferenceStateChange} onChanged={studio.refreshAfterChange}/>:null}
     </section>
     {(error || studio.error) ? <div role="alert" className="inline-notice warning">{error || studio.error}<Link to="/settings">检查系统设置</Link></div> : null}
-    {notice ? <p className="inline-notice" role="status">{notice}</p> : null}
-    {pendingImport?<WordImportPanel key={pendingImport.id} importId={pendingImport.id} studioMode initialProjectId={pendingImport.projectId} onBusyChange={setImportReviewBusy} onClose={()=>setPendingImport(null)} onImported={async id=>{
-      const pending=pendingImport;
-      if(pendingImportRef.current?.id!==pending.id)return;
-      try{await request(`/api/quality/profiles/project/${id}`,{method:'PUT',body:JSON.stringify({settings:pending.quality,expected_revision:pending.qualityRevision})});}
-      catch(e){if(pendingImportRef.current?.id===pending.id)setError('剧本已导入，但画质配置未保存，请核对当前项目制作设置：'+String(e));}
-      if(pendingImportRef.current?.id!==pending.id)return;
-      if(id===projectId)await quality.load();
-      if(pendingImportRef.current?.id!==pending.id)return;
-      await studio.refreshList();if(id===projectId)await studio.refreshAfterChange();if(pendingImportRef.current?.id!==pending.id)return;studio.selectProject(id);setFocusPreparation(id);setPendingImport(null);setNotice('剧本已确认，尚未启动制作。请先配置角色配音并核对画质，再开始制作。');
-    }}/>:null}
+    {notice && !pendingImport ? <p className="inline-notice" role="status">{notice}</p> : null}
     {loading ? <LoadingState label="读取项目与真实制作记录…"/> : null}
     {!projectId ? <section className="studio-projects"><h2>已有项目</h2>{projects.length ? <div className="studio-project-grid">{projects.map(project => <button key={project.id} type="button" className="card studio-project-card" onClick={() => studio.selectProject(project.id)}><FolderOpen size={22}/><strong>{project.name}</strong><StudioStatus status={project.status}/><span>{project.shot_count || 0} 镜 · {project.video_count || 0} 条视频{project.error_count ? ` · ${project.error_count} 项异常` : ''}</span></button>)}</div> : studio.listLoading ? <LoadingState label="读取已有项目…"/> : studio.error ? <p className="studio-muted">项目列表暂未读取成功。恢复连接后刷新即可继续查看已有记录。</p> : <EmptyState title="从第一份剧本开始" description="上传 Word 即可创建项目；已有项目会显示在这里。"/>}</section> : null}
     {data ? <>

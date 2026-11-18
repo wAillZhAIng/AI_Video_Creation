@@ -17,6 +17,9 @@ export interface HealthStatus {
 export interface ProviderHealth {
   ok: boolean;
   connected?: boolean;
+  ready?: boolean;
+  busy?: boolean;
+  busy_reason?: "qwen" | null;
   configured?: boolean;
   mode?: ProviderMode;
   provider?: string;

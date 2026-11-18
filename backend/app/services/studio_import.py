@@ -14,7 +14,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.core.errors import AppError
 from app.core.secrets import redact, reveal
-from app.models import Character, Project, ScriptRevision, WordImport
+from app.models import Character, Project, ScriptRevision, SourceDocument, StoryboardShot, WordImport
 from app.models.entities import new_id
 from app.schemas_screenplay import ImportConfirm
 from app.services.cinematic_import import build_ir
@@ -22,6 +22,9 @@ from app.services.content_manager import safe_file
 from app.services.import_persistence import persist_upload
 from app.services.word_screenplay import (block_lines, commit_import, duration_review_issues, match_characters,
     parse_blocks, read_blocks, summary, validate_preview)
+
+
+SEMANTIC_REVIEW_WARNINGS = {'unresolved_semantics', 'suggested_attribution', 'suggested_split'}
 
 
 def content_fingerprint(blocks):
@@ -71,7 +74,7 @@ def ambiguities(session, preview):
         if stable and stable in ids:issues.append(stable+'：多个角色声明同一人物ID')
         if stable:ids[stable]=person['key']
     for warning in preview.get('parse_warnings',[]):
-        if warning.get('kind') in ('unresolved_semantics','suggested_attribution','suggested_split'):
+        if warning.get('kind') in SEMANTIC_REVIEW_WARNINGS:
             issues.append(warning['message'])
     # Unknown substantive prose must not disappear behind a successful upload.
     # Cinematic extraction handles these production labels in a separate pass.
@@ -82,6 +85,18 @@ def ambiguities(session, preview):
         if text and not text.startswith(structural):
             issues.append('未归类原文：'+text[:160])
     return list(dict.fromkeys(issues))
+
+
+def check_import_target(session, project_id, new_revision):
+    if not project_id:
+        return
+    project = session.get(Project, project_id)
+    if project is None:
+        raise AppError(404, 'project_missing', '目标项目不存在')
+    if not new_revision and (project.source_text.strip() or any(
+            session.scalar(select(model.id).where(model.project_id == project_id).limit(1))
+            for model in (ScriptRevision, StoryboardShot, SourceDocument))):
+        raise AppError(409, 'new_revision_required', '目标项目已有内容，请选择保存为新的剧本修订。')
 
 
 async def language_extract(session, settings, project_id, blocks, allow_cloud_costs,allow_paid_fallback=False):
@@ -177,14 +192,15 @@ async def import_word(session, settings, filename, data, *, project_id=None,
     sha=hashlib.sha256(data).hexdigest();fingerprint=content_fingerprint(blocks)
     previous=previous_import(session,sha,fingerprint,project_id)
     if previous and not new_revision:return import_response(previous,session,reused=True)
-    if project_id and not new_revision:
-        # A changed screenplay targeting a project is an explicit new revision,
-        # not a second hidden project or an overwrite of existing approved work.
-        raise AppError(409,'new_revision_required','目标项目已有内容；请明确 new_revision=true 以保存新剧本版本')
+    check_import_target(session,project_id,new_revision)
     preview=build_ir(blocks,parse_blocks)
     parser={'mode':'local_source_preserving_rules','language_model_called':False}
     issues=ambiguities(session,match_characters(session,deepcopy(preview)))
-    if issues and not duration_review_issues(preview):
+    # Explicit shots can go straight to review, with every unclassified source
+    # line intact. Only incomplete or inferred shot structure needs extraction.
+    needs_structure = (any(warning.get('kind') in SEMANTIC_REVIEW_WARNINGS for warning in preview['parse_warnings'])
+        or any(not (shot['visual_prompt'] or shot['action'] or shot['dialogues']) for shot in preview['shots']))
+    if issues and needs_structure and not duration_review_issues(preview):
         session.rollback()
         extracted,parser=await language_extract(session,settings,project_id,blocks,allow_cloud_costs,allow_paid_fallback)
         if extracted is not None:preview=extracted
@@ -212,15 +228,14 @@ def _persist_word_import(session, settings, filename, data, blocks, sha, preview
             relative_path=relative_path,blocks_json=blocks,revision=1)
         session.add(batch)
         session.flush()
-        if project_id and not session.get(Project,project_id):
-            raise AppError(404,'project_missing','目标项目不存在')
+        check_import_target(session,project_id,new_revision)
         batch.preview_json=match_characters(session,deepcopy(preview))
         issues=ambiguities(session,batch.preview_json)
         if issues:
             batch.error_message='；'.join(issues)[:12000]
             return batch,issues
 
-        payload=ImportConfirm(revision=batch.revision,duplicate_strategy='new_revision' if new_revision else 'new_project',
+        payload=ImportConfirm(revision=batch.revision,duplicate_strategy='new_revision' if project_id else 'new_project',
             project_id=project_id,reuse_approved=True)
         result=commit_import(session,batch,payload)
         if quality:

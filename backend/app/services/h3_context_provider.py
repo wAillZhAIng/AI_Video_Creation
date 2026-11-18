@@ -441,7 +441,8 @@ async def require_context_qwen(client, origin, *, runtime_required=False):
     if vision.get('gpu_release_status') == 'unconfirmed' or vision.get('inference_phase') == 'gpu_release_unconfirmed':
         raise AppError(503, 'context_ir_qwen_release_unknown', '本地 Qwen 未确认释放显存，请检查模型服务；未提交视频任务')
     if vision['busy'] or vision['loaded']:
-        raise AppError(503, 'context_ir_qwen_starting', '本地 Qwen 尚在处理任务，等待释放显存；未提交视频任务')
+        raise AppError(503, 'context_ir_qwen_starting', '本地 Qwen 尚在处理任务，等待释放显存；未提交视频任务',
+                       {'busy_reason': 'qwen'})
     cleanup = vision.get('last_gpu_cleanup')
     release = vision.get('gpu_release_status')
     if (vision.get('inference_phase') != 'idle'
@@ -528,6 +529,7 @@ async def probe_context_health(settings, snapshot=None):
     health = ProviderHealth('comfyui_h3_context_ir', False, False, False, 'real',
                             base_url=settings.h3_context_comfyui_url, workflow_name='H3 Context-IR')
     busy = False
+    busy_reason = None
     try:
         profile = (snapshot or {}).get('settings') or {}
         origin = context_origin((snapshot or {}).get('base_url') or settings.h3_context_comfyui_url, profile)
@@ -553,9 +555,11 @@ async def probe_context_health(settings, snapshot=None):
             health.reference_to_video_available = health.ready
     except AppError as exc:
         health.error = exc.message
+        busy_reason = exc.details.get('busy_reason')
+        busy = busy or busy_reason == 'qwen'
     except (httpx.HTTPError, ValueError, TypeError, AttributeError):
         health.error = '本地 Qwen 服务不可达' if health.connected else '本地 Context-IR ComfyUI 不可达'
-    return {**health.to_dict(), 'busy': busy}
+    return {**health.to_dict(), 'busy': busy, 'busy_reason': busy_reason}
 
 
 def context_history(history, workflow, expected_graph_sha):

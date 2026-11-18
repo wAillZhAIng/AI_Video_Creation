@@ -114,3 +114,24 @@ def test_connection_health_reports_compiler_upgrade_without_claiming_generation_
         assert '更新项目自有节点' in result['error']
         assert ('GET','/health') not in calls
     assert all(method=='GET' for method,_ in calls)
+
+
+@pytest.mark.parametrize(('status', 'working'), [(200, True), (503, False)])
+def test_connection_health_distinguishes_qwen_work_from_startup(settings, monkeypatch, status, working):
+    definition = {'input': {'optional': {'production_contract': ['STRING', {}],
+                                         'caller_contract_policy': deepcopy(POLICY)}}}
+    def reply(request):
+        if request.url.path == '/queue':
+            return httpx.Response(200, json={'queue_running': [], 'queue_pending': []})
+        if request.url.path == '/object_info/' + COMPILER:
+            return httpx.Response(200, json={COMPILER: definition})
+        if request.url.path == '/health':
+            return httpx.Response(status, json={**HEALTH, 'busy': working, 'loaded': working})
+        raise AssertionError(str(request.url))
+
+    monkeypatch.setattr(provider, 'context_client',
+                        lambda *args, **kwargs: httpx.AsyncClient(transport=httpx.MockTransport(reply), **kwargs))
+    result = asyncio.run(provider.probe_context_health(settings))
+    assert result['connected'] is True and result['ready'] is False
+    assert result['busy'] is working
+    assert result['busy_reason'] == ('qwen' if working else None)

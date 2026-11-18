@@ -9,7 +9,7 @@ export function WordImportPanel({onClose, importId, studioMode=false, initialPro
   const [library,setLibrary]=useState<Row[]>([]),[projects,setProjects]=useState<Row[]>([]),[strategy,setStrategy]=useState('new_project'),[projectId,setProjectId]=useState(''),[generate,setGenerate]=useState(false),[result,setResult]=useState<Row|null>(null),[reuse,setReuse]=useState(true);
   useEffect(()=>{onBusyChange?.(Boolean(busy));return()=>onBusyChange?.(false);},[busy,onBusyChange]);
   useEffect(()=>{void Promise.all([request<Row[]>('/api/characters'),request<Row[]>('/api/projects')]).then(([c,p])=>{setLibrary(c);setProjects(p);}).catch(e=>setError(String(e)));},[]);
-  useEffect(()=>{if(resumeId)void request<Row>('/api/word-imports/'+resumeId).then(b=>{setBatch(b);setPreview(b.preview_json);setStrategy(studioMode?(initialProjectId?'new_revision':'new_project'):(b.duplicates.length?'':'new_project'));setProjectId(initialProjectId);setError(b.error_message||'');}).catch(e=>setError(String(e)));},[resumeId,studioMode,initialProjectId]);
+  useEffect(()=>{if(resumeId)void request<Row>('/api/word-imports/'+resumeId).then(b=>{setBatch(b);setPreview(b.preview_json);setStrategy(studioMode?(initialProjectId?'new_revision':'new_project'):(b.duplicates.length?'':'new_project'));setProjectId(initialProjectId);setError(b.status==='failed'?(b.error_message||''):(b.issues||[]).join('；'));}).catch(e=>setError(String(e)));},[resumeId,studioMode,initialProjectId]);
   const update=(work:(copy:Row)=>void)=>setPreview(current=>{const copy=structuredClone(current!);work(copy);return copy;});
   async function upload(file:File) {
     setBusy('正在读取正文与表格');setError('');setResult(null);
