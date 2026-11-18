@@ -95,11 +95,11 @@
     {
       "name": "VideoFactoryReferenceCachePolicy",
       "files": {
-        "cache_policy.py": "aabe39075926241903794a9eddc74af28b31d10458e6b8d2058993502fdc6eaf",
+        "cache_policy.py": "2b41542644b6cb79958a626e04c84fdbfa368734248c02c4fb2593f5bd5fc733",
         "__init__.py": "3a854c669bbe7b7875072c1375bab80bba87b1690096a0cee213250e865008db"
       },
-      "policy_version": "videofactory-reference-cache-policy-v2r1",
-      "note": "Project V2R1 source equals the observed installed policy; install only this deployment name, never V1 and V2R1 together"
+      "policy_version": "videofactory-reference-cache-policy-v2r2",
+      "note": "Recognizes visually coherent retail kits as a product unit and rechecks unresolved product images once. Deploy this node under its existing name."
     },
     {
       "name": "VideoFactorySamplingAudit",

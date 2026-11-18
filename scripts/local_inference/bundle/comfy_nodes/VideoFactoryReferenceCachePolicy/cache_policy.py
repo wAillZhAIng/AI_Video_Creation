@@ -12,7 +12,8 @@ from pathlib import Path
 import threading
 import types
 
-POLICY_VERSION = "videofactory-reference-cache-policy-v2r1"
+POLICY_VERSION = "videofactory-reference-cache-policy-v2r2"
+CHARACTER_POLICY_VERSION = "videofactory-reference-cache-policy-v2r1"
 UNIT_NAMESPACE = "videofactory/reference-analysis-explicit-unit/v2"
 V1_VERSION = "videofactory-reference-cache-policy-v1"
 V1_NAMESPACE = "videofactory/reference-analysis-effective-inputs/v1"
@@ -23,13 +24,19 @@ SOURCE_PINS = {
     "backend": "b5d219f873a7c7b60fea19d44f4273c3b3f09fdaf9d51131d937f281c1959d39",
     "compile": "f96d893ff2b895c524329f11c10bed8999a5436d6c09ce64d95590819195772b",
 }
+PRODUCT_UNIT = "product-unit:"
 UNIT_RULES = {
-    "product-unit:": (
-        "object", "Identify one visually discernible physical product as a coherent whole. "
-        "For a box, its visible face text, printed illustrations or mascots, and any visibly attached "
-        "ribbon are attributes of that same product. Exclude those features and nearby props from "
-        "the subject list. Describe the physical product in the descriptor and put only observed "
-        "features in attributes."),
+    PRODUCT_UNIT: (
+        "object", "Identify one clearly visible retail product or coherent retail kit. "
+        "A retail kit is ONE object subject even if its box, fitted tray, and included pieces "
+        "are physically separate. When the packaging and components are visibly presented "
+        "together as the same set, return one subject describing the whole set, for example "
+        "a boxed tool set displayed with its fitted tray of tools. Name the visible retail unit "
+        "in the descriptor and describe the pieces and the packaging in its attributes. "
+        "Opening, removing or arranging the pieces does not change the product identity. "
+        "Treat printed illustrations, labels and attached decorations as attributes. Exclude "
+        "background items and independently presented products. Do not assume unrelated objects "
+        "are one set just because they appear together or because the caller gave a product label."),
     "character-unit:": (
         "person", "Identify one visually discernible foreground person as a coherent whole. "
         "Hair, garments, and worn accessories are attributes of that person. Exclude those features, "
@@ -37,6 +44,24 @@ UNIT_RULES = {
         "only the portions and features visible in the image. Treat multiple views as one person "
         "only when the visible reference sheet supports that reading."),
 }
+NATIVE_SUBJECT_PARAGRAPH = (
+    'For each distinct person, animal or object that could be reused in a video, give a descriptor\n'
+    '("the young man", "the black lamb") and then split what you see into TWO separate lists. The\n'
+    'split matters more than the detail:'
+)
+PRODUCT_SUBJECT_PARAGRAPH = (
+    "For the one visibly grounded product or retail kit, give one descriptor and split what "
+    "you see into the identity attributes and the transient pose. If the image clearly shows "
+    "one coherent retail kit, catalogue that kit as the one subject. No separate subjects "
+    "are needed for the carton, its fitted tray or the contents visibly belonging to it."
+)
+PRODUCT_RECHECK = (
+    "Look again at the actual image for one coherent retail unit. In an open-box presentation, "
+    "look for visible links such as pieces seated in a fitted insert, a tray positioned with its "
+    "matching carton, or components pictured on the carton. If they clearly form a packaged set, "
+    "return one object subject for the set and describe those visible links. Separate physical "
+    "pieces can belong to one product. If one retail unit is still uncertain, return no subjects."
+)
 _LOCAL_BATCH = ContextVar("videofactory_reference_unit_local_batch", default=False)
 _LOCK = threading.RLock()
 _INSTALLED = None
@@ -144,9 +169,13 @@ def _effective_inputs(ref):
     return material
 
 
+def _policy_version(prefix):
+    return POLICY_VERSION if prefix == PRODUCT_UNIT else CHARACTER_POLICY_VERSION
+
+
 def _priority_instruction(prefix):
     kind, rule = UNIT_RULES[prefix]
-    return (f"Priority reference scope from VideoFactory {POLICY_VERSION} ({prefix}). "
+    return (f"Priority reference scope from VideoFactory {_policy_version(prefix)} ({prefix}). "
             "For the subjects field, follow this scope before the generic catalogue instructions. "
             f"{rule} Use at most one subject of kind {kind}. When the image does not establish "
             "one coherent visible subject of that kind, return an empty subjects array. "
@@ -154,7 +183,15 @@ def _priority_instruction(prefix):
             "when uncertain. Keep the other ImageCard fields factual and retain the identity/pose split.")
 
 
-def _validate_subjects(subjects, prefix, origin):
+def _focused_instructions(prefix, native_instructions):
+    if prefix == PRODUCT_UNIT:
+        if native_instructions.count(NATIVE_SUBJECT_PARAGRAPH) != 1:
+            raise CachePolicyError("The pinned native ImageCard product paragraph changed")
+        native_instructions = native_instructions.replace(NATIVE_SUBJECT_PARAGRAPH, PRODUCT_SUBJECT_PARAGRAPH)
+    return _priority_instruction(prefix) + "\n\n" + native_instructions
+
+
+def _validate_subjects(subjects, prefix, origin, sha256=None):
     kind, _ = UNIT_RULES[prefix]
     if isinstance(subjects, list) and len(subjects) == 1 and isinstance(subjects[0], dict):
         subject = subjects[0]
@@ -162,17 +199,19 @@ def _validate_subjects(subjects, prefix, origin):
         if (subject.get("kind") == kind and isinstance(descriptor, str)
                 and descriptor.strip().casefold() not in ("", "unknown", "uncertain", "unobservable")):
             return
-    raise CachePolicyError(f"{origin} did not establish one {kind} subject for {prefix}")
+    detail = f" image SHA256 {sha256[:12]}" if sha256 else ""
+    raise CachePolicyError(f"{origin} did not establish one {kind} subject for {prefix}{detail}")
 
 
 class _ImageBackendProxy:
     """Forward the pinned native image call through the original Backend."""
 
-    def __init__(self, backend, prefix, native_schema, native_instructions):
+    def __init__(self, backend, prefix, native_schema, native_instructions, sha256):
         self.backend = backend
         self.prefix = prefix
         self.native_schema = native_schema
         self.native_instructions = native_instructions
+        self.sha256 = sha256
 
     @property
     def cfg(self):
@@ -190,9 +229,14 @@ class _ImageBackendProxy:
         subjects = focused["properties"]["subjects"]
         subjects["maxItems"] = 1
         subjects["items"]["properties"]["kind"]["enum"] = [UNIT_RULES[self.prefix][0]]
-        system = {"role": "system", "content": _priority_instruction(self.prefix) + "\n\n" + self.native_instructions}
+        system = {"role": "system", "content": _focused_instructions(self.prefix, self.native_instructions)}
         reply = self.backend.json_call([system, messages[1]], focused, **kwargs)
-        _validate_subjects(reply.get("subjects") if isinstance(reply, dict) else None, self.prefix, "Model ImageCard")
+        subjects = reply.get("subjects") if isinstance(reply, dict) else None
+        if self.prefix == PRODUCT_UNIT and subjects == []:
+            retry_user = {**messages[1], "content": [*content, {"type": "text", "text": PRODUCT_RECHECK}]}
+            reply = self.backend.json_call([system, retry_user], focused, **kwargs)
+            subjects = reply.get("subjects") if isinstance(reply, dict) else None
+        _validate_subjects(subjects, self.prefix, "Model ImageCard", self.sha256)
         return reply
 
 
@@ -210,18 +254,21 @@ def _make_wrappers(analyser, native_schema, native_instructions):
                     "analysis_effective_inputs": _effective_inputs(ref)}
         prefix = _unit(ref) if _LOCAL_BATCH.get() else None
         if prefix:
-            material.update(namespace=UNIT_NAMESPACE, policy_version=POLICY_VERSION,
+            material.update(namespace=UNIT_NAMESPACE, policy_version=_policy_version(prefix),
                             unit={"prefix": prefix, "kind": UNIT_RULES[prefix][0],
                                   "instruction_sha256": _digest(_priority_instruction(prefix)),
                                   "native_image_schema_sha256": _digest(native_schema)})
+            if prefix == PRODUCT_UNIT:
+                material["unit"]["instruction_sha256"] = _digest({
+                    "system": _focused_instructions(prefix, native_instructions), "recheck": PRODUCT_RECHECK})
         return _digest(material)[:24]
 
     def analyse_image(backend, ref, *, seed=None):
         prefix = _unit(ref) if _matches_backend(backend, backend_type) else None
         if prefix is None:
             return native_image(backend, ref, seed=seed)
-        log.info("%s applies %s to ImageCard %s", POLICY_VERSION, prefix, ref.sha256[:12])
-        proxy = _ImageBackendProxy(backend, prefix, native_schema, native_instructions)
+        log.info("%s applies %s to ImageCard %s", _policy_version(prefix), prefix, ref.sha256[:12])
+        proxy = _ImageBackendProxy(backend, prefix, native_schema, native_instructions, ref.sha256)
         return native_image(proxy, ref, seed=seed)
 
     def analyse_all(backend, refs, *, use_cache=True, seed=None, transcripts=None):
@@ -240,7 +287,7 @@ def _make_wrappers(analyser, native_schema, native_instructions):
                 if (card is None or card.sha256 != ref.sha256 or card.kind is not analyser.AssetKind.IMAGE
                         or card.model_id != MODEL or card.analyzer_version != analyser.ANALYZER_VERSION):
                     raise CachePolicyError("Explicit reference card does not match the analysed media/model")
-                _validate_subjects(card.subjects, prefix, "Returned or cached ImageCard")
+                _validate_subjects(card.subjects, prefix, "Returned or cached ImageCard", ref.sha256)
             return cards
         finally:
             _LOCAL_BATCH.reset(token)
