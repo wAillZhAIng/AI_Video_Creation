@@ -17,8 +17,9 @@ from app.schemas_quality import QualitySettings
 
 PREFLIGHT_CODES = {
     'quality_route_processing_mismatch', 'quality_method_unverified',
-    'quality_route_adapter_unavailable', 'quality_route_slot',
-    'seedvr_endpoint_unverified', 'task_route_blocked', 'route_service_changed',
+    'quality_route_adapter_unavailable', 'quality_route_slot', 'quality_route_target_mismatch',
+    'seedvr_endpoint_unverified', 'realesrgan_endpoint_unverified',
+    'task_route_blocked', 'route_service_changed',
 }
 READY_STATES = {'pending', 'waiting_dependencies'}
 PROTECTED_STATES = {'running', 'dispatching', 'submitting', 'submitted',
@@ -50,23 +51,56 @@ def _quality_route(session, settings, project_id, shot_id, quality, options):
                 'profile': {'revision': 0, 'inherited_from': None,
                             'settings': {'parameters': {}}},
                 'source': 'explicit_saved_lanczos_settings'}
-    if quality.processing != 'seedvr2':
+    if quality.processing not in {'seedvr2', 'ai_super_resolution'}:
         raise AppError(409, 'quality_apply_adapter_unavailable',
                        '此处理方式尚无可明确应用的生产路由，未换用其他超分服务')
-    from app.services.task_routing import freeze_route
+    from app.services.task_routing import freeze_route, route_is_explicit
     from app.services.video_quality import _route_for_quality
+    target = {'quality': quality.model_dump()} if quality.processing == 'ai_super_resolution' else {}
     route = freeze_route(session, settings, project_id, shot_id, 'video_upscale',
                          bool(options.get('allow_cloud_costs')),
-                         bool(options.get('allow_paid_fallback')))
+                         bool(options.get('allow_paid_fallback')), **target)
+    if quality.processing == 'ai_super_resolution' and not route_is_explicit(route):
+        return route
     _route_for_quality(session, route, quality)
     selected = route['selected']['service_snapshot']
     if selected.get('is_cloud'):
         raise AppError(409, 'quality_apply_cloud_not_supported',
-                       '当前只接入已验证的本机 SeedVR2；未提交云端超分或扩大费用授权')
-    if route.get('profile', {}).get('settings', {}).get('parameters'):
+                       '画质设置只能应用到已验证的本机超分服务')
+    parameters = route['profile']['settings'].get('parameters', {})
+    if parameters and (quality.processing == 'seedvr2' or set(parameters) - set(QualitySettings.model_fields)):
         raise AppError(422, 'quality_apply_parameters_unsupported',
-                       '当前 SeedVR2 使用已验证固定参数，请移除未实现的额外超分参数')
+                       '请使用已验证的超分参数并在画质设置中选择输出规格')
     return route
+
+
+def refresh_upscale_routes_for_retry(session, settings, run, entries):
+    """Rebind only confirmed preflight failures, prior to any render dispatch."""
+    options = run.snapshot_json.get('options', {})
+    routes = copy.deepcopy(run.snapshot_json.get('routes_by_shot', {}))
+    updated = {}
+    for entry in entries:
+        if (entry['kind'] != 'quality' or entry.get('child_id')
+                or entry.get('code') not in PREFLIGHT_CODES):
+            continue
+        shot_id = entry['target_id']
+        config = options.get('quality_by_shot', {}).get(shot_id, {})
+        if config.get('processing') != 'ai_super_resolution':
+            continue
+        shot = session.get(m.StoryboardShot, shot_id)
+        quality = QualitySettings.model_validate(config)
+        if not shot or shot.project_id != run.project_id or shot.status == 'deleted' or quality.aspect_ratio != shot.aspect_ratio:
+            raise AppError(409, 'quality_apply_aspect_mismatch',
+                           '本镜实际画幅已与原片的制作规格不一致，请为新画幅创建增量制作')
+        _raw_video(session, settings, run.nodes_json, shot)
+        route = _quality_route(session, settings, run.project_id, shot_id, quality, options)
+        routes.setdefault(shot_id, {})['video_upscale'] = route
+        entry['route'] = copy.deepcopy(route)
+        selected = (route.get('selected') or {}).get('service_snapshot', {})
+        updated[entry['id']] = {'model_id': selected.get('model_id'), 'aspect_ratio': quality.aspect_ratio}
+    if updated:
+        run.snapshot_json = {**run.snapshot_json, 'routes_by_shot': routes}
+    return updated
 
 
 def _raw_video(session, settings, nodes, shot):

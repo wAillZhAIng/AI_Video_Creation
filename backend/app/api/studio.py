@@ -324,11 +324,14 @@ def retry(project_id: str, payload: dict | None = None, session: Session = Depen
         if changed_cloud:
             raise AppError(409, 'studio_cloud_scope_changed', '云端服务或密钥设置已改变，请通过重新启动确认新服务的本轮费用范围')
         run.snapshot_json = {**run.snapshot_json, 'services': snapshots, 'service_errors': errors}
+    from app.services.studio_quality_apply import refresh_upscale_routes_for_retry
+    quality_routes = refresh_upscale_routes_for_retry(session, settings, run, selected) if settings else {}
     for n in selected:
         _requeue_failed_node(n)
     run.nodes_json = nodes; run.status = 'queued'; run.error_message = None
     session.add(m.AuditEvent(object_type='studio_run', object_id=run.id, action='failed_nodes_retry_requested',
-                             details_json={'node_ids': [n['id'] for n in selected], 'refreshed_context': refreshed}))
+                             details_json={'node_ids': [n['id'] for n in selected], 'refreshed_context': refreshed,
+                                           'refreshed_upscale_routes': quality_routes}))
     sync_production_status(session, run)
     session.commit(); return overview(session, project_id)
 

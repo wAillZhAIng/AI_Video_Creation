@@ -15,6 +15,7 @@ from app.schemas_quality import QualitySettings
 from app.services.ai_services import service_snapshot
 from app.services.studio_quality_apply import apply_saved_quality
 from app.services import task_routing, video_quality as q
+from app.services import super_resolution
 
 
 @pytest.fixture
@@ -106,6 +107,95 @@ def prepared(context, settings, monkeypatch):
     monkeypatch.setattr(task_routing, 'manifest_status', lambda *_: {
         'state': 'verified', 'manifest': {'model_id': service.default_model, 'task_capabilities': ['video_upscale']}})
     return session, project, shot, video, run, service, path, digest, copy.deepcopy(new)
+
+
+def verified_upscalers(session, monkeypatch):
+    orientations = {'RealESRGAN_x4plus': '16:9', 'realesr-general-x4v3': '9:16'}
+    profiles, services = {}, {}
+    for model, aspect in orientations.items():
+        service = m.AIService(name=model, provider='comfyui', module='video_upscale',
+            base_url='http://127.0.0.1:18188', default_model=model,
+            enabled=True, is_default=aspect == '16:9')
+        session.add(service)
+        services[aspect] = service
+        profiles[model] = {'state':'verified', 'model':model, 'verified_aspect_ratios':[aspect],
+                           'verified_resolutions':['4k'], 'model_sha256':'a'*64,
+                           'script_sha256':'b'*64, 'evidence':{'sha256':'c'*64}}
+    session.flush()
+    aggregate = {**profiles['RealESRGAN_x4plus'], 'models':profiles,
+                 'model_by_aspect_ratio':{aspect:model for model, aspect in orientations.items()},
+                 'verified_aspect_ratios':list(orientations.values())}
+    monkeypatch.setattr(super_resolution, 'status', lambda settings, model_id=None:
+                        profiles[model_id] if model_id else aggregate)
+    return services
+
+
+def test_pipeline_uses_each_script_aspect_and_preserves_manual_override(context, settings, monkeypatch):
+    from app.services.studio_pipeline import create_pipeline
+
+    session, _, project, landscape, _ = context
+    portrait = m.StoryboardShot(project_id=project.id, order=2, scene_title='Portrait source',
+                                aspect_ratio='9:16', duration_seconds=2)
+    session.add(portrait); session.flush()
+    services = verified_upscalers(session, monkeypatch)
+    land, port = services['16:9'], services['9:16']
+    session.add(m.RoutePolicy(scope='system', target_id='default', slot='video_upscale', revision=1,
+        settings_json={'mode':'local_only', 'choices':[{'service_id':land.id, 'model_id':land.default_model}]}))
+    session.commit()
+    run = create_pipeline(session, settings, project.id, {
+        'quality': {'resolution':'4k', 'processing':'ai_super_resolution', 'aspect_ratio':'16:9'},
+    })
+    for shot, service in ((landscape, land), (portrait, port)):
+        target = run.snapshot_json['options']['quality_by_shot'][shot.id]
+        route = run.snapshot_json['routes_by_shot'][shot.id]['video_upscale']
+        assert target['aspect_ratio'] == shot.aspect_ratio
+        assert route['quality_target'] == {'resolution':'4k','aspect_ratio':shot.aspect_ratio,'selection':'auto'}
+        assert route['selected']['service_snapshot']['service_id'] == service.id
+    manual = m.RoutePolicy(scope='project', target_id=project.id, slot='video_upscale', revision=1,
+        settings_json={'mode':'manual','choices':[{'service_id':land.id,'model_id':land.default_model}]})
+    session.add(manual); session.flush()
+    target = run.snapshot_json['options']['quality_by_shot'][portrait.id]
+    route = task_routing.freeze_route(session, settings, project.id, portrait.id, 'video_upscale', quality=target)
+    assert route['quality_target']['selection'] == 'manual'
+    assert [choice['candidate']['model_id'] for choice in route['choices']] == [land.default_model]
+    with pytest.raises(AppError, match='当前手动选择缺少 4k · 9:16'):
+        q._route_for_quality(session, route, QualitySettings.model_validate(target))
+    manual.settings_json = {**manual.settings_json, 'choices':[{'service_id':port.id,'model_id':port.default_model}]}
+    session.flush()
+    route = task_routing.freeze_route(session, settings, project.id, portrait.id, 'video_upscale', quality=target)
+    assert route['selected']['service_snapshot']['service_id'] == port.id
+
+
+def test_retry_rebinds_a_frozen_mismatched_upscale_route_without_regenerating(prepared, settings, monkeypatch):
+    from app.api.studio import retry
+
+    session, project, shot, video, run, _, path, digest, _ = prepared
+    services = verified_upscalers(session, monkeypatch)
+    landscape, portrait = services['16:9'], services['9:16']
+    policy = task_routing.policy(session, 'project', project.id, 'video_upscale')
+    session.delete(policy)
+    session.add(m.RoutePolicy(scope='system', target_id='default', slot='video_upscale', revision=1,
+        settings_json={'mode':'local_only','choices':[{'service_id':portrait.id,'model_id':portrait.default_model}]}))
+    quality = QualitySettings(resolution='4k', processing='ai_super_resolution', aspect_ratio='16:9').model_dump()
+    before = copy.deepcopy(run.nodes_json[0])
+    nodes = copy.deepcopy(run.nodes_json)
+    nodes[1].update(code='quality_method_unverified', error='old frozen route fails')
+    run.nodes_json = nodes
+    snapshot = copy.deepcopy(run.snapshot_json)
+    snapshot.update(context_production=True, h3_context_by_shot={shot.id:{}})
+    snapshot['options']['quality_by_shot'][shot.id] = quality
+    run.snapshot_json = snapshot
+    session.commit()
+    retry(project.id, {'node_id': nodes[1]['id'], 'expected_run_id':run.id}, session, settings=settings)
+    node = run.nodes_json[1]
+    assert node['status'] == 'pending' and node['child_id'] is None
+    route = node['route']
+    assert route['quality_target']['selection'] == 'auto'
+    assert route['selected']['service_snapshot']['service_id'] == landscape.id
+    assert run.nodes_json[0] == before
+    assert run.snapshot_json['routes_by_shot'][shot.id]['video_generation'] == snapshot['routes_by_shot'][shot.id]['video_generation']
+    assert not list(session.scalars(select(m.QualityRender)))
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
 
 
 def test_apply_updates_only_undispatched_quality_and_checks_and_is_idempotent(prepared, settings):

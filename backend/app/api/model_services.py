@@ -78,6 +78,28 @@ async def submit(payload:TaskSubmit,request:Request,session:Session=Depends(get_
     if payload.slot in {'dialogue_generation','lip_sync'}:
         from app.services.media_processing import create_task
         task=create_task(session,settings,payload);session.commit();return dto(session,'media',task)
+    if payload.slot == 'video_upscale':
+        from app.schemas_quality import QualitySettings
+        from app.services.video_quality import create_render
+
+        video = session.get(m.VideoRevision, payload.inputs.get('video_id'))
+        if not video or video.project_id != payload.project_id or payload.shot_id and video.shot_id != payload.shot_id:
+            raise AppError(422, 'video_scope', '源视频不属于项目镜头')
+        source_shot = shot or session.get(m.StoryboardShot, video.shot_id)
+        profile = routing.route_profile(session, 'shot', video.shot_id, 'video_upscale')
+        parameters = {**profile.settings.parameters, **payload.parameters}
+        routing.validate_parameters(parameters)
+        config = {key: value for key, value in parameters.items() if key in QualitySettings.model_fields}
+        config.setdefault('mode', profile.settings.quality_mode)
+        if source_shot and config.get('processing') == 'ai_super_resolution':
+            config.setdefault('aspect_ratio', source_shot.aspect_ratio)
+        quality = QualitySettings.model_validate(config)
+        route = routing.freeze_route(session, settings, payload.project_id, video.shot_id, 'video_upscale',
+            payload.allow_cloud_costs, payload.allow_paid_fallback, quality=quality.model_dump())
+        frozen = route if quality.processing != 'ai_super_resolution' or routing.route_is_explicit(route) else None
+        task = create_render(session, settings, video.id, quality, route_snapshot=frozen)
+        session.commit()
+        return dto(session, 'quality', task)
     route=routing.freeze_route(session,settings,payload.project_id,payload.shot_id,payload.slot,payload.allow_cloud_costs,payload.allow_paid_fallback)
     service,snapshot=routing.assert_frozen(session,route);parameters={**route['profile']['settings']['parameters'],**payload.parameters};routing.validate_parameters(parameters)
     if payload.slot=='video_generation':
@@ -103,13 +125,6 @@ async def submit(payload:TaskSubmit,request:Request,session:Session=Depends(get_
         batch=m.CharacterBatch(character_id=character.id,character_version_id=version.id,kind='candidates',snapshot_json={**plan,'task_route_snapshot':route});session.add(batch);session.flush()
         first=plan['jobs'][0];job=m.CharacterGenerationJob(batch_id=batch.id,asset_type=first['asset_type'],prompt=first['prompt'],negative_prompt=first['negative_prompt'],seed=first['seed'],snapshot_json={**{k:v for k,v in plan.items() if k not in {'jobs','preview_hash'}},'type':first['type'],'attempt':0,'task_route_snapshot':route,'project_id':payload.project_id})
         session.add(job);session.commit();return dto(session,'image',job)
-    if payload.slot=='video_upscale':
-        from app.services.video_quality import create_render
-        from app.schemas_quality import QualitySettings
-        video=session.get(m.VideoRevision,payload.inputs.get('video_id'))
-        if not video or video.project_id!=payload.project_id or payload.shot_id and video.shot_id!=payload.shot_id:raise AppError(422,'video_scope','源视频不属于项目镜头')
-        config={k:v for k,v in parameters.items() if k in QualitySettings.model_fields};config.setdefault('mode',route['profile']['settings']['quality_mode'])
-        task=create_render(session,settings,video.id,QualitySettings(**config),route_snapshot=route);session.commit();return dto(session,'quality',task)
     if payload.slot=='final_assembly':
         if parameters:raise AppError(422,'assembly_route_parameters_unsupported','合成输出参数由已保存的时间线管理，此入口不静默覆盖')
         from app.api.assemblies import submit as render

@@ -39,6 +39,7 @@ def plan(settings,sr_status=None,seed_status=None):
     if q.aspect_ratio == '1:1': width=height
     base = {'16:9': (1024,576), '9:16': (576,1024), '1:1': (768,768)}[q.aspect_ratio]
     ai_supported=q.processing=='ai_super_resolution' and q.resolution=='4k' and (sr_status or {}).get('state')=='verified' and q.aspect_ratio in (sr_status or {}).get('verified_aspect_ratios',[])
+    ai_model=(sr_status.get('model_by_aspect_ratio',{}).get(q.aspect_ratio) or sr_status.get('model')) if ai_supported else None
     from app.services.seedvr_capabilities import target_supported
     seed_supported=q.processing=='seedvr2' and target_supported(q,seed_status)
     supported=q.processing=='lanczos' or ai_supported or seed_supported
@@ -47,7 +48,7 @@ def plan(settings,sr_status=None,seed_status=None):
         'encoding': {'codec':'libx264','pix_fmt':'yuv420p',**{k:v for k,v in MODES[q.mode].items() if k!='steps'}},
         'method': q.processing, 'supported':supported, 'ai_super_resolution':ai_supported or seed_supported,
         'temporal_model':bool(seed_supported),
-        'postprocess_model':{'name':'SeedVR2 3B FP8','steps':1,'seed':20261024,'temporal_chunk_pixel_frames':9,'temporal_overlap_latent_frames':1} if q.processing=='seedvr2' else None,
+        'postprocess_model':{'name':'SeedVR2 3B FP8','steps':1,'seed':20261024,'temporal_chunk_pixel_frames':9,'temporal_overlap_latent_frames':1} if q.processing=='seedvr2' else {'name':ai_model} if ai_model else None,
         'label':q.resolution+' 输出（普通 Lanczos 缩放）' if q.processing=='lanczos' else q.resolution+' 输出（SeedVR2 时序视频超分）' if seed_supported else '4K 输出（Real-ESRGAN 逐帧超分）' if ai_supported else '所选处理方式尚无已验证的工作流',
         'visual_quality':'human_review_required', 'limits':['文件像素尺寸不代表原生细节质量','SeedVR2仅开放完整视频实测通过的精确分辨率与画幅组合','模式参数已接入工作流；各参数实测证据以任务记录为准','时序分块模型仍需检查边界闪烁与细节伪造；Real-ESRGAN为逐帧图像模型']}
 
@@ -161,9 +162,24 @@ def _source_lineage(session,requested):
 def _route_for_quality(session,route_snapshot,q):
     if route_snapshot is None:return q,None
     from app.services.task_routing import assert_frozen
+    if q.processing == 'ai_super_resolution' and route_snapshot.get('quality_target') and not route_snapshot.get('selected'):
+        target = route_snapshot['quality_target']
+        mode = '当前手动选择' if target['selection'] == 'manual' else '已启用的本地模型'
+        raise AppError(409, 'quality_method_unverified',
+                       f"{mode}缺少 {q.resolution} · {q.aspect_ratio} 的 Real-ESRGAN 超分验证",
+                       {'target': target, 'rejections': route_snapshot['rejections']})
     _service,selected=assert_frozen(session,route_snapshot)
     if route_snapshot.get('slot')!='video_upscale' or selected.get('module')!='video_upscale':
         raise AppError(422,'quality_route_slot','画质处理只能使用视频超分任务路由')
+    from app.services import super_resolution
+    if selected.get('model_id') in super_resolution.MODELS and selected.get('provider')=='comfyui':
+        if selected.get('is_cloud') or not super_resolution.matches_service(selected['provider'],selected['model_id'],selected.get('base_url')):
+            raise AppError(409,'realesrgan_endpoint_unverified','当前 Real-ESRGAN 路由只接受实例的本机 18188 端点')
+        if q.processing!='ai_super_resolution':
+            raise AppError(409,'quality_route_processing_mismatch','请将画质处理方式设为 Real-ESRGAN 逐帧超分')
+        if selected['model_id']==super_resolution.PORTRAIT_MODEL and (q.resolution,q.aspect_ratio)!=('4k','9:16'):
+            raise AppError(409,'quality_route_target_mismatch','所选竖屏超分服务只验证了 4K 9:16，请保存对应输出规格或切换服务')
+        return q,copy.deepcopy(route_snapshot)
     if selected.get('model_id')!='seedvr2_3b_fp8_e4m3fn.safetensors' or selected.get('provider') not in {'comfyui','local_runtime'}:
         raise AppError(409,'quality_route_adapter_unavailable','此视频超分服务尚无已验证执行适配；未切换到其他服务')
     base=selected.get('base_url') or 'http://127.0.0.1:8189'
@@ -175,7 +191,12 @@ def _route_for_quality(session,route_snapshot,q):
 
 def create_render(session, settings, video_id, quality,allow_unverified_ai=False,route_snapshot=None,allow_unverified_seed=False):
     q=QualitySettings.model_validate(quality);q,route_snapshot=_route_for_quality(session,route_snapshot,q)
-    sr=_sr_status(settings);seed=seedvr_capabilities(session,settings) if q.processing=='seedvr2' else None;p=plan(q,sr,seed)
+    from app.services.super_resolution import target_status
+    sr=None
+    if q.processing=='ai_super_resolution':
+        selected_model=route_snapshot['selected']['service_snapshot']['model_id'] if route_snapshot else None
+        sr=target_status(_sr_status(settings),q.aspect_ratio,selected_model,verification_run=allow_unverified_ai)
+    seed=seedvr_capabilities(session,settings) if q.processing=='seedvr2' else None;p=plan(q,sr,seed)
     testing=allow_unverified_ai and q.processing=='ai_super_resolution' and q.resolution=='4k' and sr and sr['state'] in {'detected_not_tested','verified'}
     seed_testing=allow_unverified_seed and q.processing=='seedvr2' and q.resolution in {'720p','1080p'} and seed and seed.get('state')=='verified'
     if not p['supported'] and not (testing or seed_testing):raise AppError(409,'quality_method_unverified','没有已验证的原生／AI超分／重建流程；不能用普通缩放冒充')
@@ -461,7 +482,8 @@ async def quality_worker(settings,factory):
 def publish_sr_verification(settings,factory,identifier,snapshot,sr_receipt,relative,digest,actual):
     proof=Path(snapshot['super_resolution']['runtime']['verification']);proof.parent.mkdir(parents=True,exist_ok=True)
     payload={'model_sha256':sr_receipt['model_sha256'],'script_sha256':snapshot['super_resolution']['script_sha256'],'quality_render_id':identifier,'relative_path':relative,'aspect_ratio':snapshot['settings']['aspect_ratio'],
-        'sha256':digest,'full_decode':0,'all_frames_processed':True,'frames':actual['frames'],'method':'RealESRGAN_x4plus framewise','temporal_model':False}
+        'sha256':digest,'full_decode':0,'all_frames_processed':True,'frames':actual['frames'],'width':actual['width'],'height':actual['height'],
+        'method':sr_receipt.get('method','RealESRGAN_x4plus framewise'),'temporal_model':False}
     temporary=proof.with_suffix('.tmp.json');temporary.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8');temporary.replace(proof)
     with factory() as session:
         for candidate in session.scalars(select(m.LocalModel).where(m.LocalModel.kind=='upscale')):

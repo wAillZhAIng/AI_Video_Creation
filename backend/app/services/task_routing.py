@@ -7,7 +7,7 @@ from sqlalchemy import select
 from app import models as m
 from app.core.errors import AppError
 from app.core.paths import safe_media_path
-from app.schemas_routing import TaskSlot, RouteSettings, RouteProfile, TaskCandidate
+from app.schemas_routing import TaskSlot, RouteSettings, RouteProfile, RouteChoice, TaskCandidate
 from app.services.ai_services import service_snapshot
 from app.services.runtime_registry import file_sha, manifest_status
 from app.services.service_acceptance import accepted_evidence
@@ -51,15 +51,28 @@ def route_profile(session,scope,target,slot):
     if scope!='system':scopes.append(('system','default'))
     for level,identifier in scopes:
         row=policy(session,level,identifier,slot)
-        if row:return RouteProfile(scope=scope,target_id=target,slot=slot,revision=row.revision if level==scope else 0,
-            inherited_from=None if level==scope else level+':'+identifier,settings=row.settings_json)
+        if row:
+            config = RouteSettings.model_validate(row.settings_json)
+            if slot == 'video_upscale' and level == 'system' and config.mode == 'local_only':
+                # Old system defaults listed the original installed Real-ESRGAN model.
+                # An explicit manual policy still pins the operator's selection.
+                from app.services.super_resolution import MODELS
+                def installed_model(choice):
+                    service = session.get(m.AIService, choice.service_id)
+                    return choice.model_id or (service.default_model if service else '')
+                if all(installed_model(choice) in MODELS for choice in config.choices):
+                    config = config.model_copy(update={'mode': 'auto'})
+            return RouteProfile(scope=scope,target_id=target,slot=slot,revision=row.revision if level==scope else 0,
+                inherited_from=None if level==scope else level+':'+identifier,settings=config)
     choices=[]
+    binding=None
     for module in SLOTS[slot][1]:
         binding=session.scalar(select(m.ProjectServiceBinding).where(m.ProjectServiceBinding.project_id==project,m.ProjectServiceBinding.module==module)) if project else None
         service=session.get(m.AIService,binding.service_id) if binding else session.scalar(select(m.AIService).where(m.AIService.module==module,m.AIService.is_default.is_(True),m.AIService.enabled.is_(True)))
         if service and service.enabled:choices=[{'service_id':service.id,'model_id':(binding.model_id if binding else '') or service.default_model}];break
+    mode = 'auto' if slot == 'video_upscale' and not binding else 'manual' if choices else 'local_only'
     return RouteProfile(scope=scope,target_id=target,slot=slot,revision=0,inherited_from='legacy_module_default' if choices else None,
-        settings=RouteSettings(mode='manual' if choices else 'local_only',choices=choices))
+        settings=RouteSettings(mode=mode,choices=choices))
 
 def save_route(session,scope,target,slot,payload):
     validate_scope(session,scope,target,slot);validate_parameters(payload.settings.parameters)
@@ -140,6 +153,17 @@ def _evidence(session,settings,service,model,slot):
         if service.provider not in {'local_llm','openai_compatible'}:return None
         from app.services.screenplay_generation import screenplay_evidence
         return screenplay_evidence(session,settings,service,model,slot)
+    if slot == 'video_upscale':
+        from app.services import super_resolution
+        if super_resolution.matches_service(service.provider, model, service.base_url):
+            status = super_resolution.status(settings, model)
+            if status['state'] == 'verified':
+                return {'kind':'decoded_realesrgan_render','model_sha256':status['model_sha256'],
+                        'script_sha256':status['script_sha256'],
+                        'verified_resolutions':status['verified_resolutions'],
+                        'verified_aspect_ratios':status['verified_aspect_ratios'],
+                        'output_sha256':status['evidence']['sha256']}
+            return None
     if service.provider=='local_runtime' or service.module=='video_upscale' and service.provider=='comfyui':
         family=service.settings_json.get('runtime_family') or ('seedvr2' if model=='seedvr2_3b_fp8_e4m3fn.safetensors' else '')
         if family=='seedvr2' and service.base_url.rstrip('/')!='http://127.0.0.1:8189':return None
@@ -203,13 +227,48 @@ def candidate(session,settings,service,slot,model_id=None):
         is_cloud=snapshot['is_cloud'],enabled=service.enabled,eligible=not reasons,
         verification='verified' if not reasons else 'unavailable' if service.provider=='cloud_draft' or not service.enabled else 'not_tested',reasons=reasons,evidence=proof or {})
 
-def freeze_route(session,settings,project_id,shot_id,slot,allow_cloud_costs=False,allow_paid_fallback=False):
+def _registered_realesrgan_choices(session, configured):
+    from app.services.super_resolution import matches_service
+
+    choices = {}
+    for choice in configured:
+        service = session.get(m.AIService, choice.service_id)
+        model = (choice.model_id or service.default_model) if service else None
+        if service and matches_service(service.provider, model, service.base_url):
+            choices[service.id, model] = RouteChoice(service_id=service.id, model_id=model)
+    services = session.scalars(select(m.AIService).where(m.AIService.module == 'video_upscale')
+                              .order_by(m.AIService.is_default.desc(), m.AIService.created_at, m.AIService.id))
+    for service in services:
+        models = dict.fromkeys([service.default_model, *(
+            item.get('id', '') if isinstance(item, dict) else str(item) for item in service.models_json)])
+        for model in models:
+            if matches_service(service.provider, model, service.base_url):
+                choices.setdefault((service.id, model), RouteChoice(service_id=service.id, model_id=model))
+    return list(choices.values())
+
+
+def freeze_route(session,settings,project_id,shot_id,slot,allow_cloud_costs=False,allow_paid_fallback=False,*,quality=None):
     profile=route_profile(session,'shot' if shot_id else 'project' if project_id else 'system',shot_id or project_id or 'default',slot)
     config=profile.settings;choices=[]
-    for index,choice in enumerate(config.choices):
+    target = None
+    explicit = profile.revision > 0 or profile.inherited_from not in (None,'legacy_module_default')
+    requested_choices = config.choices
+    if slot == 'video_upscale' and quality and quality.get('processing') == 'ai_super_resolution':
+        target = {key: quality[key] for key in ('resolution', 'aspect_ratio')}
+        if config.mode == 'auto':
+            requested_choices = _registered_realesrgan_choices(session, config.choices)
+        explicit = explicit or bool(requested_choices)
+    for index,choice in enumerate(requested_choices):
         service=session.get(m.AIService,choice.service_id)
         if not service:continue
         item=candidate(session,settings,service,slot,choice.model_id)
+        if target and item.eligible:
+            proof = item.evidence
+            if (item.is_cloud or proof.get('kind') != 'decoded_realesrgan_render'
+                    or target['resolution'] not in proof.get('verified_resolutions', [])
+                    or target['aspect_ratio'] not in proof.get('verified_aspect_ratios', [])):
+                item = item.model_copy(update={'eligible':False, 'reasons':[
+                    f"{item.model_id} 未验证 {target['resolution']} · {target['aspect_ratio']} 的 Real-ESRGAN 超分"]})
         choices.append({'original_index':index,'candidate':item.model_dump(),'service_snapshot':service_snapshot(service,item.model_id)})
     if config.mode=='local_only':choices=[v for v in choices if not v['candidate']['is_cloud']]
     elif config.mode=='cloud_only':choices=[v for v in choices if v['candidate']['is_cloud']]
@@ -225,8 +284,11 @@ def freeze_route(session,settings,project_id,shot_id,slot,allow_cloud_costs=Fals
         if index and item['is_cloud'] and not (config.allow_fallback and config.allow_paid_fallback and allow_paid_fallback):
             rejections.append({'service_id':item['service_id'],'reasons':['Paid fallback requires route AND invocation authorization']});continue
         selected=choice;break
-    return {'slot':slot,'profile':profile.model_dump(),'configured':profile.revision>0 or profile.inherited_from not in (None,'legacy_module_default'),
+    route = {'slot':slot,'profile':profile.model_dump(),'configured':explicit,
         'choices':choices,'selected':selected,'rejections':rejections,'allow_cloud_costs':allow_cloud_costs,'allow_paid_fallback':allow_paid_fallback}
+    if target:
+        route['quality_target'] = {**target, 'selection': 'auto' if config.mode == 'auto' else 'manual'}
+    return route
 
 def route_is_explicit(route):
     profile=(route or {}).get('profile',{})

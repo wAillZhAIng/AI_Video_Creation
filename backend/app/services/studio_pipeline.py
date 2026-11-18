@@ -229,12 +229,22 @@ def create_pipeline(session, settings, project_id, options, *, prior_quality=Non
         script = session.scalar(select(m.ScriptRevision).where(m.ScriptRevision.project_id == project_id).order_by(m.ScriptRevision.revision.desc()).limit(1))
     from app.services.task_routing import SLOTS, freeze_route
     def freeze(shot_id=None):
-        return {slot: freeze_route(session, settings, project_id, shot_id, slot,
-                    raw['allow_cloud_costs'], raw['allow_paid_fallback']) for slot in SLOTS}
+        config = quality_by_shot.get(shot_id, {})
+        routes = {}
+        for slot in SLOTS:
+            target = {'quality': config} if slot == 'video_upscale' and config.get('processing') == 'ai_super_resolution' else {}
+            routes[slot] = freeze_route(session, settings, project_id, shot_id, slot,
+                raw['allow_cloud_costs'], raw['allow_paid_fallback'], **target)
+        return routes
     from app.services.studio_audio_policy import get_audio_policy
     raw['dialogue_audio_policy']=raw.get('dialogue_audio_policy') or get_audio_policy(session,project_id)
     routes = freeze()
     routes_by_shot = {shot.id: freeze(shot.id) for shot in shots}
+    from app.services.video_quality import _route_for_quality
+    for shot_id, config in quality_by_shot.items():
+        route = routes_by_shot[shot_id]['video_upscale']
+        if config['processing'] == 'ai_super_resolution' and _explicit_route(route):
+            _route_for_quality(session, route, QualitySettings.model_validate(config))
     snapshots, errors = _capture_services(session, project_id)
     context_by_shot = {}
     if not settings.h3_demo_mode:
@@ -719,7 +729,14 @@ def _quality(session,settings,run,entry):
     item=session.get(m.QualityRender,entry['child_id']) if entry.get('child_id') else None
     if not item:
         route=_route(run,'video_upscale',entry['target_id'])
-        item=create_render(session,settings,raw['video_id'],run.snapshot_json['options']['quality_by_shot'][entry['target_id']],
+        quality=run.snapshot_json['options']['quality_by_shot'][entry['target_id']]
+        if route and quality.get('processing')=='lanczos':
+            from app.services.super_resolution import MODELS as REALESRGAN_MODELS
+            choices=[route['selected']] if route.get('selected') else route.get('choices',[])
+            services=[choice.get('service_snapshot',{}) for choice in choices]
+            if services and all(item.get('model_id') in REALESRGAN_MODELS and item.get('provider')=='comfyui' for item in services):
+                route=None
+        item=create_render(session,settings,raw['video_id'],quality,
                            route_snapshot=route if _explicit_route(route) else None)
         entry.update(child_id=item.id,status='running',attempts=entry['attempts']+1,source_video_id=raw['video_id'],error=None)
     elif item.status=='generated':

@@ -316,6 +316,8 @@ def _probe_failure(error):
 
 
 async def probe_service(service, settings):
+    from app.services import super_resolution
+
     started = time.perf_counter()
     snapshot = service_snapshot(service)
     secret = reveal(service.encrypted_secret)
@@ -331,6 +333,12 @@ async def probe_service(service, settings):
                           notice='本地识别模型已就绪。设为默认后，视频生剧本会自动识别音轨语言。',
                           capabilities={'speech_recognition': {'state':'detected', 'model_id':health['model_id'],
                                                               'source':'离线模型的实际健康回执'}})
+        elif service.module == 'video_upscale' and super_resolution.matches_service(service.provider, service.default_model, service.base_url):
+            runtime = await asyncio.to_thread(super_resolution.status, settings, service.default_model)
+            result.update(status='connected' if runtime['state'] == 'verified' else 'unavailable',
+                capabilities={'video_upscale': {'state': runtime['state'], 'model_id': runtime['model'],
+                    'source': 'Verified local Real-ESRGAN render',
+                    'verified_resolutions': runtime['verified_resolutions'], 'verified_aspect_ratios': runtime['verified_aspect_ratios']}})
         elif service.provider=='local_runtime':
             from app.services.runtime_registry import manifest_status
             runtime=await asyncio.to_thread(manifest_status, service.settings_json.get('runtime_family', ''), settings)

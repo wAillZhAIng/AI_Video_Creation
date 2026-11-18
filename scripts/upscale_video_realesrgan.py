@@ -20,8 +20,10 @@ import uuid
 from fractions import Fraction
 
 
-METHOD = 'RealESRGAN_x4plus framewise'
-OFFICIAL_WEIGHT_SHA256 = '4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1'
+OFFICIAL_MODELS = {
+    '4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1': ('RealESRGAN_x4plus', 'ESRGAN'),
+    '8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292': ('realesr-general-x4v3', 'Compact'),
+}
 WINDOW_FLAGS = 0x08000000 if os.name == 'nt' else 0
 
 
@@ -111,7 +113,7 @@ def validate_cadence(input_path, ffprobe, spec, timeout=600):
         stop_process(process)
 
 
-def load_model(path, device, precision, threads):
+def load_model(path, device, precision, threads, architecture):
     if device == 'cpu':
         # A CPU interface test must not initialize a CUDA context while H3 runs.
         os.environ['CUDA_VISIBLE_DEVICES'] = ''
@@ -130,8 +132,9 @@ def load_model(path, device, precision, threads):
     if not state or any(not isinstance(value, torch.Tensor) for value in state.values()):
         raise ValueError('Expected a plain tensor state dictionary; executable model objects are rejected')
     descriptor = ModelLoader(device='cpu').load_from_state_dict(state).eval()
-    if not isinstance(descriptor, ImageModelDescriptor) or descriptor.architecture.id != 'ESRGAN' or descriptor.scale != 4 or descriptor.input_channels != 3 or descriptor.output_channels != 3:
-        raise ValueError('Expected the 3-channel ESRGAN x4 architecture')
+    if (not isinstance(descriptor, ImageModelDescriptor) or descriptor.architecture.id != architecture
+            or descriptor.scale != 4 or descriptor.input_channels != 3 or descriptor.output_channels != 3):
+        raise ValueError(f'Expected the 3-channel {architecture} x4 architecture')
     if precision == 'fp16' and not descriptor.supports_half:
         raise ValueError('This descriptor does not support half precision')
     dtype = torch.float16 if precision == 'fp16' else torch.float32
@@ -262,7 +265,7 @@ def parser():
 def run(args):
     started = time.monotonic()
     source, output, model, receipt_path = [Path(getattr(args, k)).resolve() for k in ('input', 'output', 'model', 'receipt')]
-    result = {'status': 'RUNNING', 'method': METHOD, 'temporal_model': False, 'source_path': str(source),
+    result = {'status': 'RUNNING', 'method': None, 'temporal_model': False, 'source_path': str(source),
         'output_path': str(output), 'model_path': str(model), 'frames_processed': 0, 'source_frames': None,
         'scale': 4, 'tile': {'requested': args.tile, 'actual_minimum': args.tile, 'context_pad': args.tile_pad},
         'requested_width': args.width, 'requested_height': args.height, 'device': args.device,
@@ -288,17 +291,20 @@ def run(args):
         if args.timeout < 5: raise ValueError('Timeout must be at least5 seconds')
         if not 0 <= args.crf <= 51: raise ValueError('CRF must be0..51')
         result['source_sha256'], result['model_sha256'] = sha256(source), sha256(model)
-        if result['model_sha256'] != OFFICIAL_WEIGHT_SHA256:
-            raise ValueError('This helper only supports the audited official RealESRGAN_x4plus v0.1.0 weights')
+        model_profile = OFFICIAL_MODELS.get(result['model_sha256'])
+        if model_profile is None:
+            raise ValueError('This helper only supports the audited official RealESRGAN_x4plus and realesr-general-x4v3 weights')
         if args.expected_model_sha256 and args.expected_model_sha256.lower() != result['model_sha256']:
             raise ValueError('Model SHA256 does not match the selected verified weight')
+        model_name, architecture = model_profile
+        result.update(model_name=model_name, method=f'{model_name} framewise')
         input_probe = probe(source, args.ffprobe, args.timeout)
         spec = source_spec(input_probe, args.width, args.height, args.fps)
         result.update(source_frames=spec['frames'], fps=spec['fps'], source_width=spec['width'], source_height=spec['height'],
             source_probe=input_probe, native_model_width=spec['width'] * 4, native_model_height=spec['height'] * 4,
             post_model_resize='lanczos' if (args.width, args.height) != (spec['width'] * 4, spec['height'] * 4) else 'none',
             cadence=validate_cadence(source, args.ffprobe, spec, args.timeout))
-        descriptor, torch, dtype, runtime = load_model(model, args.device, args.precision, args.threads)
+        descriptor, torch, dtype, runtime = load_model(model, args.device, args.precision, args.threads, architecture)
         result.update(runtime_versions=runtime, model_architecture=descriptor.architecture.id, model_tags=descriptor.tags,
             model_parameters=sum(p.numel() for p in descriptor.model.parameters()))
         import numpy as np

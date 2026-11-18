@@ -54,7 +54,21 @@ def test_super_resolution(payload:QualityRenderInput,request:Request,session:Ses
 
 @router.post('/renders',response_model=QualityRenderDTO,status_code=202)
 def render(payload:QualityRenderInput,request:Request,session:Session=Depends(get_db)):
-    item=create_render(session,request.app.state.settings,payload.video_id,payload.settings);session.commit();return render_dto(item)
+    settings = request.app.state.settings
+    route = None
+    if payload.settings.processing == 'ai_super_resolution':
+        from app.services.task_routing import freeze_route, route_is_explicit
+
+        video = session.get(m.VideoRevision, payload.video_id)
+        if not video:
+            raise AppError(404, 'video_not_found', '源视频不存在')
+        resolved = freeze_route(session, settings, video.project_id, video.shot_id, 'video_upscale',
+                                quality=payload.settings.model_dump())
+        if route_is_explicit(resolved):
+            route = resolved
+    item = create_render(session, settings, payload.video_id, payload.settings, route_snapshot=route)
+    session.commit()
+    return render_dto(item)
 
 
 @router.post('/seedvr2/load-test',response_model=QualityRenderDTO,status_code=202)
