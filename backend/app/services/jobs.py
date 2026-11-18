@@ -29,8 +29,8 @@ _SOURCE_GATE_ERROR = re.compile(
     r"requires actual source=written without fallback; evidence: ([^\r\n]+)"
 )
 _REFERENCE_GATE_ERROR = 'Declared reference projection BLOCKED before H3 loading: '
-_REFERENCE_GATE_MESSAGE = ('本镜 Context-IR 参考素材绑定未通过，视频尚未开始生成。'
-                           '请核对已选商品或人物素材，在镜头动作中明确引用对应的主体标签，再重试此镜。')
+_REFERENCE_GATE_MESSAGE = ('本镜模型生成的 Context-IR 参考绑定未通过校验，视频尚未开始生成。'
+                           '原参考素材和本次输入已保留，可重试此镜。')
 _COMPILER_SCOPE = re.compile(r'([0-9]{8}-[0-9]{6}-[0-9]{6}Z)-[0-9a-f]{8}')
 _REVISION_RULE_HELP = {
     'revision_target_scale_conflict': '模型正文仍保留与本次要求冲突的商品尺寸',

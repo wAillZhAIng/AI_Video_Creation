@@ -109,3 +109,31 @@ def test_unknown_custom_rule_text_is_not_reflected_as_trusted_diagnostic(native_
     message = _h3_source_gate_message(*args, read_local_receipt=True)
     assert '本镜 Context-IR 编译未通过' in message
     assert 'arbitrary_private_secret' not in message and '校验项' not in message
+
+
+@pytest.mark.parametrize('read_local_receipt', [True, False])
+def test_reference_binding_failure_explains_model_contract_without_manual_subject_tags(
+        native_failure, read_local_receipt):
+    args, failure, _ = native_failure
+    failure['exception_message'] = (
+        'Declared reference projection BLOCKED before H3 loading: LocalProfileBlocked: '
+        'Reference binding BLOCKED; evidence: C:\\private\\compiler-001')
+    args[0]['error'] = ('Node 4 (VideoFactoryLocalH3IRCompile): LocalProfileBlocked: '
+                        + failure['exception_message'])
+
+    message = _h3_source_gate_message(*args, read_local_receipt=read_local_receipt)
+
+    assert '模型生成的 Context-IR 参考绑定未通过校验' in message
+    assert '视频尚未开始生成' in message
+    assert '原参考素材和本次输入已保留' in message and '可重试此镜' in message
+    assert '主体标签' not in message and '核对已选商品' not in message
+    assert 'private' not in message and 'compiler-001' not in message
+
+
+def test_product_identity_conflict_is_not_relabelled_as_a_model_binding_failure(native_failure):
+    args, failure, _ = native_failure
+    failure['exception_message'] = '商品参考身份不一致或无法确定：<Picture 2> Pink plush dumpling.'
+    args[0]['error'] = ('Node 4 (VideoFactoryLocalH3IRCompile): LocalProfileBlocked: '
+                        + failure['exception_message'])
+
+    assert _h3_source_gate_message(*args, read_local_receipt=False) is None

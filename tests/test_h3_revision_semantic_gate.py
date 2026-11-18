@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 import h3ir.compile as compiler
+import h3ir.prose as prose
 from h3ir.models import (AssetKind, Brief, Finding, IRDocument, ManifestEntry, Mode,
                          Plan, Role, SubjectPlan, Target)
 from h3ir.validate import Context
@@ -124,6 +125,15 @@ class NativeRevisionSemanticGateTests(unittest.TestCase):
             replacement = patch.object(compiler, name, native)
             replacement.start()
             self.addCleanup(replacement.stop)
+        fix = patch.object(prose, 'fix_with_findings', inspect.unwrap(prose.fix_with_findings))
+        fix.start()
+        self.addCleanup(fix.stop)
+        # These older fixtures deliberately omit manifest/native binding facts;
+        # exercise the semantic hook independently. Complete binding fixtures
+        # and the actual native correction loop live in the companion suite.
+        binding = patch.object(profile, '_native_reference_verification', return_value=None)
+        binding.start()
+        self.addCleanup(binding.stop)
         token = profile._ACTIVE.set(None)
         self.addCleanup(profile._ACTIVE.reset, token)
         self.brief = Brief(intent=INSTRUCTION, seconds=124 / 24, shots=1, silent=True)

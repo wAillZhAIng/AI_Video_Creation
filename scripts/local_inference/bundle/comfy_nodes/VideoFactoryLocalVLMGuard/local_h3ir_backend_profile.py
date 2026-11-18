@@ -25,11 +25,12 @@ import ipaddress
 import socket
 import threading
 import time
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 import uuid
 
 VERSION='local-h3ir-qwen4b-v3'
-POLICY_REVISION='revision-framing-20261108-v3'
+POLICY_REVISION='revision-framing-binding-20261117-v5'
 MODEL='Qwen/Qwen3-VL-4B-Instruct'
 MAX_OUTPUT=4096
 CARD_OUTPUT=3072
@@ -45,6 +46,10 @@ STOCK_H3_SHA256='108ceff11e5a5c9a34a57bbc380447cf9941beb673a1bd421abc818de54ccd5
 WRITTEN_CONTEXT_SHA256='15934b25540728207199551947ce7b4a6de80cccf82ee7b96f529956387a0256'
 WRITTEN_VALIDATE_SHA256='b84ea591ee561790dce790dd81c90796cf4a631e1485e24a59d8e84e79c29c79'
 COMPILE_BRIEF_SHA256='c75bdd18e15b9e1a1ac1feb06457f241e24e68ff7f00d8a10113a3bdcbc9dfd8'
+FIX_WITH_FINDINGS_SHA256='0c9ac3ac2c296a507f07b1ea06c4eab12ea777eb8d2719d21bc87ff6205a6e59'
+_REFERENCE_FINDING_RULES=frozenset(('F2-duplicate-definition','F3-required-reference',
+    'F4-conflicting-groups','F5-declared-group-binding','F6-declared-binding-projection',
+    'F7-locked-onscreen-text'))
 
 
 class LocalProfileFailure(RuntimeError):
@@ -392,12 +397,12 @@ def _audit_or_project(doc,brief,scope,folder):
         except Exception as error:
             projection.update(status='BLOCKED',error_type=type(error).__name__,error=str(error));raise
         finally:write_json(folder/'binding-projection.json',projection)
-    final.update(correction_attempts=0,binding_projections=scope['binding_projections'],
+    final.update(correction_attempts=scope['reference_corrections'],binding_projections=scope['binding_projections'],
         creative_text_source='model_written',binding_source='declared_contract_projection' if scope['binding_projections'] else 'model_written',
         visual_facts_added=False)
     write_json(folder/'reference-binding.final.json',final)
     if final['status']!='PASS':
-        raise LocalProfileBlocked('Reference binding BLOCKED before H3 loading; no additional model rewrite was attempted; evidence: '+str(folder))
+        raise LocalProfileBlocked('Reference binding BLOCKED before H3 loading after native written verification; evidence: '+str(folder))
     scope['final_reference_binding']=final
     return result
 
@@ -488,6 +493,71 @@ def _revision_semantic_findings(prompt,scope,*,plan=None,final_folder=None):
     return findings
 
 
+def _native_reference_verification(prompt,brief,plan,contract,proof=None):
+    """Preview the final binding policy without editing the writer's candidate.
+
+    A caller-declared alias merge is legal, so audit its pure projection rather
+    than asking the writer to undo it. This preview consumes no projection
+    budget and does not alter the Plan, prompt, contract, or captured cards.
+    Native validation errors remain owned by the original validator; this
+    record contains only additional declared-reference findings.
+    """
+    if not contract or not (contract.get('groups') or contract.get('required_native')):
+        return None
+    resolved=deepcopy(contract)
+    if resolved.get('identity_validation_required') and any(
+            group['category']=='product' for group in resolved.get('groups',[])):
+        if not proof or proof.get('status')!='PASS':
+            raise LocalProfileBlocked('商品参考身份尚未通过本地实图一致性校验，不能要求模型补写身份绑定。')
+        resolved['verified_product_descriptors_by_native']=deepcopy(
+            proof['approved_product_descriptors_by_native'])
+    candidate=SimpleNamespace(prompt=prompt,plan=plan,findings=[])
+    projected=prompt;checks={};projection_error=None
+    try:
+        if resolved.get('groups'):
+            projected,evidence=project_declared_bindings(candidate,resolved,brief)
+            checks=projection_invariants(projected,evidence)
+            checks['plan_unchanged']=digest(asdict(plan))==evidence['plan_before_sha256']
+            if not all(checks.values()):
+                raise LocalProfileFailure('Native binding preview changed protected model text or Plan')
+        audit=reference_binding(SimpleNamespace(prompt=projected,plan=plan,findings=[]),resolved)
+        errors=[dict(item) for item in audit['errors']]
+        blocked_groups=iter(row for row in audit['group_results'] if row['status']!='PASS')
+        for item in errors:
+            if item['rule']!='F5-declared-group-binding':continue
+            row=next(blocked_groups)
+            if row['subject'] and not row['subject_cited_in_detailed_description']:
+                item['message']+=(' The existing declared target '+row['subject']
+                    +' is already defined from the attached references but is never cited in '
+                    'detailed_description. In that section, name this same target with the exact '
+                    'token '+row['subject']+' in its existing action text. A summary mention is '
+                    'insufficient. Preserve the existing people, shots, camera, action, dialogue '
+                    'and on-screen text. Do not add a subject, visual fact, or motion source.')
+    except LocalProfileBlocked as error:
+        projection_error=str(error)
+        audit=None
+        errors=[{'rule':'F6-declared-binding-projection','message':
+            'The existing written reference definitions cannot satisfy the caller-declared binding: '
+            +str(error)+'. Correct only the reported binding in the six written sections, using '
+            'the attached reference labels and existing verified identity descriptions. Preserve '
+            'people, shots, camera, action, dialogue and on-screen text; do not invent a subject, '
+            'visual fact, or motion source.'}]
+    from h3ir.repair import normalize
+    normalized=normalize(prompt)
+    for text in brief.onscreen_text:
+        if text and '"'+normalize(text)+'"' not in normalized:
+            errors.append({'rule':'F7-locked-onscreen-text','message':
+                'Keep the caller-locked on-screen text verbatim in double quotes: '+repr(text)
+                +'. Restore it in the existing scene without changing its words or the reference binding.'})
+    return {'policy':POLICY_REVISION,'stage':'native_written_verification',
+        'status':'BLOCKED' if errors else 'PASS',
+        'prompt_sha256':hashlib.sha256(prompt.encode('utf-8')).hexdigest(),
+        'findings':[dict(item,severity='ERROR') for item in errors],
+        'binding_only_audit':audit,'projection_invariants':checks,
+        'projection_error':projection_error,'rewrites_creative_text':False,
+        'correction_owner':'pinned upstream compile_brief / fix_with_findings; maximum two rounds'}
+
+
 def _install_revision_validation():
     """Let the real upstream writer repair caller-contract conflicts.
 
@@ -496,14 +566,17 @@ def _install_revision_validation():
     in this scope; no global policy or model is changed outside this wrapper.
     """
     import h3ir.compile as compiler
+    import h3ir.prose as prose
     from h3ir.models import Finding
     with _INSTALL_LOCK:
         original_context=compiler._written_context
         original_validate=compiler.validate
+        original_fix=inspect.unwrap(prose.fix_with_findings)
         if getattr(original_validate,'_factory_revision_validation_version',None)==POLICY_REVISION:return
         if (source_hash(inspect.unwrap(original_context))!=WRITTEN_CONTEXT_SHA256
                 or source_hash(inspect.unwrap(original_validate))!=WRITTEN_VALIDATE_SHA256
-                or source_hash(compiler.compile_brief)!=COMPILE_BRIEF_SHA256):
+                or source_hash(compiler.compile_brief)!=COMPILE_BRIEF_SHA256
+                or source_hash(original_fix)!=FIX_WITH_FINDINGS_SHA256):
             raise LocalProfileFailure('The audited native written verification/correction path changed')
 
         @functools.wraps(original_context)
@@ -514,6 +587,8 @@ def _install_revision_validation():
                 scope.setdefault('written_contexts',[]).append(context)
                 plan=inspect.signature(original_context).bind(*args,**kwargs).arguments.get('plan')
                 scope.setdefault('written_plans',[]).append((context,plan))
+                brief=inspect.signature(original_context).bind(*args,**kwargs).arguments.get('brief')
+                scope.setdefault('written_briefs',[]).append((context,brief))
             return context
 
         @functools.wraps(original_validate)
@@ -523,11 +598,27 @@ def _install_revision_validation():
             if scope is None or not any(context is item for item in scope.get('written_contexts',[])):
                 return findings
             plan=next((plan for item,plan in scope.get('written_plans',[]) if item is context),None)
-            return [*findings,*[Finding(item['rule'],item['severity'],item['message'])
-                for item in _revision_semantic_findings(prompt,scope,plan=plan)]]
+            brief=next((brief for item,brief in scope.get('written_briefs',[]) if item is context),None)
+            additional=_revision_semantic_findings(prompt,scope,plan=plan)
+            reference=_native_reference_verification(prompt,brief,plan,
+                scope.get('reference_contract'),scope.get('product_identity_verification'))
+            if reference is not None:
+                write_json(scope['directory']/f"reference-written-verify-{scope['revision_validation_passes']:03d}.json",reference)
+                additional=[*additional,*reference['findings']]
+            return [*findings,*[Finding(item['rule'],item['severity'],item['message']) for item in additional]]
+
+        @functools.wraps(original_fix)
+        def fix_written(backend,written,findings,*args,**kwargs):
+            scope=_ACTIVE.get()
+            if scope is not None and any(f.rule in _REFERENCE_FINDING_RULES for f in findings):
+                # Count a real native correction invocation, never a validator
+                # call or the deterministic final projection.
+                scope['reference_corrections']=scope.get('reference_corrections',0)+1
+            return original_fix(backend,written,findings,*args,**kwargs)
         validate_written._factory_revision_validation_version=POLICY_REVISION
         compiler._written_context=written_context
         compiler.validate=validate_written
+        prose.fix_with_findings=fix_written
 
 
 def _install_document_gate(namespace):
@@ -993,7 +1084,7 @@ def profile_scope(receipt_root,setup,seed=20261104,backend_class=None,compiler_f
              'source_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
              'scope':'explicit project wrapper Main only; all user/media inputs preserved'}
     receipt['compiler_source_gate']=compiler_contract
-    receipt.update(card_cache_policy='reuse unchanged vendor model/analyzer/schema cache keys and existing STATE_DIR',max_reference_corrections=0,
+    receipt.update(card_cache_policy='reuse unchanged vendor model/analyzer/schema cache keys and existing STATE_DIR',max_reference_corrections=2,
                    max_binding_projections=1,
                    reference_contract_required=reference_contract is not None,
                    requested_image_sizing=sizing)
