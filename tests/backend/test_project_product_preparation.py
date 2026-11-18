@@ -109,6 +109,45 @@ def test_upload_select_persist_exact_chinese_name_suggestions_and_clear_scoped_s
     assert all(media_path(settings, image).is_file() for image in product['images'])
 
 
+@pytest.mark.parametrize(('keyframe','video'), [(True,False), (False,True), (False,False)])
+def test_each_shot_product_reference_stage_can_be_left_empty(client, settings, keyframe, video):
+    from app.services.context_production_inputs import collect_context_inputs
+
+    product = product_with_images(client)
+    project_id, shots = project_with_shots(client)
+    ids = [image['id'] for image in product['images']]
+    assert save(client, project_id, selection(client, project_id, product['id']), ids, shots[:2]).status_code == 200
+    with client.app.state.session_factory() as session:
+        session.add(m.StudioRun(project_id=project_id, status='exceptions',
+            snapshot_json={'shot_ids':shots[:2]}, nodes_json=[]))
+        session.commit()
+    url = f'/api/product-library/projects/{project_id}/shots/{shots[0]}/references'
+    initial = client.get(url).json()['products'][0]
+    payload = {'products':[{
+        'product_id':product['id'], 'expected_revision':initial['revision'],
+        'keyframe_image_ids':ids if keyframe else [], 'video_image_ids':ids if video else [],
+    }]}
+    updated = client.put(url, json=payload)
+    assert updated.status_code == 200, updated.text
+    assert client.get(url).json() == updated.json()
+    assert client.put(url, json=payload).status_code == 409
+    with client.app.state.session_factory() as session:
+        shot = session.get(m.StoryboardShot, shots[0])
+        for stage,enabled in (('keyframe',keyframe), ('video',video)):
+            refs = product_library.shot_references(session, settings, shot, stage=stage)
+            assert {reference['id'] for reference in refs} == (set(ids) if enabled else set())
+            sibling = session.get(m.StoryboardShot, shots[1])
+            assert {reference['id'] for reference in product_library.shot_references(session,settings,sibling,stage=stage)} == set(ids)
+        context = collect_context_inputs(session, settings, shot)
+        assert {ref['asset_id'] for ref in context['references']} == (set(ids) if video else set())
+        assert ('\n商品：' in context['prompt']) is video
+        run = session.scalar(select(m.StudioRun).where(m.StudioRun.project_id == project_id))
+        assert run.status == 'paused' and run.snapshot_json['product_references_changed'] is True
+    overview = selection(client, project_id, product['id'])
+    assert set(overview['shot_ids']) == (set(shots[:2]) if keyframe or video else {shots[1]})
+    assert all(media_path(settings, image).is_file() for image in product['images'])
+
+
 @pytest.mark.parametrize('bad_selection', ['foreign-image', 'foreign-shot', 'duplicate-image', 'duplicate-shot'])
 def test_rejects_cross_product_project_and_duplicate_choices_atomically(client, bad_selection):
     product = product_with_images(client)

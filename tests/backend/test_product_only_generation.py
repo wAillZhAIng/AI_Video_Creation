@@ -181,16 +181,29 @@ def test_product_state_or_selected_image_changes_invalidate_visual_inputs(produc
     assert any(f['code'] == 'keyframe_stale' for f in shot_preflight(p.session, p.settings, p.shot)['findings'])
     p.binding.image_ids_json = []
     p.session.flush()
-    with pytest.raises(AppError, match='有效的产品'):
-        generation_inputs(p.session, p.shot, p.settings)
-    assert any(f['code'] == 'product_reference_missing' for f in shot_preflight(p.session, p.settings, p.shot, False)['findings'])
+    assert 'keyframe_stale' in {f['code'] for f in shot_preflight(p.session, p.settings, p.shot, False)['findings']}
+
+
+def test_legacy_reference_video_accepts_approved_frame_with_product_images_cleared(product_shot):
+    p = product_shot
+    p.binding.state_json = {**p.binding.state_json, 'keyframe_image_ids':[]}
+    p.binding.image_ids_json = []
+    p.session.flush()
+    p.keyframe.snapshot_json = {'inputs_hash':fingerprint(visual_inputs(p.session,p.shot))}
+    p.session.flush()
+    version, references, prompt, _, _, snapshot = routes._legacy_generation_inputs(
+        p.session, p.settings, p.shot, GenerationRequest(), None, None)
+    assert version is None
+    assert [ref['role'] for ref in references] == ['composition']
+    assert references[0]['asset_id'] == p.keyframe.id
+    assert 'product_appearance_review' not in snapshot
+    assert 'the approved visual composition' in prompt
 
 
 def test_missing_product_ref_and_missing_participants_remain_blocked(product_shot):
     p = product_shot
     p.session.delete(p.binding)
     p.session.flush()
-    assert not uses_structured_screenplay(p.session, p.shot)
     with pytest.raises(AppError) as error:
         generation_inputs(p.session, p.shot, p.settings)
     assert error.value.code == 'participants_required'

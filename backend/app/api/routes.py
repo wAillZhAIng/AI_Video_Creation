@@ -897,8 +897,6 @@ def _legacy_generation_inputs(session, settings, shot, payload, instruction, fro
     version = structured_inputs[0] if structured_inputs else required(session, CharacterVersion, shot.character_asset_version_id, "角色版本")
     if version is not None and version.approval_state != "approved":
         raise AppError(409, "character_version_not_approved", "绑定的角色版本尚未批准")
-    if version is None and (not structured_inputs or not any(ref.get('role')=='product' for ref in structured_inputs[1])):
-        raise AppError(409,'product_reference_required','无人物镜头必须绑定真实可读的产品参考图')
     assets = session.scalars(select(CharacterAsset).where(CharacterAsset.character_version_id == version.id, CharacterAsset.status == "approved").order_by(CharacterAsset.is_primary_reference.desc(), CharacterAsset.created_at)).all() if version else []
     if not settings.h3_demo_mode and not structured:
         assets = [asset for asset in assets if asset.id in shot.reference_asset_ids_json]
@@ -909,7 +907,7 @@ def _legacy_generation_inputs(session, settings, shot, payload, instruction, fro
         absolute = safe_media_path(settings.media_root, asset.relative_path, must_exist=True)
         references.append({"asset_id": asset.id, "asset_type": asset.asset_type, "relative_path": asset.relative_path, "absolute_path": str(absolute), "is_primary_reference": asset.is_primary_reference, "sha256": asset.sha256})
     if not settings.h3_demo_mode and not references:
-        raise AppError(409, "approved_reference_required", "真实 H3 任务至少需要一个已批准且可读的人物或已绑定产品参考素材")
+        raise AppError(409, "approved_reference_required", "当前参考生视频工作流需要至少一张可用的画面参考，可绑定场景图或关键画面")
     prompt, negative = (structured_inputs[2], structured_inputs[3].get('model_lab_negative_prompt','')) if structured_inputs else build_prompt(shot, version, instruction)
     from app.services.video_revisions import editable_generation_prompt, cloud_revision_targets
     source_snapshot = structured_inputs[3] if structured_inputs else None

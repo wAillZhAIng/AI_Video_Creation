@@ -14,6 +14,7 @@ export function ProjectProductPreparation({projectId,shots,disabled,onStateChang
   const [name,setName]=useState(''),[files,setFiles]=useState<File[]>([]),[fileKey,setFileKey]=useState(0),[uploadTarget,setUploadTarget]=useState('');
   const [busy,setBusy]=useState(''),[loading,setLoading]=useState(false),[error,setError]=useState(''),[notice,setNotice]=useState(''),[reload,setReload]=useState(0);
   const [detailState,setDetailState]=useState<State>({busy:false,dirty:false,overBudget:false});
+  const [detailReload,setDetailReload]=useState(0);
   const onDetailState=useCallback((state:State)=>setDetailState(state),[]);
   const callbacks=useRef({onStateChange,onChanged});callbacks.current={onStateChange,onChanged};
   const onDetailChanged=useCallback(async()=>{setReload(n=>n+1);await callbacks.current.onChanged?.();},[]);
@@ -48,7 +49,7 @@ export function ProjectProductPreparation({projectId,shots,disabled,onStateChang
     busyRef.current=true;setBusy('save');setError('');setNotice('');
     try{
       const value=await request<Selection>(`/api/product-library/projects/${encodeURIComponent(projectId)}/references`,{method:'PUT',body:JSON.stringify({product_id:productId,expected_token:selection.expected_token,image_ids:shotIds.length?imageIds:[],shot_ids:shotIds})});
-      if(!active.current)return;setSelection(value);setImageIds(value.image_ids);setShotIds(value.shot_ids);setReload(n=>n+1);
+      if(!active.current)return;setSelection(value);setImageIds(value.image_ids);setShotIds(value.shot_ids);setReload(n=>n+1);setDetailReload(n=>n+1);
       setNotice(`已保存：${shotIds.length} 个分镜使用此产品原图。后续关键画面和视频自动使用所选参考；旧视频保留。`);await callbacks.current.onChanged?.();
     }catch(e){if(active.current)setError(String(e));}finally{busyRef.current=false;if(active.current)setBusy('');}
   }
@@ -67,7 +68,7 @@ export function ProjectProductPreparation({projectId,shots,disabled,onStateChang
       <fieldset className="asset-picker" disabled={blocked}><legend>从产品图库选择并绑定分镜</legend>
         <FormField label="固定产品／道具"><select value={productId} onChange={e=>changeProduct(e.target.value)}><option value="">请选择产品／道具</option>{library?.items.map(item=><option key={item.id} value={item.id}>{item.name}{item.state!=='active'?'（不可新用，可解除引用）':''}</option>)}</select></FormField>
         <p className="form-hint">可以依次配置多个产品。切换产品只切换编辑对象；已保存的其他产品引用继续保留。</p>
-        <button type="button" className="button button-ghost" onClick={()=>{if(dirty&&!window.confirm('放弃尚未保存的产品参考草稿并重新读取？'))return;setFiles([]);setName('');setFileKey(n=>n+1);setReload(n=>n+1);}}>刷新图库与项目引用</button>
+        <button type="button" className="button button-ghost" onClick={()=>{if(dirty&&!window.confirm('放弃尚未保存的产品参考草稿并重新读取？'))return;setFiles([]);setName('');setFileKey(n=>n+1);setReload(n=>n+1);setDetailReload(n=>n+1);}}>刷新图库与项目引用</button>
         {loading?<p role="status">读取产品原图与项目分镜…</p>:null}
         {selection?<><p>本次制作选择 {imageIds.length}/4 张；同一包装版本请保持一致。人物与场景也占参考图预算，超出模型能力会明确提示。</p>
           <div className="asset-picker-images">{selection.product.images.map((image,index)=><label key={image.id}><input type="checkbox" aria-label={`${selection.product.name}参考图 ${index+1}`} checked={imageIds.includes(image.id)} disabled={!imageIds.includes(image.id)&&imageIds.length>=4} onChange={e=>setImageIds(ids=>e.target.checked?[...ids,image.id]:ids.filter(id=>id!==image.id))}/><img src={api.mediaUrl(image.thumbnail_url||image.media_url)} alt={`${selection.product.name}原图 ${index+1}`}/><span>{image.filename}</span></label>)}</div>
@@ -78,7 +79,7 @@ export function ProjectProductPreparation({projectId,shots,disabled,onStateChang
           <button type="button" className="button button-primary" disabled={shotIds.length>0&&(!imageIds.length||imageIds.length>4)||(!dirty&&selection.bound)} onClick={()=>void save()}>{busy==='save'?'正在保存项目引用…':'保存产品／道具项目引用'}</button>
         </>:null}
       </fieldset>
-      <ProjectProductReferences key={`${projectId}:${reload}`} projectId={projectId} shots={shots} disabled={disabled||Boolean(busy)||dirty} onStateChange={onDetailState} onChanged={onDetailChanged}/>
+      <ProjectProductReferences key={`${projectId}:${detailReload}`} projectId={projectId} shots={shots} disabled={disabled||Boolean(busy)||dirty} onStateChange={onDetailState} onChanged={onDetailChanged}/>
     </>:null}
     {error?<p role="alert" className="inline-notice warning">{error}</p>:null}{notice?<p role="status" className="inline-notice">{notice}</p>:null}
   </details>;

@@ -139,17 +139,13 @@ def shot_preflight(session,settings,shot,require_visual=True,*,context_inputs=Fa
             from app.core.errors import AppError
             if isinstance(exc,AppError):findings.append(issue(exc.code,'blocker',exc.message,shot.id,repair='identity'))
             else:raise
-    from app.services.product_library import shot_references,shot_product_snapshot
-    products=shot_product_snapshot(session,shot);product_references=[]
-    if products:
-        try:
-            product_references=shot_references(session,settings,shot)
-            if not product_references and not context_inputs:findings.append(issue('product_reference_missing','blocker','产品镜头缺少有效的已绑定参考图片',shot.id))
-        except Exception as exc:
-            from app.core.errors import AppError
-            if isinstance(exc,AppError):findings.append(issue(exc.code,'blocker',exc.message,shot.id,repair='product'))
-            else:raise
-    if not context_inputs and not bundle['participants'] and not products:findings.append(issue('cast_not_ready','blocker','镜头尚无可确认人物或产品绑定',shot.id))
+    from app.core.errors import AppError
+    from app.services.product_library import shot_references
+    product_references=[]
+    try:
+        product_references=shot_references(session,settings,shot)
+    except AppError as exc:
+        findings.append(issue(exc.code,'blocker',exc.message,shot.id,repair='product'))
     for e in entities:
         if e is None:findings.append(issue('design_missing','blocker','当前绑定的制作设定已不存在',shot.id))
         elif e.project_id!=shot.project_id:findings.append(issue('design_project_mismatch','blocker','制作设定属于其他项目',shot.id))
@@ -193,6 +189,11 @@ def shot_preflight(session,settings,shot,require_visual=True,*,context_inputs=Fa
             if hashlib.sha256(path.read_bytes()).hexdigest()!=visual.sha256:raise ValueError()
         except Exception:findings.append(issue('visual_file_invalid','blocker','视觉参考文件缺失或哈希变化',shot.id));continue
         visuals.append(visual)
+    if not context_inputs and not bundle['participants']:
+        if not visuals and not product_references:
+            findings.append(issue('cast_not_ready','blocker','参考生视频需要至少一张可用的画面参考，可绑定场景图或关键画面',shot.id))
+        elif visuals:
+            findings=[finding for finding in findings if finding['code']!='cast_unknown']
     if enabled and require_visual and not any(v.kind=='keyframe' for v in visuals):findings.append(issue('keyframe_review_required','review','先生成并审核本镜关键画面，再提交电影镜头',shot.id))
     policy=prod.get('requested_controls',{}).get('identity_reference_policy','full_reference')
     if policy not in {'full_reference','independent_faces_scene'}:findings.append(issue('identity_reference_policy_unsupported','blocker','未实现此身份参考路由',shot.id))
@@ -292,8 +293,8 @@ def compile_context(session,shot,settings):
     from app.services.screenplay import shot_bundle
     from app.services.product_library import shot_product_snapshot
     participants=shot_bundle(session,shot.id)['participants']
-    product_only=not participants and bool(shot_product_snapshot(session,shot))
-    rules_text='\n'.join(rules['visual_language'][key] for key in ('scene','camera','audio')) if product_only else '\n'.join(rules['visual_language'].values())
+    product_only=not participants and any(product['images'] for product in shot_product_snapshot(session,shot))
+    rules_text='\n'.join(rules['visual_language'][key] for key in ('scene','camera','audio')) if not participants else '\n'.join(rules['visual_language'].values())
     if product_only:rules_text+='\nPreserve each referenced product shape, proportions, color, packaging and visible structure. Exact printed text and logo reproduction require visual review or post-production overlays. Do not invent performers or unsupported accessories.'
     names={p['name']:i for i,p in enumerate(participants,1)}
     return {'contact_directions':physical_directions(visual_inputs(session,shot),names),'versions':rules['versions'],'source_versions':script.parsed_json['versions'],'rules_source_sha256':rules['source_sha256'],'rules_text':rules_text,'production':production,'entities':[{'id':e.id,'logical_id':e.logical_id,'kind':e.kind,'version':e.version,'status':e.status,'spec':e.spec_json} for e in entities if e],'preflight':shot_preflight(session,settings,shot)}

@@ -213,9 +213,10 @@ def bind_created_project(session,job,result):
 def shot_references(session,settings,shot,*,stage='video',include_image_notes=False):
     result=[]
     for binding in session.scalars(select(ShotProductBinding).where(ShotProductBinding.shot_id==shot.id).order_by(ShotProductBinding.product_id)):
+        chosen=set(binding.state_json.get('keyframe_image_ids',binding.image_ids_json) if stage=='keyframe' else binding.image_ids_json)
+        if not chosen:continue
         project=session.scalar(select(ProjectProductBinding).where(ProjectProductBinding.project_id==shot.project_id,ProjectProductBinding.product_id==binding.product_id))
         if not project:raise AppError(409,'product_binding_missing','镜头产品缺少项目资料')
-        chosen=set(binding.state_json.get('keyframe_image_ids',binding.image_ids_json) if stage=='keyframe' else binding.image_ids_json)
         if chosen-{item['id'] for item in project.snapshot_json.get('images',[])}:raise AppError(409,'product_frozen_image_missing','镜头所选产品图不在冻结项目资料中')
         for item in project.snapshot_json.get('images',[]):
             if item['id'] not in chosen:continue
@@ -248,8 +249,9 @@ def reference_selection(session,project_id,shot_id):
     return {'project_id':project_id,'shot_id':shot_id,'products':result,'limits':{'keyframe_total_max':4,'video_total_max':9},'note':'总预算还包括人物与场景图，实际提交前再次校验；不自动截断图片'}
 
 def save_reference_selection(session,project_id,shot_id,payload):
+    session.execute(update(m.Project).where(m.Project.id==project_id).values(name=m.Project.name).execution_options(synchronize_session=False))
     current=reference_selection(session,project_id,shot_id)
-    active={'queued','submitting','submitted','running','cancelling'}
+    active={'queued','submitting','submitted','running','postprocessing','cancelling','reconciling','unknown'}
     for model in (m.GenerationJob,m.ProductionVisual,m.MediaProcessTask):
         if session.scalar(select(model.id).where(model.project_id==project_id,model.status.in_(active)).limit(1)):raise AppError(409,'product_binding_busy','项目仍有制作任务，请等待结束后修改参考')
     from app.services.studio_pipeline import latest_run,RUN_TERMINAL
@@ -264,6 +266,9 @@ def save_reference_selection(session,project_id,shot_id,payload):
         row=session.scalar(select(ShotProductBinding).where(ShotProductBinding.shot_id==shot_id,ShotProductBinding.product_id==value.product_id))
         changed=session.execute(update(ShotProductBinding).where(ShotProductBinding.id==row.id,ShotProductBinding.revision==value.expected_revision).values(image_ids_json=value.video_image_ids,state_json={**row.state_json,'keyframe_image_ids':value.keyframe_image_ids,'reference_selection_confirmed':True},revision=ShotProductBinding.revision+1))
         if changed.rowcount!=1:raise AppError(409,'product_reference_revision','镜头产品参考已被修改，请刷新')
+    if payload.products and run and run.status in {'paused','exceptions'} and shot_id in run.snapshot_json.get('shot_ids',[shot_id]):
+        run.snapshot_json = {**run.snapshot_json, 'product_references_changed': True}
+        run.status = 'paused'
     session.add(m.AuditEvent(object_type='storyboard_shot',object_id=shot_id,action='product_reference_selection_saved',details_json=payload.model_dump()))
     session.commit();return reference_selection(session,project_id,shot_id)
 
@@ -343,7 +348,9 @@ def project_references(session, project_id, product_id):
         'shots':[(row.shot_id,row.revision,row.image_ids_json,row.state_json) for row in rows]},
         ensure_ascii=False,sort_keys=True).encode('utf-8'))
     current_rows=[row for row in rows if row.shot_id in editable_ids]
-    selected=list(dict.fromkeys(image_id for row in current_rows for image_id in row.image_ids_json))
+    choices={row.shot_id: [*row.image_ids_json, *row.state_json.get('keyframe_image_ids',row.image_ids_json)]
+             for row in current_rows}
+    selected=list(dict.fromkeys(image_id for image_ids in choices.values() for image_id in image_ids))
     result=[]
     name=product.name.strip().casefold()
     for shot in editable_shots:
@@ -359,7 +366,7 @@ def project_references(session, project_id, product_id):
         available[image['id']]=image
     current['images']=list(available.values())
     return {'project_id':project_id,'product':current,'expected_token':token,
-        'image_ids':selected,'shot_ids':[row.shot_id for row in current_rows],
+        'image_ids':selected,'shot_ids':[shot_id for shot_id,image_ids in choices.items() if image_ids],
         'shots':result,'bound':binding is not None,
         'note':'仅所选分镜使用产品原图；更改后旧视频保留，后续生成会重新检查输入。'}
 

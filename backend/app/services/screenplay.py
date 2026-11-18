@@ -152,7 +152,11 @@ def uses_structured_screenplay(session,shot):
     participants=list(session.scalars(select(ShotCharacter).where(ShotCharacter.shot_id==shot.id)))
     detail=session.scalar(select(ShotDetail).where(ShotDetail.shot_id==shot.id))
     from app.services.product_library import shot_product_snapshot
-    return bool(shot_product_snapshot(session,shot)) or bool(participants) and (len(participants)>1 or not shot.character_id or bool(detail and detail.source_json.get('structured_edit')) or any(not p.source_json.get('legacy') and not p.source_json.get('migration') for p in participants))
+    if shot_product_snapshot(session,shot):
+        return True
+    if not participants:
+        return bool(not shot.character_id and detail and detail.source_json.get('production',{}).get('visual_ids'))
+    return len(participants)>1 or not shot.character_id or bool(detail and detail.source_json.get('structured_edit')) or any(not p.source_json.get('legacy') and not p.source_json.get('migration') for p in participants)
 
 
 def generation_inputs(session, shot, settings):
@@ -161,8 +165,7 @@ def generation_inputs(session, shot, settings):
     bundle=shot_bundle(session,shot.id)
     from app.services.product_library import shot_references,shot_product_snapshot
     product_references=shot_references(session,settings,shot)
-    if not bundle['participants'] and not product_references:raise AppError(409,'participants_required','分镜尚未添加人物或有效的产品参考')
-    product_only=not bundle['participants']
+    product_only=not bundle['participants'] and bool(product_references)
     from app.services.identity_references import actor_references,reference_manifest,actor_visual_description,english_position,english_action
     from app.services.cinematic_quality import production_context
     _,_,_,production,entities=production_context(session,shot)
@@ -198,6 +201,24 @@ def generation_inputs(session, shot, settings):
         bundle['product_appearance_review']={'status':'needs_review','exact_logo_text_verified':False,
             'limitations':['产品参考图已进入实际输入；外观连续性、包装文字与Logo复现仍需人工审核，必要时后期叠加。']}
     from app.services.cinematic_quality import compile_context
+    if product_only:
+        shot_description = 'A product presentation shot showing the defined products. Do not add people or hands.'
+        photography_direction = 'product photography, practical lighting and physically grounded product movement.'
+        production_heading = 'Product presentation and sound directions:'
+        composition_direction = 'Show the supplied products only, without adding performers. '
+        retention_direction = 'each product retains its own supplied appearance.'
+    elif actors:
+        shot_description = 'A live-action dramatic shot with the defined characters. Reference roles apply to their respective subjects only.'
+        photography_direction = 'photography with natural skin texture matching each referenced character, practical lighting and physically grounded movement.'
+        production_heading = 'Performer actions, positions, wardrobe and voice:'
+        composition_direction = 'Its synthesized faces are not new identities; each performer follows their separate identity Subject reference. '
+        retention_direction = 'each Subject keeps their independently referenced face.'
+    else:
+        shot_description = 'A live-action shot following the written scene and the approved visual composition.'
+        photography_direction = 'photography with realistic materials, practical lighting and physically grounded movement.'
+        production_heading = 'Scene and sound directions:'
+        composition_direction = 'Use its framing and scene content as visual guidance. '
+        retention_direction = 'the written shot defines the visible subjects and action.'
     cinematic=compile_context(session,shot,settings)
     if cinematic:
         bundle['cinematic']=cinematic
@@ -212,10 +233,12 @@ def generation_inputs(session, shot, settings):
             if role=='scene':
                 environment_subject=f'<Subject {len(actors)+1}>'
                 definitions.append(f'{environment_subject} is the unoccupied location in <Picture {len(references)}>, supplying only room geometry, lighting and real materials, never performer identity.')
-                retention.append(f'{environment_subject} (appears in [Shot 1]): fully_preserved - retain the location separately from each referenced '+('product.' if product_only else 'person.'))
+                retention.append(f'{environment_subject} (appears in [Shot 1]): fully_preserved - retain the location and keep its reference distinct from other subjects.')
             else:
-                definitions.append(f'<Picture {len(references)}> is the composition planning reference for [Shot 1]. '+('Show the supplied products only, without adding performers. ' if product_only else 'Its synthesized faces are not new identities; each performer follows their separate identity Subject reference. ')+'This is guidance, not a guaranteed exact first frame.')
-                retention.append(f'<Picture {len(references)}> ([Shot 1] composition): partially_preserved - viewpoint and placement guide the shot while '+('each product retains its own supplied appearance.' if product_only else 'each Subject keeps their independently referenced face.'))
+                definitions.append(f'<Picture {len(references)}> is the composition planning reference for [Shot 1]. {composition_direction}This is guidance, not a guaranteed exact first frame.')
+                retention.append(f'<Picture {len(references)}> ([Shot 1] composition): partially_preserved - viewpoint and placement guide the shot while {retention_direction}')
+    if not bundle['participants'] and not references:
+        raise AppError(409,'participants_required','当前参考生视频需要至少一张可用的画面参考，可绑定场景图或关键画面')
     if len(references)>9:raise AppError(422,'reference_limit','当前H3适配器最多传入9张人物/产品/场景/关键画面参考图，请减少所选数量')
     audio=list(bundle['audio_events'])
     if bundle['scene']:audio=[row(x) for x in session.scalars(select(AudioEvent).where(AudioEvent.scene_id==bundle['scene']['id']))]+audio
@@ -237,13 +260,13 @@ def generation_inputs(session, shot, settings):
         project_context=imported.preview_json.get('project',{}) if imported else {}
     bundle['project_context']=project_context
     prompt='\n'.join(['subject_definitions:',*definitions,'summary:',
-        '[reference generation] '+('A product presentation shot showing the defined products. Do not add people or hands.' if product_only else 'A live-action dramatic shot with the defined characters. Reference roles apply to their respective subjects only.'),
+        '[reference generation] '+shot_description,
         'retention_analysis:',*retention,'detailed_description:',
-        'The target video uses believable live-action '+('product photography, practical lighting and physically grounded product movement.' if product_only else 'photography with natural skin texture matching each referenced character, practical lighting and physically grounded movement.'),
+        'The target video uses believable live-action '+photography_direction,
         'Reviewed screenplay style, synopsis and continuity constraints: '+json.dumps(project_context,ensure_ascii=False),
         '[Shot 1] '+shot.visual_prompt, 'Shot-level action: '+shot.action, 'Environment: '+json.dumps(environment,ensure_ascii=False),
         'Camera: '+shot.camera_move+' '+json.dumps(photography,ensure_ascii=False),
-        'Product presentation and sound directions:' if product_only else 'Performer actions, positions, wardrobe and voice:',*performances,*dialogue,
+        production_heading,*performances,*dialogue,
         'overall_soundscape:', '\n'.join(json.dumps({k:x.get(k) for k in ('kind','description','start_seconds','end_seconds','volume')},ensure_ascii=False) for x in audio if x['kind']!='music' and not x.get('relative_path')) or shot.audio_direction or 'Quiet room tone accompanies the visible actions.',
         'non_diegetic_music:', '\n'.join(x['description'] for x in audio if x['kind']=='music' and not x.get('relative_path')) or 'N/A'])
     if cinematic:

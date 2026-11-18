@@ -15,6 +15,51 @@ export function ProjectProductReferences({projectId,shots,disabled,onStateChange
   const keyframeCount=drafts.reduce((total,item)=>total+item.keyframe_image_ids.length,0),videoCount=drafts.reduce((total,item)=>total+item.video_image_ids.length,0),overBudget=Boolean(data)&&(keyframeCount>data!.limits.keyframe_total_max||videoCount>data!.limits.video_total_max);
   useEffect(()=>{callbacks.current.onStateChange?.({busy:saving,dirty,overBudget});},[saving,dirty,overBudget]);
   function toggle(productId:string,field:'keyframe_image_ids'|'video_image_ids',imageId:string,checked:boolean){setDrafts(previous=>previous.map(product=>product.product_id===productId?{...product,[field]:checked?[...product[field],imageId]:product[field].filter(id=>id!==imageId)}:product));setNotice('');}
-  async function save(){if(!data||disabled||saving||!dirty||overBudget)return;const destination=selectedShot;setSaving(true);setError('');setNotice('');try{const value=await request<ProjectProductReferenceOverview>(`/api/product-library/projects/${encodeURIComponent(projectId)}/shots/${encodeURIComponent(destination)}/references`,{method:'PUT',body:JSON.stringify({products:drafts.map(product=>({product_id:product.product_id,expected_revision:product.revision,video_image_ids:product.video_image_ids,keyframe_image_ids:product.keyframe_image_ids}))})});if(current.current!==destination)return;if(value.project_id!==projectId||value.shot_id!==destination)throw new Error('保存响应不属于当前分镜');setData(value);setDrafts(value.products);setNotice('此分镜的产品参考已保存。关键画面与视频分别使用明确选择的图片，历史任务快照保留。');await callbacks.current.onChanged?.();}catch(e){setError(String(e));}finally{setSaving(false);}}
-  return <details className="workspace-details" open={open} onToggle={event=>{if(dirty||saving){event.currentTarget.open=true;return;}setOpen(event.currentTarget.open);}}><summary>产品图的制作引用（逐镜明确选择）</summary><p className="form-hint">剧本创作可以使用全部产品图片，制作时可为关键画面与视频分别选择部分图片。超过模型总预算会阻塞，请明确调整；不会自动裁减或将一个产品的图片套给其他产品。</p>{shots.length?<FormField label="选择产品参考分镜"><select value={selectedShot} disabled={disabled||saving||dirty} onChange={event=>setShotId(event.target.value)}>{shots.map(shot=><option key={shot.id} value={shot.id}>#{shot.order} · {shot.title}</option>)}</select></FormField>:<p>先建立分镜，再选择产品制作参考。</p>}{loading?<p role="status">读取此镜头冻结的产品资料与已选图片…</p>:null}{error?<p role="alert" className="inline-notice warning">{error}</p>:null}{data?<><p>产品图数量：关键画面 {keyframeCount} / 总预算 {data.limits.keyframe_total_max} · 视频 {videoCount} / 总预算 {data.limits.video_total_max}</p><p className="form-hint">{data.note}</p>{overBudget?<p role="alert" className="inline-notice warning">当前产品图片已超过模型预算。请减少对应阶段的选择；人物与场景图片也占用总预算，提交制作时还会再次校验。</p>:null}{drafts.map(product=><article className="asset-picker-product" key={product.product_id}><h3>{product.name}</h3><small>产品 {product.product_id} · 配置修订 {product.revision}</small><div className="asset-media-grid">{product.images.map((image,index)=><article className="asset-image-card" key={image.id}><img src={api.mediaUrl(image.thumbnail_url||image.thumbnail||image.media_url||image.url)} alt={`${product.name}制作参考图 ${index+1}`}/><small>{image.filename||image.id} · {image.purpose||'用途见产品图库'}</small><label><input type="checkbox" checked={product.keyframe_image_ids.includes(image.id)} disabled={disabled||saving} onChange={event=>toggle(product.product_id,'keyframe_image_ids',image.id,event.target.checked)}/>{product.name}图 {index+1} 用于关键画面</label><label><input type="checkbox" checked={product.video_image_ids.includes(image.id)} disabled={disabled||saving} onChange={event=>toggle(product.product_id,'video_image_ids',image.id,event.target.checked)}/>{product.name}图 {index+1} 用于视频</label></article>)}</div></article>)}{!drafts.length?<p>此镜头没有绑定产品图库素材。</p>:null}</>:null}<div className="asset-actions">{drafts.length?<button type="button" className="button button-primary button-small" disabled={disabled||saving||!dirty||overBudget} onClick={()=>void save()}>{saving?'正在保存制作引用…':'保存此镜头的产品参考选择'}</button>:null}<button type="button" className="button button-secondary button-small" disabled={saving||loading} onClick={()=>{if(dirty&&!window.confirm('放弃此镜头尚未保存的产品参考选择并重新读取？'))return;setReload(value=>value+1);}}>重新读取此镜头</button></div>{notice?<p role="status" className="form-hint">{notice}</p>:null}</details>;
+  function clearReferences() {
+    setDrafts(previous => previous.map(product => ({...product, keyframe_image_ids:[], video_image_ids:[]})));
+    setNotice('');
+  }
+  async function save(){if(!data||disabled||saving||!dirty||overBudget)return;const destination=selectedShot;setSaving(true);setError('');setNotice('');try{const value=await request<ProjectProductReferenceOverview>(`/api/product-library/projects/${encodeURIComponent(projectId)}/shots/${encodeURIComponent(destination)}/references`,{method:'PUT',body:JSON.stringify({products:drafts.map(product=>({product_id:product.product_id,expected_revision:product.revision,video_image_ids:product.video_image_ids,keyframe_image_ids:product.keyframe_image_ids}))})});if(current.current!==destination)return;if(value.project_id!==projectId||value.shot_id!==destination)throw new Error('保存响应不属于当前分镜');setData(value);setDrafts(value.products);setNotice('此分镜的产品参考已保存。');await callbacks.current.onChanged?.();}catch(e){setError(String(e));}finally{setSaving(false);}}
+
+  return <details className="workspace-details" open={open} onToggle={event=>{if(dirty||saving){event.currentTarget.open=true;return;}setOpen(event.currentTarget.open);}}>
+    <summary>产品图的制作引用（逐镜可选）</summary>
+    <p className="form-hint">关键画面和视频可分别选图，也可留空。留空的阶段使用剧本和其他可用素材制作。</p>
+    {shots.length?<FormField label="选择产品参考分镜">
+      <select value={selectedShot} disabled={disabled||saving||dirty} onChange={event=>setShotId(event.target.value)}>
+        {shots.map(shot=><option key={shot.id} value={shot.id}>#{shot.order} · {shot.title}</option>)}
+      </select>
+    </FormField>:<p>建立分镜后可配置产品制作参考。</p>}
+    {loading?<p role="status">读取此镜头冻结的产品资料与已选图片…</p>:null}
+    {error?<p role="alert" className="inline-notice warning">{error}</p>:null}
+    {data?<>
+      <p>产品图数量：关键画面 {keyframeCount} / 总预算 {data.limits.keyframe_total_max} · 视频 {videoCount} / 总预算 {data.limits.video_total_max}</p>
+      <p className="form-hint">{data.note}</p>
+      {overBudget?<p role="alert" className="inline-notice warning">当前产品图片已超过模型预算。请减少对应阶段的选择。人物与场景图片也占用总预算。</p>:null}
+      {drafts.map(product=><article className="asset-picker-product" key={product.product_id}>
+        <h3>{product.name}</h3><small>产品 {product.product_id} · 配置修订 {product.revision}</small>
+        <div className="asset-media-grid">
+          {product.images.map((image,index)=><article className="asset-image-card" key={image.id}>
+            <img src={api.mediaUrl(image.thumbnail_url||image.thumbnail||image.media_url||image.url)} alt={`${product.name}制作参考图 ${index+1}`}/>
+            <small>{image.filename||image.id} · {image.purpose||'用途见产品图库'}</small>
+            <label><input type="checkbox" checked={product.keyframe_image_ids.includes(image.id)} disabled={disabled||saving}
+              onChange={event=>toggle(product.product_id,'keyframe_image_ids',image.id,event.target.checked)}/>{product.name}图 {index+1} 用于关键画面</label>
+            <label><input type="checkbox" checked={product.video_image_ids.includes(image.id)} disabled={disabled||saving}
+              onChange={event=>toggle(product.product_id,'video_image_ids',image.id,event.target.checked)}/>{product.name}图 {index+1} 用于视频</label>
+          </article>)}
+        </div>
+      </article>)}
+      {!drafts.length?<p>此镜头没有绑定产品图库素材。</p>:null}
+    </>:null}
+    <div className="asset-actions">
+      {drafts.length?<>
+        <button type="button" className="button button-primary button-small" disabled={disabled||saving||!dirty||overBudget}
+          onClick={()=>void save()}>{saving?'正在保存制作引用…':'保存此镜头的产品参考选择'}</button>
+        <button type="button" className="button button-secondary button-small" disabled={disabled||saving||!(keyframeCount||videoCount)}
+          onClick={clearReferences}>清空本镜产品引用</button>
+      </>:null}
+      <button type="button" className="button button-secondary button-small" disabled={saving||loading}
+        onClick={()=>{if(dirty&&!window.confirm('放弃此镜头尚未保存的产品参考选择并重新读取？'))return;setReload(value=>value+1);}}>重新读取此镜头</button>
+    </div>
+    {notice?<p role="status" className="form-hint">{notice}</p>:null}
+  </details>;
 }

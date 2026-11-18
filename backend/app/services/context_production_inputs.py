@@ -201,8 +201,8 @@ def collect_context_inputs(session, settings, shot, *, prompt_override=None, ins
     product_names = {ref['product_id']: ref['product_name'] for ref in library_refs}
     product_directions = [{'商品': ref['product_name'], '图片': f"<Picture {ref['picture_index']}>"}
                           for ref in prop_refs] or [
-        {'商品': product_names.get(product['product_id'], '本镜已绑定商品'),
-         '可见状态': product['state'].get('visible_state')} for product in products
+        {'商品': product_names[product['product_id']], '可见状态': product['state'].get('visible_state')}
+        for product in products if product['product_id'] in product_names
     ]
     prop_entities = {entity.id: entity.name for entity in entities if entity and entity.kind == 'prop'}
     prop_states = [

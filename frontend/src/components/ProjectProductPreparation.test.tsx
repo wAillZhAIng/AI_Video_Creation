@@ -17,6 +17,41 @@ function install(){let data={project_id:'p1',product,expected_token:'a'.repeat(6
 });}
 afterEach(()=>{cleanup();mocked.mockReset();vi.restoreAllMocks();});
 it('is optional without fetching or creating references while collapsed',()=>{const states:unknown[]=[];render(<ProjectProductPreparation projectId="p1" shots={[]} disabled={false} onStateChange={state=>states.push(state)}/>);expect(screen.getByText('固定产品／道具参考图（可选）')).toBeInTheDocument();expect(mocked).not.toHaveBeenCalled();expect(states.at(-1)).toEqual({busy:false,dirty:false,overBudget:false});});
+it('saves zero product images for the selected shot and keeps its editor open',async()=>{
+  const shots=[{id:'s1',order:1,title:'首镜'},{id:'s2',order:2,title:'次镜'}];
+  const states:unknown[]=[];
+  const rows=Object.fromEntries(shots.map(shot=>[shot.id,{product_id:product.id,name:product.name,revision:2,
+    images:product.images,video_image_ids:['im1'] as string[],keyframe_image_ids:['im1'] as string[]} ]));
+  mocked.mockImplementation(async(url,init)=>{
+    if(url==='/api/product-library?include_archived=true')return {items:[product],limits:{}};
+    const shotId=url.includes('/shots/s2/')?'s2':'s1';
+    if(init?.method==='PUT'){
+      const {video_image_ids,keyframe_image_ids}=JSON.parse(String(init.body)).products[0];
+      rows[shotId]={...rows[shotId],revision:3,video_image_ids,keyframe_image_ids};
+    }
+    return {project_id:'p1',shot_id:shotId,products:[structuredClone(rows[shotId])],
+      limits:{keyframe_total_max:4,video_total_max:9},note:''};
+  });
+  const user=userEvent.setup();
+  render(<ProjectProductPreparation projectId="p1" shots={shots} disabled={false} onStateChange={state=>states.push(state)}/>);
+  await user.click(screen.getByText('固定产品／道具参考图（可选）'));
+  await user.click(screen.getByText('产品图的制作引用（逐镜可选）'));
+  await user.selectOptions(screen.getByLabelText('选择产品参考分镜'),'s2');
+  expect(await screen.findByLabelText('固定礼盒图 1 用于视频')).toBeChecked();
+  await user.click(screen.getByRole('button',{name:'清空本镜产品引用'}));
+  await user.click(screen.getByRole('button',{name:'保存此镜头的产品参考选择'}));
+  expect(await screen.findByText('此分镜的产品参考已保存。')).toBeVisible();
+  expect(screen.getByLabelText('选择产品参考分镜')).toHaveValue('s2');
+  expect(screen.getByLabelText('固定礼盒图 1 用于关键画面')).not.toBeChecked();
+  expect(screen.getByLabelText('固定礼盒图 1 用于视频')).not.toBeChecked();
+  const saved=mocked.mock.calls.find(([,init])=>init?.method==='PUT')!;
+  expect(saved[0]).toBe('/api/product-library/projects/p1/shots/s2/references');
+  expect(JSON.parse(String(saved[1]?.body))).toEqual({products:[{product_id:'product1',expected_revision:2,
+    keyframe_image_ids:[],video_image_ids:[]}]});
+  await waitFor(()=>expect(states.at(-1)).toEqual({busy:false,dirty:false,overBudget:false}));
+  await user.selectOptions(screen.getByLabelText('选择产品参考分镜'),'s1');
+  expect(await screen.findByLabelText('固定礼盒图 1 用于视频')).toBeChecked();
+});
 it('selects real library image IDs for only explicit product shots and reloads persistence',async()=>{
   install();const user=userEvent.setup();render(<ProjectProductPreparation projectId="p1" shots={[]} disabled={false}/>);
   await user.click(screen.getByText('固定产品／道具参考图（可选）'));await screen.findAllByRole('option',{name:'固定礼盒'});
