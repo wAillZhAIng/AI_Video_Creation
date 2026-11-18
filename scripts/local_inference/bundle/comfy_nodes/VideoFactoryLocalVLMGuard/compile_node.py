@@ -94,6 +94,13 @@ def reference_contract(upstream,media,groups='',required='',motion='',production
             or row.get('rule') not in {'target_first_frame_palm_support','target_hand_face_same_frame','target_raise_to_cheek'}
             for row in requirements)):
         raise ValueError('Unsupported caller scene requirement contract')
+    camera_sentence=policy.get('camera_sentence')
+    if camera_sentence is not None:
+        if not isinstance(camera_sentence,str) or not re.fullmatch(
+                r'The camera (?:shakes slightly|(?:shakes slightly and )?pushes in(?: at slow speed)?'
+                r'|pulls out(?: at slow speed)?)\.',camera_sentence):
+            raise ValueError('Unsupported frozen camera movement')
+        result['camera_sentence']=camera_sentence
     return result
 
 

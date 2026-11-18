@@ -75,7 +75,8 @@ class NativeReferenceCorrectionTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory=Path(self.temp.name)
-        for owner,name in ((compiler,'_written_context'),(compiler,'validate'),(prose,'fix_with_findings')):
+        for owner,name in ((compiler,'_written_context'),(compiler,'validate'),
+                           (compiler,'repair_brief'),(prose,'fix_with_findings')):
             replacement=patch.object(owner,name,inspect.unwrap(getattr(owner,name)))
             replacement.start();self.addCleanup(replacement.stop)
         token=profile._ACTIVE.set(None)
@@ -194,6 +195,29 @@ class NativeReferenceCorrectionTests(unittest.TestCase):
         self.assertIn('<d>[English]Look at this tree.</d>',doc.prompt)
         self.assertNotIn('Different spoken words.',doc.prompt)
         self.assertTrue(any('caller\'s exact line' in row for row in doc.provenance['repairs']))
+
+    def test_native_verification_restores_frozen_pullback_without_rewriting_shot(self):
+        self.missing=self.corrected.replace('A static camera frames','A medium shot shows') \
+            .replace('The camera holds its position while a hand gently turns','A hand gently turns') \
+            .replace('The camera maintains the same composition through the final frame. ','')
+        sentence='The camera pulls out at slow speed.'
+        self.contract['camera_sentence']=sentence
+        context=compiler._written_context(self.brief,Mode.REF2VA,self.plan,{},300,None)
+        self.assertIn('P5-camera-no-motion-type',{f.rule for f in compiler.validate(self.missing,context)})
+
+        doc,calls=self.compile([])
+        self.assertEqual(doc.source,'written',doc.provenance)
+        self.assertEqual(doc.provenance['fix_rounds'],0)
+        self.assertEqual(calls,[])
+        self.assertEqual(doc.prompt.replace(sentence+' ',''),self.missing)
+        self.assertTrue(any(profile._CAMERA_REPAIR in row for row in doc.provenance['repairs']))
+        self.assertEqual(profile._restore_camera_motion(doc.prompt,sentence),doc.prompt)
+
+    def test_camera_repair_preserves_existing_movement_and_skips_ambiguous_shots(self):
+        sentence='The camera pulls out at slow speed.'
+        self.assertEqual(profile._restore_camera_motion(self.corrected,sentence),self.corrected)
+        multiple='detailed_description:\n[Shot 1] One scene.\n[Shot 2] Another scene.'
+        self.assertEqual(profile._restore_camera_motion(multiple,sentence),multiple)
 
     def test_reference_and_existing_revision_findings_are_joint_native_errors(self):
         constraints=importlib.import_module(spec.name+'.revision_constraints')

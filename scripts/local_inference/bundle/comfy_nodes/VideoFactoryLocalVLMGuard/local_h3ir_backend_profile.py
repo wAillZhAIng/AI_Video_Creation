@@ -30,7 +30,7 @@ from urllib.parse import urlsplit
 import uuid
 
 VERSION='local-h3ir-qwen4b-v3'
-POLICY_REVISION='revision-framing-binding-20261117-v5'
+POLICY_REVISION='revision-framing-binding-camera-v6'
 MODEL='Qwen/Qwen3-VL-4B-Instruct'
 MAX_OUTPUT=4096
 CARD_OUTPUT=3072
@@ -47,6 +47,8 @@ WRITTEN_CONTEXT_SHA256='15934b25540728207199551947ce7b4a6de80cccf82ee7b96f529956
 WRITTEN_VALIDATE_SHA256='b84ea591ee561790dce790dd81c90796cf4a631e1485e24a59d8e84e79c29c79'
 COMPILE_BRIEF_SHA256='c75bdd18e15b9e1a1ac1feb06457f241e24e68ff7f00d8a10113a3bdcbc9dfd8'
 FIX_WITH_FINDINGS_SHA256='0c9ac3ac2c296a507f07b1ea06c4eab12ea777eb8d2719d21bc87ff6205a6e59'
+REPAIR_BRIEF_SHA256='fa9740d40b41f6e66ae7b13750b457c4284768744c45e1386a534dd4f9b5026e'
+_CAMERA_REPAIR='restored the frozen camera sentence in the numbered shot'
 _REFERENCE_FINDING_RULES=frozenset(('F2-duplicate-definition','F3-required-reference',
     'F4-conflicting-groups','F5-declared-group-binding','F6-declared-binding-projection',
     'F7-locked-onscreen-text'))
@@ -558,6 +560,28 @@ def _native_reference_verification(prompt,brief,plan,contract,proof=None):
         'correction_owner':'pinned upstream compile_brief / fix_with_findings; maximum two rounds'}
 
 
+def _restore_camera_motion(prompt,sentence):
+    """Carry forward explicit camera direction only when the writer omitted a move."""
+    from h3ir.validate import CAMERA_MOTION_PHRASE,CAMERA_STEM_IN_CONTEXT
+
+    description=re.search(
+        r'^(?:detailed_description|integrated_multimodal_description)[ \t]*:(.*?)'
+        r'(?=^(?:overall_soundscape|non_diegetic_music)[ \t]*:|\Z)',prompt,re.M|re.S)
+    if not description:
+        return prompt
+    detail=description[1]
+    shots=list(re.finditer(r'^[ \t]*\[Shot (\d+)\](?=\s|$)',detail,re.M))
+    if len(shots)!=1 or shots[0][1]!='1' or not detail[shots[0].end():].strip():
+        return prompt
+    if CAMERA_MOTION_PHRASE.search(detail) or any(
+            CAMERA_STEM_IN_CONTEXT.search(clause)
+            for clause in re.split(r'(?<=[.!?])\s+',detail)
+            if re.search(r'\b(?:camera|shot|lens|frame)\b',clause,re.I)):
+        return prompt
+    position=description.start(1)+shots[0].end()
+    return prompt[:position]+' '+sentence+prompt[position:]
+
+
 def _install_revision_validation():
     """Let the real upstream writer repair caller-contract conflicts.
 
@@ -572,12 +596,26 @@ def _install_revision_validation():
         original_context=compiler._written_context
         original_validate=compiler.validate
         original_fix=inspect.unwrap(prose.fix_with_findings)
+        original_repair=inspect.unwrap(compiler.repair_brief)
         if getattr(original_validate,'_factory_revision_validation_version',None)==POLICY_REVISION:return
         if (source_hash(inspect.unwrap(original_context))!=WRITTEN_CONTEXT_SHA256
                 or source_hash(inspect.unwrap(original_validate))!=WRITTEN_VALIDATE_SHA256
                 or source_hash(compiler.compile_brief)!=COMPILE_BRIEF_SHA256
+                or source_hash(original_repair)!=REPAIR_BRIEF_SHA256
                 or source_hash(original_fix)!=FIX_WITH_FINDINGS_SHA256):
             raise LocalProfileFailure('The audited native written verification/correction path changed')
+
+        @functools.wraps(original_repair)
+        def repair_written(*args,**kwargs):
+            result=original_repair(*args,**kwargs)
+            scope=_ACTIVE.get() or {}
+            sentence=(scope.get('reference_contract') or {}).get('camera_sentence')
+            if sentence:
+                repaired=_restore_camera_motion(result.text,sentence)
+                if repaired!=result.text:
+                    result.text=repaired
+                    result.repairs.append(_CAMERA_REPAIR+': '+sentence)
+            return result
 
         @functools.wraps(original_context)
         def written_context(*args,**kwargs):
@@ -618,6 +656,7 @@ def _install_revision_validation():
         validate_written._factory_revision_validation_version=POLICY_REVISION
         compiler._written_context=written_context
         compiler.validate=validate_written
+        compiler.repair_brief=repair_written
         prose.fix_with_findings=fix_written
 
 
@@ -675,7 +714,8 @@ def _install_document_gate(namespace):
                 record.update(creative_text_source='model_written',
                     binding_source=provenance.get('binding_source','model_written'),
                     visual_facts_added=False,
-                    caller_authored_constraints_added=bool(provenance.get('caller_authored_constraints_added')))
+                    caller_authored_constraints_added=bool(provenance.get('caller_authored_constraints_added')
+                        or any(item.startswith(_CAMERA_REPAIR) for item in provenance.get('repairs',[]))))
                 binding_path=folder/'reference-binding.final.json'
                 if binding_path.exists():
                     binding=json.loads(binding_path.read_text(encoding='utf-8'))

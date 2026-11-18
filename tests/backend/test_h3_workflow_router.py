@@ -4,7 +4,7 @@ import pytest
 
 from app.core.errors import AppError
 from app.services import h3_workflow_router
-from app.services.h3_context_provider import context_compiler_intent, reference_layout
+from app.services.h3_context_provider import context_compiler_intent, prepare_context_compilation, reference_layout
 from app.services.h3_workflow_router import FAST, QUALITY, build_graph, freeze_workflow
 
 
@@ -124,6 +124,33 @@ def test_context_keeps_explicit_camera_terms_in_the_shot_without_overriding_new_
 def test_handheld_approach_uses_the_native_camera_verbs_as_a_complete_sentence():
     intent = context_compiler_intent('大口直饮补水\n机位与运镜：手持手机微晃，仰角缓慢靠近', '', [])
     assert 'this exact camera sentence: The camera shakes slightly and pushes in at slow speed.' in intent
+
+
+def test_extended_shot_keeps_frozen_pullback_in_context_graph():
+    tray, declarations, intent, contract = prepare_context_compilation(
+        '双人中景\n机位与运镜：平视全景镜头平缓后撤。', '', [], [], {'duration_seconds': 8.4})
+    sentence = 'The camera pulls out at slow speed.'
+    assert 'this exact camera sentence: ' + sentence in intent
+    graph = build(freeze_workflow('fast'), tray, intent=intent, duration_seconds=8.4,
+                  production_contract=contract, **declarations)
+    compile_inputs = graph['4']['inputs']
+    assert compile_inputs['seconds'] == 8.4
+    assert json.loads(compile_inputs['production_contract'])['camera_sentence'] == sentence
+
+
+@pytest.mark.parametrize(('camera', 'context', 'motion'), [
+    ('不要平缓后撤', {}, []),
+    ('平缓后撤或者固定机位', {}, []),
+    ('先平缓后撤，然后向前推进', {}, []),
+    ('平缓后撤', {'prompt_override': '改成固定机位'}, []),
+    ('平缓后撤', {'instruction': '采用新的运镜方式'}, []),
+    ('平缓后撤', {}, [{'reference_role': 'structure'}]),
+])
+def test_camera_fallback_respects_override_and_motion_reference(camera, context, motion):
+    _, _, _, contract = prepare_context_compilation('机位与运镜：' + camera, '', [], motion, context)
+    assert 'camera_sentence' not in contract
+
+
 def test_named_product_compiler_layout_includes_stationary_reference_at_declared_position():
     from app.services.h3_context_provider import _declared_prop_states, _frozen_product_staging
     prompt = ('道具镜头状态：[{"道具":"粉色杯","holder":"右手"},'

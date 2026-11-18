@@ -208,6 +208,29 @@ def reference_layout(images, motion, *, prop_states=None):
     return tray, declarations, directions
 
 
+def _frozen_camera_sentence(prompt):
+    if '首段是本次明确的镜头制作要求。' in prompt:
+        return ''
+    camera = re.findall(r'^机位与运镜：([^\r\n]+)', prompt, re.M)
+    if len(camera) != 1 or re.search(r'或|任选|然后|随后|再|[/／]|\b(?:or|then)\b', camera[0], re.I):
+        return ''
+    clauses = re.split(r'[，、；。！？,;.!?]', camera[0])
+    positive = ' '.join(clause.strip() for clause in clauses if not re.search(r'不|无|禁止|避免', clause)).strip()
+    pull_out = re.fullmatch(
+        r'(?:平视|俯视|仰视)?\s*(?:全景|远景|中景|中近景|近景|特写)?\s*'
+        r'(?:镜头|机位|摄像机|相机)?\s*(平缓|缓缓|缓慢|慢慢)?\s*'
+        r'(?:后撤|后移|后退|向后移动|向后拉镜头?)', positive)
+    if pull_out:
+        return 'The camera pulls out at slow speed.' if pull_out[1] else 'The camera pulls out.'
+    movements = []
+    if re.search(r'微晃|轻微晃动', positive):
+        movements.append('shakes slightly')
+    push_in = re.search(r'向前推进|(?:缓缓|缓慢|慢慢)(?:推近|靠近)|轻微推近', positive)
+    if push_in:
+        movements.append('pushes in at slow speed' if re.match(r'缓缓|缓慢|慢慢', push_in[0]) else 'pushes in')
+    return 'The camera ' + ' and '.join(movements) + '.' if movements else ''
+
+
 def context_compiler_intent(prompt, negative_prompt, directions, *, silent=False, staging=''):
     parts = [staging, prompt] if staging else [prompt]
     if negative_prompt:
@@ -229,22 +252,10 @@ def context_compiler_intent(prompt, negative_prompt, directions, *, silent=False
                  'holds static, pushes in, pulls out, pans left, pans right, tilts up, tilts down, shakes slightly, or '
                  'tracks alongside. Choose a phrase supported by the requested action. Copy the chosen phrase into the '
                  'camera sentence verbatim, including its verb form.')
-    if '首段是本次明确的镜头制作要求。' not in prompt:
-        camera = re.search(r'^机位与运镜：([^\r\n]+)', prompt, re.M)
-        if camera:
-            clauses = re.split(r'[，、；。！？,;.!?]', camera[1])
-            positive = ' '.join(clause for clause in clauses if not re.search(r'不|无|禁止|避免', clause))
-            movements = []
-            if re.search(r'微晃|轻微晃动', positive):
-                movements.append('shakes slightly')
-            push_in = re.search(r'向前推进|(?:缓缓|缓慢|慢慢)(?:推近|靠近)|轻微推近', positive)
-            if push_in:
-                phrase = 'pushes in at slow speed' if re.match(r'缓缓|缓慢|慢慢', push_in[0]) else 'pushes in'
-                movements.append(phrase)
-            if movements:
-                sentence = 'The camera ' + ' and '.join(movements) + '.'
-                parts.append(f'Begin the first numbered shot with this exact camera sentence: {sentence} '
-                             'Keep the specified angle, framing and other shot actions in the description.')
+    sentence = _frozen_camera_sentence(prompt)
+    if sentence:
+        parts.append(f'Begin the first numbered shot with this exact camera sentence: {sentence} '
+                     'Keep the specified angle, framing and other shot actions in the description.')
     return '\n'.join(parts)
 
 
@@ -300,6 +311,10 @@ def prepare_context_compilation(prompt,negative_prompt,images,motion,context,*,s
     tray,declarations,directions=reference_layout(images,motion,prop_states=prop_states)
     staging=_frozen_product_staging(images,motion,prop_states)
     contract=frozen_production_contract(images,declarations,context,prompt)
+    if not motion and not context.get('instruction') and context.get('prompt_override') is None:
+        sentence = _frozen_camera_sentence(prompt)
+        if sentence:
+            contract['camera_sentence'] = sentence
     for item in (contract['revision_constraints'].get('items') or []):
         key=item.get('target_key')
         if key and key not in contract['constraint_target_groups']:
