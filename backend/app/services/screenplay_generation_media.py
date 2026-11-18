@@ -77,6 +77,31 @@ def asset_dto(asset):
     return {'id':asset.id,'input_mode':asset.input_mode,'filename':asset.filename,'relative_path':asset.relative_path,
         'media_url':'/api/media/'+asset.relative_path,'sha256':asset.sha256,'metadata':asset.metadata_json,'source_note':asset.source_note}
 
+
+def extract_source_audio(settings, path, directory, limit_seconds=None):
+    audio = directory / 'source_audio.wav'
+    duration = ['-t', limit_seconds] if limit_seconds is not None else []
+    run([settings.ffmpeg_path,'-nostdin','-v','error','-n','-i',path,'-map','0:a:0',
+         *duration,'-vn','-ar','16000','-ac','1','-c:a','pcm_s16le',audio])
+    return {'audio_relative_path': audio.relative_to(settings.media_root).as_posix(),
+            'audio_sha256': sha(audio.read_bytes()), 'audio_transcription': 'not_configured'}
+
+
+def prepare_reference_audio(settings, job, video, expected_sha):
+    """Extract a bounded audio sample from the chosen frozen library reference."""
+    from app.services.runtime_registry import file_sha
+
+    if not video.metadata_json.get('has_audio'):
+        return {'audio_transcription': 'no_audio_stream'}
+    path = safe_media_path(settings.media_root, video.relative_path, must_exist=True)
+    if video.sha256 != expected_sha or file_sha(path) != expected_sha:
+        raise AppError(409, 'screenplay_source_changed', '冻结的主参考视频已变化，未提取音轨')
+    directory = safe_media_path(settings.media_root,f'screenplay_jobs/{job.id}/source_frames')
+    directory.mkdir(parents=True,exist_ok=True)
+    return {**extract_source_audio(settings,path,directory,60),'audio_reference_video_id':video.id,
+            'audio_sample_limit_seconds':60}
+
+
 def prepare_source(settings,job,asset):
     receipt={'input_mode':job.input_mode,'source_asset_id':asset.id if asset else None,'frames':[]}
     content=[]
@@ -97,8 +122,6 @@ def prepare_source(settings,job,asset):
         content.extend([{'type':'text','text':f'视频时间戳 {timestamp:.3f} 秒'},part])
         receipt['frames'].append({'timestamp_seconds':timestamp,'relative_path':frame.relative_to(settings.media_root).as_posix(),'sha256':sha(frame.read_bytes()),'request_image_sha256':digest})
     if asset.metadata_json.get('has_audio'):
-        audio=directory/'source_audio.wav'
-        run([settings.ffmpeg_path,'-nostdin','-v','error','-n','-i',path,'-vn','-ar','16000','-ac','1','-c:a','pcm_s16le',audio])
-        receipt.update(audio_relative_path=audio.relative_to(settings.media_root).as_posix(),audio_sha256=sha(audio.read_bytes()),audio_transcription='not_configured')
+        receipt.update(extract_source_audio(settings,path,directory))
     else:receipt['audio_transcription']='no_audio_stream'
     return content,receipt

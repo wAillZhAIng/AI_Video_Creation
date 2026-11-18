@@ -23,7 +23,8 @@ from app.schemas_screenplay_generation import GenerateScreenplay
 from app.services.ai_services import service_snapshot, service_request, public_service
 from app.services.cinematic_rules import rules_bundle
 from app.services.runtime_registry import file_sha
-from app.services.screenplay_generation_media import LIMITS, prepare_source, asset_dto, sha
+from app.services.screenplay_generation_media import LIMITS, prepare_source, prepare_reference_audio, asset_dto, sha
+from app.services import speech_recognition
 from app.services.screenplay_document import export_screenplay
 from app.services.word_screenplay import validate_preview, summary, read_blocks, commit_import
 from app.services.gpu_gate import gpu_submission
@@ -150,6 +151,8 @@ def create_generation(session,settings,payload,*,capability_test=False,parent=No
     if service.encrypted_secret:
         reveal(service.encrypted_secret)
     extras=frozen_sources(session,settings,payload)
+    if payload.input_mode == 'video':
+        extras['speech_recognition_service'] = speech_recognition.default_snapshot(session)
     job=Job(id=new_id('spjob'),idempotency_key=payload.idempotency_key,request_sha256=request_hash,project_name=payload.project_name,
         input_mode=payload.input_mode,creative_prompt=payload.creative_prompt,story_text=payload.story_text,input_asset_id=asset.id if asset else None,
         parent_job_id=parent.id if parent else None,scope=scope,target_key=target_key,instruction=instruction,capability_test=capability_test,
@@ -290,14 +293,22 @@ observations:[素材中真实可见的线索],uncertainties:[需要用户确认�
     rules=job.snapshot_json.get('rules_snapshot',{})
     instructions=['\n'.join([section.get('title',''),*section.get('instructions',[])]) for section in rules.get('sections',{}).values()]
     system+='\n当前项目统一制作规范（各模式相同，不能把字数当时长）：\n'+'\n'.join(instructions)
-    model_source={k:v for k,v in source.items() if k not in {'frames','products','images','reference_videos','transcription_receipt'}}
+    model_source={k:v for k,v in source.items() if k not in {'frames','products','images','reference_videos','transcript','transcription_receipt'}}
     if source.get('images'):model_source['images']=[{k:picture.get(k) for k in ('id','product_id','purpose','notes')} for picture in source['images']]
     user=[{'type':'text','text':'项目名称必须原样保持：'+job.project_name+'\n统一创作提示词：'+job.creative_prompt+
         '\n输入方式：'+job.input_mode+'\n故事素材：'+job.story_text+'\n来源处理：'+canonical(model_source)}]+media_parts
     if source.get('audio_transcription')=='not_configured':
         user.append({'type':'text','text':'音轨已提取但未配置语音转写。你不能听到音轨，禁止声称恢复原对白；原对白内容与说话人必须标为待确认。'})
     elif source.get('audio_transcription')=='transcribed_unverified':
-        user.append({'type':'text','text':'以下为真实ASR自动转写，仍需人工核对。所有说话人目前未知，严禁凭空指派到某个角色或声称已验证口型；应把原话保留为来源与待确认项。若另写创作对白，请明确是建议。\n'+canonical(source.get('transcript',{}))})
+        transcript = source.get('transcript', {})
+        if language := transcript.get('language'):
+            user.append({'type':'text','text':f'原音轨识别语言代码为 {language}。用户若要求沿用参考视频语言，请用该语言为新剧本创作原创口播或对白。营销口播属于创作建议，写入新分镜的 dialogues 或旁白，按分镜时长控制字数。'})
+        else:
+            user.append({'type':'text','text':'识别到语音，但语言待确认。若用户要求沿用原语言，请标明待确认，避免把猜测写成识别结果。'})
+        if source.get('source_kind') != 'analysed_reference_library':
+            user.append({'type':'text','text':'以下为真实ASR自动转写，仅作内容证据。说话人目前未知，请勿分配原话给新角色。生成的营销口播应为原创，不把原广告的时效、价格或销量当作新产品事实。\n'+canonical(transcript)})
+    elif source.get('audio_transcription') in {'no_speech_detected', 'recognition_failed', 'reference_language_ambiguous'}:
+        user.append({'type':'text','text':'暂无可靠的参考音轨语言。原对白、说话人和语言待确认。同语言创作要求应标为待确认，按用户明确指定的语言撰写新口播。'})
     base=job.snapshot_json.get('base_ir')
     if base:
         if job.scope=='all':payload=base;instruction='重新生成整份，保存新的独立版本。'
@@ -569,8 +580,14 @@ def normalize_ir(session,job,raw,source):
                 design['model_original_kind']='wardrobe';design['kind']='prop'
                 ir['parse_warnings'].append({'kind':'product_design_classification','design_key':design['key'],'message':'模型将已选产品标为服装；根据真实product_id归为道具，原类型保留供审核。'})
             else:raise ValueError('无人产品片不能把不明内容当作服装设计；请在产品字段或道具中描述')
-    if source.get('audio_transcription')=='not_configured':
-        message='原视频音轨已提取但尚未转写；原对白、说话人与声音内容必须人工确认，新增台词仅为创作建议。'
+    audio_warning = {
+        'not_configured':'原视频音轨已提取但尚未转写；原对白、说话人与声音内容必须人工确认，新增台词仅为创作建议。',
+        'recognition_failed':'本次原音轨识别未完成，语言待确认。可在系统设置的语音识别服务档案中检查连接。',
+        'no_speech_detected':'原音轨未检测到清晰口播，语言待确认。',
+        'reference_language_ambiguous':'选择多份参考时，请指定用于识别语言的主参考视频。',
+    }.get(source.get('audio_transcription'))
+    if audio_warning:
+        message = audio_warning
         if message not in ir['uncertainties']:ir['uncertainties'].append(message)
         ir['parse_warnings'].append({'kind':'untranscribed_source_audio','message':message})
     total=round(sum(float(shot['duration_seconds']) for shot in ir['shots']),3)
@@ -589,6 +606,8 @@ def normalize_ir(session,job,raw,source):
     if source.get('audio_transcription')=='transcribed_unverified':
         message='原音轨已有自动转写，识别结果未经人工确认，说话人未知；请核对原话、时间段与说话人归属。'
         ir['source_transcript']=copy.deepcopy(source.get('transcript',{}))
+        if not ir['source_transcript'].get('language'):
+            ir['uncertainties'].append('原音轨已有转写，语言仍待核对。')
         if message not in ir['uncertainties']:ir['uncertainties'].append(message)
         ir['parse_warnings'].append({'kind':'unverified_source_transcript','message':message})
     products=job.snapshot_json.get('products',[])
@@ -632,6 +651,8 @@ def export_job(session,settings,job):
             '风格档案ID':job.receipt_json.get('source',{}).get('style_profile_id',''),
             '源素材SHA256':job.receipt_json.get('source',{}).get('source_sha256',''),'素材说明':job.receipt_json.get('source',{}).get('source_note',''),
             '音轨处理':job.receipt_json.get('source',{}).get('audio_transcription','不适用'),
+            '原音轨识别语言':job.receipt_json.get('source',{}).get('transcript',{}).get('language') or '',
+            '语音识别模型':job.receipt_json.get('source',{}).get('transcription_receipt',{}).get('model_id',''),
             '实际生成模型':actual_service.get('model_id',''),'模型服务档案修订':actual_service.get('service_revision',''),
             '原音轨自动转写':job.receipt_json.get('source',{}).get('transcript',{}).get('text',''),
             '原音轨说话人':'未知，需人工核对' if job.receipt_json.get('source',{}).get('transcript') else ''})
@@ -777,6 +798,36 @@ async def _call_provider(settings,session,job,media_parts,source,*,snapshot=None
             'provider_response_received':True,'provider_response_saved':True};session.commit()
         return result,snapshot,secret,response.status_code
 
+async def _recognize_job_audio(settings, session, job, source):
+    snapshot = job.snapshot_json['speech_recognition_service']
+    try:
+        service = session.get(m.AIService, snapshot['service_id'])
+        if (not service or not service.enabled or service.module != speech_recognition.MODULE
+                or service.provider != speech_recognition.PROVIDER or service.revision != snapshot['service_revision']):
+            raise AppError(409, 'speech_recognition_service_changed', '语音识别服务已停用或配置已变化')
+        if source.get('source_kind') == 'analysed_reference_library':
+            from app.services.reference_video_analysis import get_video
+            references = source['reference_videos']['sources']
+            primary = source['style_context'].get('primary_video_id')
+            if not primary and len(references) == 1:
+                primary = references[0]['id']
+            frozen = next((item for item in references if item['id'] == primary), None)
+            if not frozen:
+                return {**source, 'audio_transcription': 'reference_language_ambiguous'}
+            video = get_video(session, primary, active=True)
+            session.commit()
+            source = {**source, **await asyncio.to_thread(prepare_reference_audio, settings, job, video, frozen['sha256'])}
+        else:
+            session.commit()
+        if source.get('audio_relative_path'):
+            return await speech_recognition.transcribe_audio(settings, snapshot, source)
+        return source
+    except (AppError, httpx.HTTPError, OSError, ValueError) as error:
+        details = {'code': getattr(error, 'code', type(error).__name__),
+                   'message': error.message if isinstance(error, AppError) else '本地语音识别未返回可用结果'}
+        return {**source, 'audio_transcription': 'recognition_failed', 'transcription_error': details}
+
+
 async def _process_job(settings,factory,identifier):
     started=time.monotonic();secret='';response_received=False
     with factory() as session:
@@ -817,6 +868,14 @@ async def _process_job(settings,factory,identifier):
                 media_parts,source=await asyncio.to_thread(prepare_images,settings,job)
             else:media_parts,source=await asyncio.to_thread(prepare_source,settings,job,asset)
             job.receipt_json={**job.receipt_json,'source':source}
+            if (not saved_response and job.snapshot_json.get('speech_recognition_service')
+                    and (source.get('audio_relative_path') or source.get('source_kind') == 'analysed_reference_library')):
+                set_stage(session, job, 'running', 'transcribing')
+                source = await _recognize_job_audio(settings, session, job, source)
+                session.refresh(job)
+                if job.status != 'running':
+                    return
+                job.receipt_json={**job.receipt_json,'source':source}
             if saved_response:
                 result,history,chunks,http_status=_load_saved_generation_result(settings,receipt)
                 job.receipt_json={**job.receipt_json,'provider_response_received':True,'provider_response_saved':True,

@@ -25,6 +25,7 @@ from app.core.trusted_service_origins import (confirmed_local_origin, is_trusted
 MODULES = {'character_generation': {'comfyui','openai_compatible','cloud_draft'},
     'video_generation': {'comfyui','video_api','cloud_draft'}, 'final_assembly': {'ffmpeg'},
     'language_processing':{'openai_compatible','local_llm','cloud_draft'},
+    'speech_recognition': {'local_asr'},
     'dialogue_generation':{'local_runtime','openai_tts','cloud_draft'},
     'lip_sync':{'local_runtime','cloud_draft'},'video_upscale':{'comfyui','local_runtime','cloud_draft'},
     'quality_check':{'ffmpeg','openai_compatible','cloud_draft'}}
@@ -83,7 +84,17 @@ def validate_configuration(module, provider, base_url, options):
             raise AppError(422, 'lk888_endpoint_invalid', '零度 H3 请选择 https://api.lk888.ai 或 https://api.lk888.ai/v1')
     if provider == 'video_api' and options.get('video_contract') == 'wan26-i2v' and urlsplit(base_url).path.rstrip('/') != '/api/v1':
         raise AppError(422, 'wan_endpoint_invalid', '万相 2.6 请使用供应商原生 /api/v1 地址，不要填写聊天接口 /compatible-mode/v1')
-    if provider=='local_runtime':
+    if provider == 'local_asr':
+        try:
+            url = urlsplit(base_url)
+            valid = (url.scheme in {'http','https'} and is_loopback_service(base_url) and url.port
+                     and url.path in {'','/'} and url.username is None and url.password is None
+                     and not (url.query or url.fragment))
+        except ValueError:
+            valid = False
+        if not valid or set(options) - {'timeout','concurrency'}:
+            raise AppError(422, 'speech_recognition_local_only', '语音识别请填写带端口的本机服务地址，音轨仅在本机处理')
+    elif provider=='local_runtime':
         if base_url or set(options)-{'timeout','concurrency','runtime_family'}:raise AppError(422,'runtime_fixed_configuration','本地运行时只接受已登记family，不接受路径、命令或URL')
         if options.get('runtime_family') not in {'cosyvoice3','indextts25','latentsync15'}:raise AppError(422,'runtime_adapter_missing','此family没有固定CLI适配器')
         if options.get('runtime_family')=='indextts25' and module!='dialogue_generation':raise AppError(422,'runtime_module_mismatch','IndexTTS 2.5 仅用于角色配音模块')
@@ -111,7 +122,7 @@ def validate_configuration(module, provider, base_url, options):
         raise AppError(422,'invalid_numeric_settings','超时、并发和分辨率必须是有效数字') from exc
     if timeout is not None and timeout < 3:
         raise AppError(422, 'invalid_timeout', '请求超时留空表示无上限；设置数值时须至少为 3 秒')
-    if not 1 <= concurrency <= (1 if provider in ('comfyui','ffmpeg','local_runtime','local_llm') else 4):
+    if not 1 <= concurrency <= (1 if provider in ('comfyui','ffmpeg','local_runtime','local_llm','local_asr') else 4):
         raise AppError(422, 'invalid_concurrency', '本地 GPU/渲染默认串行；云端并发上限为 4')
     # Unknown options are never passed directly into shell commands or headers.
     for field in ('width', 'height'):
@@ -127,7 +138,7 @@ def public_service(service):
             'last_success_at': service.last_success_at.isoformat() if service.last_success_at else None,
             'has_api_key': bool(service.encrypted_secret), 'api_key_mask': '***' if service.encrypted_secret else '',
             'key_storage': storage_label(service.encrypted_secret),
-            'trusted_local_endpoint': service.provider in {'comfyui', 'local_llm'} and (is_loopback_service(service.base_url) or is_trusted_local_service(service.base_url, service.settings_json)),
+            'trusted_local_endpoint': service.provider in {'comfyui', 'local_llm', 'local_asr'} and is_local_provider(service.provider, service.base_url, service.settings_json),
             'revision': service.revision, 'created_at': service.created_at.isoformat()}
 
 
@@ -176,7 +187,10 @@ async def service_request(settings, snapshot, method, endpoint, secret='', *, cl
             raise AppError(422, 'unsupported_service_headers', '不支持此服务请求头')
         headers.update(extra_headers)
     extensions = {}
-    trusted_local = snapshot.get('provider') in {'comfyui', 'local_llm'} and (is_loopback_service(base) or is_trusted_local_service(base, snapshot.get('settings')))
+    provider = snapshot.get('provider')
+    if provider == 'local_asr' and not is_loopback_service(base):
+        raise AppError(422, 'speech_recognition_local_only', '语音识别请求只能发给本机服务')
+    trusted_local = provider in {'comfyui', 'local_llm', 'local_asr'} and is_local_provider(provider, base, snapshot.get('settings'))
     if trusted_local:
         if service_origin(url) != service_origin(base):
             raise AppError(422, 'service_origin_changed', '本地服务请求不能跳转到其他地址')
@@ -309,6 +323,14 @@ async def probe_service(service, settings):
     try:
         if service.provider=='cloud_draft':
             result.update(status='unsupported',error='此云端档案没有执行适配器；未发请求，不能选择为已验证服务')
+        elif service.provider == 'local_asr':
+            from app.services.speech_recognition import service_health
+            health = await service_health(settings, snapshot)
+            result.update(status='connected', http_status=200, model_sha256=health['model_sha256'],
+                          models=[{'id':health['model_id'], 'source':'本机 Whisper 已加载'}],
+                          notice='本地识别模型已就绪。设为默认后，视频生剧本会自动识别音轨语言。',
+                          capabilities={'speech_recognition': {'state':'detected', 'model_id':health['model_id'],
+                                                              'source':'离线模型的实际健康回执'}})
         elif service.provider=='local_runtime':
             from app.services.runtime_registry import manifest_status
             runtime=await asyncio.to_thread(manifest_status, service.settings_json.get('runtime_family', ''), settings)

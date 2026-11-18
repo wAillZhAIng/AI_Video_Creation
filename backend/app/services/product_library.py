@@ -17,6 +17,32 @@ from app.services.screenplay_generation_media import upload_asset,sha
 PURPOSES={'main','front','back','side','detail','usage','packaging','dimensions','other'}
 LIMITS={'max_images_per_product':32,'max_generation_images':8,'max_upload_bytes':10*1024**2,'formats':['.png','.jpg','.jpeg','.webp']}
 
+SHOT_REFERENCE_LIMITS={'keyframe_total_max':4,'video_total_max':9}
+_PRODUCT_SUBJECT_ERROR = 'Model ImageCard did not establish one object subject for product-unit:'
+
+
+def is_product_reference_error(code, message):
+    return code == 'product_reference_identity_conflict' or (
+        code == 'comfyui_execution_failed'
+        and any(marker in (message or '') for marker in ('商品参考身份不一致或无法确定', _PRODUCT_SUBJECT_ERROR))
+    )
+
+
+def _stalled_product_run(run):
+    if not run or run.status != 'running':
+        return False
+    nodes = run.nodes_json or []
+    if not any(node['kind'] == 'video' and node['status'] == 'exception'
+               and is_product_reference_error(node.get('code'), node.get('error')) for node in nodes):
+        return False
+    complete = {node['id'] for node in nodes if node['status'] == 'succeeded'}
+    return not any(
+        node['status'] in {'dispatching', 'running', 'retrying', 'unknown'}
+        or (node['status'] in {'pending', 'waiting_dependencies'}
+            and set(node.get('dependencies', [])) <= complete)
+        for node in nodes
+    )
+
 def get_product(session,identifier):
     item=session.get(Product,identifier)
     if not item:raise AppError(404,'product_missing','产品不存在')
@@ -243,34 +269,96 @@ def reference_selection(session,project_id,shot_id):
     for binding in session.scalars(select(ShotProductBinding).where(ShotProductBinding.shot_id==shot_id).order_by(ShotProductBinding.product_id)):
         project=session.scalar(select(ProjectProductBinding).where(ProjectProductBinding.project_id==project_id,ProjectProductBinding.product_id==binding.product_id))
         if not project:raise AppError(409,'product_binding_missing','镜头产品缺少项目资料')
+        available={image['id']:image for image in project.snapshot_json.get('images',[])}
+        product=session.get(Product,binding.product_id)
+        if product and product.state=='active':
+            for image in images(session,binding.product_id):
+                if image.id not in available:available[image.id]=image_dto(session,image)
         result.append({'product_id':binding.product_id,'name':project.snapshot_json['name'],'revision':binding.revision,
-            'images':project.snapshot_json.get('images',[]),'video_image_ids':binding.image_ids_json,
+            'images':list(available.values()),'video_image_ids':binding.image_ids_json,
             'keyframe_image_ids':binding.state_json.get('keyframe_image_ids',binding.image_ids_json)})
-    return {'project_id':project_id,'shot_id':shot_id,'products':result,'limits':{'keyframe_total_max':4,'video_total_max':9},'note':'总预算还包括人物与场景图，实际提交前再次校验；不自动截断图片'}
+    return {'project_id':project_id,'shot_id':shot_id,'products':result,'limits':SHOT_REFERENCE_LIMITS,
+        'note':'各分镜独立选图。留空可取消该阶段的产品参考。总预算还包括人物与场景图，实际提交前再次校验。'}
 
-def save_reference_selection(session,project_id,shot_id,payload):
+def save_reference_selection(session,project_id,shot_id,payload,*,settings=None,commit=True,allow_stalled_run=False):
+    # Serialize updates of the shared frozen photo pool for this project.
     session.execute(update(m.Project).where(m.Project.id==project_id).values(name=m.Project.name).execution_options(synchronize_session=False))
     current=reference_selection(session,project_id,shot_id)
-    active={'queued','submitting','submitted','running','postprocessing','cancelling','reconciling','unknown'}
+    active={'queued','submitting','submitted','running','cancelling','postprocessing','reconciling','unknown'}
     for model in (m.GenerationJob,m.ProductionVisual,m.MediaProcessTask):
         if session.scalar(select(model.id).where(model.project_id==project_id,model.status.in_(active)).limit(1)):raise AppError(409,'product_binding_busy','项目仍有制作任务，请等待结束后修改参考')
     from app.services.studio_pipeline import latest_run,RUN_TERMINAL
     run=latest_run(session,project_id)
-    if run and run.status not in RUN_TERMINAL|{'paused','exceptions'}:raise AppError(409,'product_binding_busy','自动制作仍在执行')
+    stalled = _stalled_product_run(run)
+    if not allow_stalled_run and run and run.status not in RUN_TERMINAL|{'paused','exceptions'} and not stalled:
+        raise AppError(409,'product_binding_busy','自动制作仍在执行')
     mapping={p['product_id']:p for p in current['products']}
-    if len({p.product_id for p in payload.products})!=len(payload.products) or {p.product_id for p in payload.products}!=set(mapping):raise AppError(422,'product_reference_scope','请提交当前镜头全部已绑定产品')
+    requested = {value.product_id for value in payload.products}
+    if len(requested) != len(payload.products) or set(mapping) - requested:
+        raise AppError(422,'product_reference_scope','请提交当前镜头全部已绑定产品，每个产品只提交一次')
+    if sum(len(value.video_image_ids) for value in payload.products)>SHOT_REFERENCE_LIMITS['video_total_max']:
+        raise AppError(422,'product_video_budget','此镜的视频产品参考最多9张')
+    if sum(len(value.keyframe_image_ids) for value in payload.products)>SHOT_REFERENCE_LIMITS['keyframe_total_max']:
+        raise AppError(422,'product_keyframe_budget','此镜的关键画面产品参考最多4张')
+    from app.schemas_product_library import ProductSelection
+    changed_any = False
     for value in payload.products:
-        known=mapping[value.product_id];available={i['id'] for i in known['images']}
+        known = mapping.get(value.product_id)
+        if value.expected_revision != (known['revision'] if known else 0):
+            raise AppError(409,'product_reference_revision','镜头产品参考已被修改，请刷新')
+        selected_ids = set(value.video_image_ids) | set(value.keyframe_image_ids)
+        if not known and not selected_ids:
+            continue
+        project=session.scalar(select(ProjectProductBinding).where(ProjectProductBinding.project_id==project_id,ProjectProductBinding.product_id==value.product_id))
+        frozen=project.snapshot_json.get('images',[]) if project else []
+        if known:
+            available = {image['id'] for image in known['images']}
+        else:
+            product = get_product(session, value.product_id)
+            if product.state != 'active':
+                raise AppError(409,'product_archived','已移出图库的产品不能添加到本镜')
+            available = {image.id for image in images(session, product.id)} | {image['id'] for image in frozen}
         for selected in (value.video_image_ids,value.keyframe_image_ids):
-            if len(set(selected))!=len(selected) or set(selected)-available:raise AppError(422,'product_reference_scope','图片不属于本镜冻结产品或存在重复')
+            if len(set(selected)) != len(selected) or set(selected) - available:
+                raise AppError(422,'product_reference_scope','图片不属于所选产品或存在重复')
+        new_ids=selected_ids-{image['id'] for image in frozen}
+        if new_ids:
+            if settings is None:raise AppError(409,'product_reference_settings_missing','无法校验新选产品原图，请重新打开项目')
+            ordered=[image.id for image in images(session,value.product_id) if image.id in new_ids]
+            batch_size=LIMITS['max_generation_images']
+            for start in range(0,len(ordered),batch_size):
+                selection=ProductSelection(product_id=value.product_id,image_ids=ordered[start:start+batch_size])
+                snapshot=freeze_products(session,settings,[selection])[0]
+                frozen=[*frozen,*snapshot['images']]
+                if not project:
+                    project=ProjectProductBinding(project_id=project_id,product_id=value.product_id,snapshot_json=snapshot)
+                    session.add(project)
+            if project:
+                project.snapshot_json={**project.snapshot_json,'images':frozen}
         row=session.scalar(select(ShotProductBinding).where(ShotProductBinding.shot_id==shot_id,ShotProductBinding.product_id==value.product_id))
-        changed=session.execute(update(ShotProductBinding).where(ShotProductBinding.id==row.id,ShotProductBinding.revision==value.expected_revision).values(image_ids_json=value.video_image_ids,state_json={**row.state_json,'keyframe_image_ids':value.keyframe_image_ids,'reference_selection_confirmed':True},revision=ShotProductBinding.revision+1))
-        if changed.rowcount!=1:raise AppError(409,'product_reference_revision','镜头产品参考已被修改，请刷新')
-    if payload.products and run and run.status in {'paused','exceptions'} and shot_id in run.snapshot_json.get('shot_ids',[shot_id]):
-        run.snapshot_json = {**run.snapshot_json, 'product_references_changed': True}
-        run.status = 'paused'
-    session.add(m.AuditEvent(object_type='storyboard_shot',object_id=shot_id,action='product_reference_selection_saved',details_json=payload.model_dump()))
-    session.commit();return reference_selection(session,project_id,shot_id)
+        state = {**(row.state_json if row else {}), 'keyframe_image_ids':value.keyframe_image_ids,
+                 'reference_selection_confirmed':True}
+        if row is None:
+            session.add(ShotProductBinding(project_id=project_id,shot_id=shot_id,product_id=value.product_id,
+                                           image_ids_json=value.video_image_ids,state_json=state))
+            changed_any = True
+        elif row.image_ids_json != value.video_image_ids or row.state_json != state:
+            changed=session.execute(update(ShotProductBinding).where(ShotProductBinding.id==row.id,
+                ShotProductBinding.revision==value.expected_revision).values(image_ids_json=value.video_image_ids,
+                state_json=state,revision=ShotProductBinding.revision+1))
+            if changed.rowcount!=1:raise AppError(409,'product_reference_revision','镜头产品参考已被修改，请刷新')
+            changed_any = True
+    if changed_any and not allow_stalled_run and run and (run.status in {'paused','exceptions'} or stalled):
+        run_shots=set(run.snapshot_json.get('shot_ids',[]))
+        run_shots.update(node.get('target_id') for node in run.nodes_json or [] if node.get('kind') in {'video','keyframe'})
+        if shot_id in run_shots:
+            run.snapshot_json={**run.snapshot_json,'product_references_changed':True}
+            run.status='paused'
+    if changed_any:
+        session.add(m.AuditEvent(object_type='storyboard_shot',object_id=shot_id,action='product_reference_selection_saved',details_json=payload.model_dump()))
+    session.flush()
+    if commit:session.commit()
+    return reference_selection(session,project_id,shot_id)
 
 
 def bind_existing_project(session, settings, project_id, payload):

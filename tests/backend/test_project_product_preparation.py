@@ -81,6 +81,38 @@ def test_optional_project_starts_without_a_product_or_inference_call(client):
         assert not product_library.shot_product_snapshot(session, session.get(m.StoryboardShot, shots[0]))
 
 
+def test_shots_select_from_gallery_independently_without_bulk_binding(client, settings):
+    product = product_with_images(client, count=3)
+    project_id, shots = project_with_shots(client)
+    first, second, third = [item['id'] for item in product['images']]
+
+    def path(shot):
+        return f'/api/product-library/projects/{project_id}/shots/{shot}/references'
+
+    def put(shot, revision, video, keyframe):
+        return client.put(path(shot), json={'products': [{
+            'product_id': product['id'], 'expected_revision': revision,
+            'video_image_ids': video, 'keyframe_image_ids': keyframe,
+        }]})
+
+    assert client.get(path(shots[0])).json()['products'] == []
+    one = put(shots[0], 0, [first, second], [third])
+    assert one.status_code == 200, one.text
+    assert put(shots[1], 0, [third], []).status_code == 200
+    assert put(shots[0], 0, [third], []).status_code == 409
+    cleared = put(shots[0], 1, [], [third])
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()['products'][0]['video_image_ids'] == []
+    assert cleared.json()['products'][0]['keyframe_image_ids'] == [third]
+    assert client.get(path(shots[1])).json()['products'][0]['video_image_ids'] == [third]
+    with client.app.state.session_factory() as session:
+        one = session.get(m.StoryboardShot, shots[0])
+        two = session.get(m.StoryboardShot, shots[1])
+        assert product_library.shot_references(session, settings, one, stage='video') == []
+        assert [image['id'] for image in product_library.shot_references(session, settings, one, stage='keyframe')] == [third]
+        assert [image['id'] for image in product_library.shot_references(session, settings, two, stage='video')] == [third]
+
+
 def test_upload_select_persist_exact_chinese_name_suggestions_and_clear_scoped_shots(client, settings):
     product = product_with_images(client)
     project_id, shots = project_with_shots(client)

@@ -1031,6 +1031,77 @@ def test_configured_source_transcription_is_sent_to_model_and_retained_as_unveri
         word='\n'.join(p.text for p in Document(settings.media_root/document.relative_path).paragraphs)
         assert '原音轨自动转写：先核对原始记录。' in word and '原音轨说话人：未知' in word
 
+def test_video_uses_separate_default_speech_recognition_and_exports_language(client,factory,settings,model,monkeypatch):
+    from app.services import ai_services, speech_recognition
+
+    audio = settings.media_root / 'reference.wav'
+    audio.write_bytes(b'fixture audio input')
+    audio_sha = service.sha(audio.read_bytes())
+    video = settings.media_root / 'original.mp4'
+    video.write_bytes(b'fixture video source')
+    health = {
+        'service': speech_recognition.PROTOCOL, 'offline': True, 'ready': True,
+        'model_id': speech_recognition.DEFAULT_MODEL, 'model_sha256': 'a'*64, 'revision': 'b'*40,
+    }
+    calls = []
+
+    async def asr_call(settings, snapshot, method, endpoint, **kwargs):
+        assert snapshot['provider'] == 'local_asr'
+        calls.append(endpoint)
+        response = health if endpoint == '/health' else {
+            'status': 'transcribed', 'language': 'en', 'language_probability': .999,
+            'segments': [{'text': 'Original speech.', 'start': 0, 'end': 1}],
+            'receipt': {**health, 'input_sha256': audio_sha},
+        }
+        return httpx.Response(200, json=response, request=httpx.Request(method, snapshot['base_url']+endpoint))
+
+    monkeypatch.setattr(ai_services,'service_request',asr_call)
+    config = {'module':'speech_recognition','provider':'local_asr','name':'Local Whisper',
+              'default_model':speech_recognition.DEFAULT_MODEL,'base_url':speech_recognition.DEFAULT_BASE_URL}
+    assert client.post('/api/settings/ai-services', json={**config,'base_url':'https://example.com:8778'}).status_code == 422
+    assert client.post('/api/settings/ai-services', json={**config,'api_key':'invalid-for-local'}).status_code == 422
+    created = client.post('/api/settings/ai-services', json=config)
+    assert created.status_code == 201, created.text
+    service_path = '/api/settings/ai-services/'+created.json()['id']
+    tested = client.post(service_path+'/test').json()
+    assert tested['last_test']['status'] == 'connected'
+    assert client.post(service_path+'/set-default').json()['is_default']
+
+    async def ensure(snapshot):
+        return None
+
+    async def generate(settings, snapshot, method, endpoint, secret='', **kwargs):
+        text = '\n'.join(part.get('text','') for part in kwargs['json']['messages'][1]['content'])
+        assert '原音轨识别语言代码为 en' in text and 'Original speech.' in text
+        assert '音轨已提取但未配置语音转写' not in text
+        return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(raw_ir(),ensure_ascii=False)}}]},
+                             request=httpx.Request('POST','http://127.0.0.1/test'))
+
+    monkeypatch.setitem(sys.modules,'app.services.screenplay_runtime',SimpleNamespace(ensure_local_service=ensure))
+    monkeypatch.setattr(service,'service_request',generate)
+    monkeypatch.setattr(service,'prepare_source',lambda *args: ([],{
+        'audio_relative_path':'reference.wav','audio_sha256':audio_sha,'audio_transcription':'not_configured',
+    }))
+    with factory() as session:
+        asset = m.ScreenplayInputAsset(input_mode='video',filename=video.name,relative_path=video.name,
+                                       sha256=service.sha(video.read_bytes()),metadata_json={'duration_seconds': 1,'has_audio':True})
+        session.add(asset);session.commit()
+        job = service.create_generation(session,settings,payload(model,input_mode='video',story_text='',asset_id=asset.id),
+                                        capability_test=True)
+        identifier = job.id
+        assert job.snapshot_json['speech_recognition_service']['model_sha256'] == 'a'*64
+    asyncio.run(service.process_job(settings,factory,identifier))
+    with factory() as session:
+        job = service.get_job(session, identifier)
+        assert job.status == 'awaiting_review', job.error_message
+        assert job.screenplay_json['source_transcript']['language'] == 'en'
+        assert job.screenplay_json['source_transcript']['speaker'] == 'unknown'
+        document = service.documents(session, identifier)[0]
+        word = '\n'.join(p.text for p in Document(settings.media_root/document.relative_path).paragraphs)
+        assert '原音轨识别语言：en' in word and '原音轨自动转写：Original speech.' in word
+    assert calls == ['/health','/health','/factory/transcribe']
+
+
 def test_explicit_retry_creates_new_idempotent_job_using_current_config_without_mutating_failure(factory,settings,model):
     with factory() as session:
         original=service.create_generation(session,settings,payload(model),capability_test=True)

@@ -8,7 +8,7 @@ import type {ScreenplayInputAsset,ScreenplayIRPreview,ScreenplayJob,ScreenplayMo
 import {ProductLibraryPicker,ReferenceVideoPicker,type ProductSelection} from '../components/ScreenplayLibraryInputs';
 import '../screenplay-generation.css';
 
-const labels:Record<string,string>={queued:'等待执行',running:'正在处理',preprocessing:'正在读取素材',generating:'模型正在生成',validating:'正在校验剧本结构',exporting:'正在生成 Word',awaiting_review:'等待内容审核',approved:'审核已通过',failed:'执行失败',unknown:'请求未返回 · 等待已结束',blocked:'条件未满足',export_failed:'Word 导出失败',cancelled:'已中止'};
+const labels:Record<string,string>={queued:'等待执行',running:'正在处理',preprocessing:'正在读取素材',transcribing:'正在识别原视频语音',generating:'模型正在生成',validating:'正在校验剧本结构',exporting:'正在生成 Word',awaiting_review:'等待内容审核',approved:'审核已通过',failed:'执行失败',unknown:'请求未返回 · 等待已结束',blocked:'条件未满足',export_failed:'Word 导出失败',cancelled:'已中止'};
 const modeLabels:Record<ScreenplayMode,string>={text:'文生剧本',image:'图片生剧本',video:'视频生剧本'};
 const fieldLabels:Record<string,string>={description:'描述',age:'年龄',identity:'身份',facial_features:'面容',hair:'发型',eyes:'眼睛',skin:'肤质',identifying_marks:'识别特征',body:'体态',style:'视觉风格',fixed_traits:'固定特征',variable_attributes:'可变特征',wardrobes:'服装',voice:'声音',voice_profile:'声音',location:'地点',time:'时间',weather:'天气',lighting:'灯光',layout:'空间布局',continuity:'连续性',action:'动作',action_order:'动作顺序',position:'站位',orientation:'朝向',expression:'表情',emotion:'情绪',eyeline:'视线',wardrobe:'服装',props:'道具',shot_size:'景别',camera_position:'机位',composition:'构图',lens:'焦段',start_state:'开始状态',end_state:'结束状态',transition:'转场',kind:'类型',text:'内容',name:'名称',volume:'音量',start_seconds:'开始秒',end_seconds:'结束秒',synopsis:'梗概',genre:'题材',target_duration_seconds:'目标时长（秒）',target_duration:'目标时长',shot_total_duration_seconds:'分镜合计时长（秒）',duration_conflict:'时长需核对',relationships:'人物关系',notes:'备注',title:'标题',beats:'动作节拍',wardrobe_states:'服装状态',prop_states:'道具状态',scene_state_key:'场景状态',state_change_reason:'状态变化原因',require_visual_review:'需要画面审核'};
 Object.assign(fieldLabels,{hook:'开场吸引点',target_audience:'目标观众',display_sequence:'产品展示顺序',call_to_action:'行动号召',evidence_sources:'卖点证据来源',product_id:'产品 ID',visible_state:'产品可见状态',display_features:'展示特征',on_screen_text:'屏幕文字',logo_review_required:'Logo或包装文字需人工复核',story_body:'剧情正文',aspect_ratio:'画幅',immutable_traits:'固定身份特征',angle:'角度',materials:'主要材质',speaker:'说话人',state:'状态',character_key:'所属人物标识',scene_key:'所属场景标识',key:'引用编号',spec:'制作设定',wardrobe_key:'服装资料编号',prop_key:'道具资料编号',production_rules_version:'制作规则版本',screenplay_schema_version:'剧本结构版本',template_version:'模板版本',parser_version:'解析器版本',video_prompt_compiler_version:'视频提示词版本'});
@@ -20,11 +20,24 @@ function valueText(value:unknown):string{
   return String(value);
 }
 function Fields({value}:{value?:Record<string,unknown>}){return <div className="screenplay-fields">{Object.entries(value||{}).filter(([key,item])=>item!==null&&item!==undefined&&valueText(item)&&!['character_id','source','provenance','requested_controls','visual_ids'].includes(key)).map(([key,item])=><p key={key}><strong>{fieldLabels[key]||key}：</strong>{valueText(item)}</p>)}</div>;}
+function displayLanguage(code?:string|null){
+  if(!code)return '待确认';
+  try{return new Intl.DisplayNames(['zh-CN'],{type:'language'}).of(code)||code;}
+  catch{return code;}
+}
 function Preview({ir}:{ir:ScreenplayIRPreview}){
+  const transcript=ir.source_transcript;
   const person=(key:string)=>ir.characters.find(item=>item.key===key)?.name||key;
   return <div className="screenplay-outline" aria-label="结构化剧本预览">
     <details open><summary>项目概述</summary><Fields value={ir.project}/></details>{ir.marketing?<details open><summary>产品营销方案与卖点依据</summary><Fields value={ir.marketing}/></details>:null}
-    {ir.source_transcript?.text?<details open><summary>视频音轨转写</summary><p>{ir.source_transcript.text}</p><p className="form-hint">这是实际音轨转写，文本准确性与说话人归属仍需核对。</p>{ir.source_transcript.segments?.map((segment,index)=><p key={index}><small>{segment.start??'—'}–{segment.end??'—'} 秒 · {segment.speaker==='unknown'||!segment.speaker?'说话人待确认':segment.speaker}</small> {segment.text}</p>)}</details>:null}
+    {transcript?.text?<details open><summary>视频音轨转写</summary>
+      <p><strong>识别语言</strong> {displayLanguage(transcript.language)}
+        {transcript.language&&typeof transcript.language_probability==='number'? ` · 模型置信度 ${(transcript.language_probability*100).toFixed(1)}%`:null}</p>
+      <p className="form-hint">转写文本与说话人归属仍需核对。</p>
+      {transcript.segments?.length?transcript.segments.map((segment,index)=><p key={index}>
+        <small>{segment.start??'—'}–{segment.end??'—'} 秒 · {segment.speaker==='unknown'||!segment.speaker?'说话人待确认':segment.speaker}</small> {segment.text}
+      </p>):<p>{transcript.text}</p>}
+    </details>:null}
     <details open><summary>人物设定 · {ir.characters.length} 人</summary>{ir.characters.map(item=><article key={item.key}><h4>{item.name}</h4><Fields value={item.profile}/><small>人物标识：{item.key}</small></article>)}</details>
     <details><summary>场景与环境 · {ir.scenes.length} 场</summary>{ir.scenes.map(item=><article key={item.key}><h4>{item.order||''} {item.name}</h4><Fields value={item.environment}/>{item.audio_events?.length?<p><strong>场景声音：</strong>{valueText(item.audio_events)}</p>:null}<small>场景标识：{item.key}</small></article>)}</details>
     {ir.shots.map((shot,index)=><details open key={shot.key}><summary>分镜 {index+1} · {shot.title} · {shot.duration_seconds} 秒</summary><p>场景：{ir.scenes.find(scene=>scene.key===shot.scene_key)?.name||shot.scene_key}</p><p>{shot.visual_prompt}</p>{shot.action?<p><strong>镜头动作：</strong>{shot.action}</p>:null}{shot.camera_move?<p><strong>运镜：</strong>{shot.camera_move}</p>:null}<Fields value={shot.photography}/>{shot.participants.map(participant=><div className="screenplay-person-performance" key={participant.character_key}><strong>{person(participant.character_key)}</strong><Fields value={participant.performance}/></div>)}{shot.dialogues.length?<div><h4>独立对白</h4><ol>{shot.dialogues.map((line,n)=><li key={n}><strong>{person(line.character_key)}：</strong>{line.text}{line.delivery&&Object.keys(line.delivery).length?<small> · {valueText(line.delivery)}</small>:null}</li>)}</ol></div>:<p>本镜无对白。</p>}{shot.products?.length?<div><h4>产品展示与外观连续性</h4>{shot.products.map((product,index)=><Fields key={index} value={product}/>)}</div>:null}{shot.audio_events?.length?<p><strong>环境与声音：</strong>{valueText(shot.audio_events)}</p>:null}<Fields value={shot.production}/><small>分镜标识：{shot.key}</small></details>)}

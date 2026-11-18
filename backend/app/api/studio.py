@@ -2,6 +2,7 @@
 import copy
 import asyncio
 from fastapi import APIRouter, Depends, Request
+from pydantic import Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app import models as m
@@ -10,6 +11,7 @@ from app.core.db import get_db
 from app.core.errors import AppError
 from app.schemas_studio import (PipelineStart, StudioOverview, StudioProject,
     ShotFramingOverview,ShotFramingUpdate,ShotFramingResult)
+from app.schemas_product_library import ShotProductReferencesEdit
 from app.services.studio_pipeline import create_pipeline, latest_run, overview, project_list, _capture_services
 from app.services.screenplay_production_status import sync_production_status
 
@@ -78,6 +80,11 @@ def _run(session, project_id):
     return run
 
 
+class ProductReferenceRetry(ShotProductReferencesEdit):
+    expected_run_id: str = Field(min_length=1, max_length=64)
+    node_id: str = Field(min_length=1, max_length=128)
+
+
 def _requeue_failed_node(entry):
     # Keep the definitive failure and its child for review. Output-only
     # rechecks continue using the original submitted child.
@@ -89,6 +96,124 @@ def _requeue_failed_node(entry):
     entry.pop('context_dispatch_wait', None)
     entry.pop('retry_after', None)
     entry.update(status='pending', child_id=retained_child, error=None, code=None)
+
+
+@router.post('/projects/{project_id}/retry-product-references', response_model=StudioOverview)
+async def retry_product_references(project_id: str, payload: ProductReferenceRetry, request: Request,
+                                   session: Session = Depends(get_db)):
+    from app.services.studio_project_guard import project_guard
+    async with project_guard(request.app, project_id):
+        session.expire_all()
+        try:
+            return _retry_product_references(session, request.app.state.settings, project_id, payload)
+        except Exception:
+            session.rollback()
+            raise
+
+
+def _retry_product_references(session, settings, project_id, payload):
+    from app.services.cinematic_quality import generation_inputs_hash
+    from app.services.context_production_inputs import collect_context_inputs
+    from app.services.product_library import is_product_reference_error, reference_selection, save_reference_selection
+
+    run = _run(session, project_id)
+    if run.id != payload.expected_run_id:
+        raise AppError(409, 'studio_retry_scope', '当前制作批次已变化，请刷新后重试')
+    if run.status not in {'paused', 'running', 'exceptions', 'completed_with_errors'}:
+        raise AppError(409, 'studio_product_retry_unavailable', '当前制作已变化或无法重试，请刷新并核对本次制作')
+    nodes = copy.deepcopy(run.nodes_json)
+    node = next((entry for entry in nodes if entry['id'] == payload.node_id), None)
+    if not node or node['kind'] != 'video' or node['status'] not in {'exception', 'failed'}:
+        raise AppError(409, 'studio_product_retry_unavailable', '只能为当前批次中已确认失败的分镜视频重选商品图')
+    shot_id = node['target_id']
+    child = session.get(m.GenerationJob, node['child_id']) if node.get('child_id') else None
+    if (not child or child.status != 'failed' or child.provider != 'comfyui_h3'
+            or child.project_id != project_id or child.shot_id != shot_id
+            or not is_product_reference_error(child.error_code, child.error_message)):
+        raise AppError(409, 'studio_product_retry_unavailable', '原任务没有已确认的商品参考身份异常，未重复提交')
+    if any(entry['status'] in {'dispatching', 'running', 'retrying'} for entry in nodes if entry is not node):
+        raise AppError(409, 'product_binding_busy', '制作批次仍有节点正在处理，请等待后重选商品图')
+
+    # A paused batch must not start unrelated pending work as a side effect of
+    # correcting one shot. Block only nodes that could proceed immediately.
+    if run.status == 'paused':
+        completed = {entry['id'] for entry in nodes if entry['status'] == 'succeeded'}
+        if any(entry.get('shot_id', entry['target_id']) != shot_id
+               and entry['status'] in {'pending', 'waiting_dependencies'}
+               and set(entry.get('dependencies', [])) <= completed for entry in nodes):
+            raise AppError(409, 'product_binding_busy', '本批次暂停时仍有其他待执行节点，请先处理这些节点')
+
+    shot = session.get(m.StoryboardShot, shot_id)
+    by_shot = copy.deepcopy(run.snapshot_json.get('h3_context_by_shot', {}))
+    references_changed = bool(run.snapshot_json.get('product_references_changed'))
+
+    def changed_frozen_shots():
+        changed = []
+        for target in set(run.snapshot_json.get('shot_ids', [])) | set(by_shot):
+            captured = by_shot.get(target, {}).get('inputs') or {}
+            original_shot = session.get(m.StoryboardShot, target)
+            if (not original_shot or original_shot.project_id != project_id or not captured
+                    or original_shot.revision != captured.get('shot_revision')
+                    or generation_inputs_hash(session, original_shot) != captured.get('generation_inputs_hash')):
+                changed.append(target)
+        return sorted(changed)
+
+    if references_changed:
+        changed = changed_frozen_shots()
+        if changed:
+            raise AppError(409, 'studio_product_retry_inputs_changed',
+                '本批次的分镜参考已另行修改，请先用「开始／增量续作」应用修改后再处理这些镜头：'+'、'.join(changed),
+                {'run_id': run.id, 'shot_ids': changed})
+    frozen = by_shot.get(shot_id, {})
+    before = frozen.get('inputs')
+    workflow = frozen.get('service', {}).get('h3_workflow')
+    previous = child.parameters_json or {}
+    if (not shot or shot.project_id != project_id or not before or not workflow
+            or previous.get('h3_workflow') != workflow
+            or (previous.get('context_inputs') or {}).get('fingerprint') != before.get('fingerprint')):
+        raise AppError(409, 'studio_retry_context_unavailable', '失败镜头缺少本项目的原始 Context-IR 输入快照')
+    if (shot.revision != before.get('shot_revision')
+            or generation_inputs_hash(session, shot) != before.get('generation_inputs_hash')):
+        raise AppError(409, 'studio_retry_context_changed', '上次失败后本镜素材或制作内容已变化，请核对后新建增量制作')
+
+    saved = {item['product_id']: item for item in reference_selection(session, project_id, shot_id)['products']}
+    if len(payload.products) != len(saved) or {item.product_id for item in payload.products} != set(saved):
+        raise AppError(422, 'product_reference_scope', '请提交本分镜已绑定的全部产品')
+    if any(item.keyframe_image_ids != saved[item.product_id]['keyframe_image_ids'] for item in payload.products):
+        raise AppError(422, 'studio_product_retry_video_only', '本次只需更改分镜视频的商品图；关键画面选图请单独保存')
+    if not any(set(item.video_image_ids) != set(saved[item.product_id]['video_image_ids']) for item in payload.products):
+        raise AppError(422, 'studio_product_retry_selection_unchanged', '请至少更改本分镜的一张商品视频参考图后再重试')
+
+    save_reference_selection(session, project_id, shot_id, ShotProductReferencesEdit(products=payload.products),
+                             settings=settings, commit=False, allow_stalled_run=True)
+    session.flush()
+    current = collect_context_inputs(session, settings, shot, prompt_override=before.get('prompt_override'),
+        instruction=before.get('instruction'), image_ids=before.get('explicit_visual_ids'),
+        motion_values=before.get('explicit_motion'), audio_policy=before.get('audio_policy'))
+
+    def other_references(inputs):
+        return [{key: value for key, value in record.items() if key != 'picture_index'}
+                for record in inputs.get('references', []) if record.get('role') != 'product']
+
+    unchanged_fields = ('shot_revision', 'script_revision_id', 'duration_seconds', 'aspect_ratio',
+                        'negative_prompt', 'motion_references', 'revision_constraints', 'effective_cinematography')
+    if (any(before.get(key) != current.get(key) for key in unchanged_fields)
+            or other_references(before) != other_references(current)):
+        raise AppError(409, 'studio_retry_context_changed', '本镜其他素材或制作内容已变化，请核对后新建增量制作')
+    frozen['inputs'] = current
+    _requeue_failed_node(node)
+    run.snapshot_json = {**run.snapshot_json, 'h3_context_by_shot': by_shot}
+    if references_changed:
+        run.snapshot_json = {**run.snapshot_json, 'product_references_changed': bool(changed_frozen_shots())}
+    run.nodes_json = nodes
+    run.status = 'queued'
+    run.error_message = None
+    session.add(m.AuditEvent(object_type='studio_run', object_id=run.id, action='product_reference_video_retry_requested',
+        details_json={'node_id': node['id'], 'shot_id': shot_id, 'previous_child_id': child.id,
+            'previous_input_fingerprint': before['fingerprint'], 'current_input_fingerprint': current['fingerprint']}))
+    sync_production_status(session, run)
+    session.commit()
+    return overview(session, project_id)
 
 
 @router.post('/projects/{project_id}/pause', response_model=StudioOverview)

@@ -4,6 +4,7 @@ from app.core.db import get_db
 from app.core.errors import AppError
 from app.schemas_product_library import ProductCreate,ProductEdit,ProductImagesEdit,ShotProductReferencesEdit,ExistingProjectProductBind,ProjectProductReferenceEdit
 from app.services import product_library as service
+from app.services.studio_project_guard import project_guard
 from app import models as m
 from sqlalchemy import select
 
@@ -20,8 +21,10 @@ def save_project_references(project_id:str,payload:ProjectProductReferenceEdit,r
 def selected_references(project_id:str,shot_id:str,session:Session=Depends(get_db)):
     return service.reference_selection(session,project_id,shot_id)
 @router.put('/projects/{project_id}/shots/{shot_id}/references')
-def save_selected_references(project_id:str,shot_id:str,payload:ShotProductReferencesEdit,session:Session=Depends(get_db)):
-    return service.save_reference_selection(session,project_id,shot_id,payload)
+async def save_selected_references(project_id:str,shot_id:str,payload:ShotProductReferencesEdit,request:Request,session:Session=Depends(get_db)):
+    async with project_guard(request.app,project_id):
+        session.expire_all()
+        return service.save_reference_selection(session,project_id,shot_id,payload,settings=request.app.state.settings)
 @router.get('')
 def listing(q:str='',category:str='',include_archived:bool=False,session:Session=Depends(get_db)):
     return service.list_products(session,q,category,include_archived)

@@ -156,6 +156,8 @@ def is_loopback_service(value: str) -> bool:
 
 
 def is_local_provider(provider: str, value: str, profile_settings=None) -> bool:
+    if provider == 'local_asr':
+        return is_loopback_service(value)
     if provider not in {'ffmpeg', 'comfyui', 'local_runtime', 'local_llm'}:
         return False
     if not value:

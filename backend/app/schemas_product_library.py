@@ -48,7 +48,7 @@ class ProductionPreferenceEdit(Strict):
     dialogue_audio_policy:Literal['auto','native','tts','skip']
 class ShotProductReferenceEdit(Strict):
     product_id:str
-    expected_revision:int=Field(ge=1)
+    expected_revision:int=Field(ge=0)
     video_image_ids:list[str]=Field(max_length=8)
     keyframe_image_ids:list[str]=Field(max_length=4)
 class ShotProductReferencesEdit(Strict):

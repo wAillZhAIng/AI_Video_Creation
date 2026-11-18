@@ -7,6 +7,7 @@ import { PageHeader, EmptyState, LoadingState, FormField } from '../components/u
 import { useStudio, StudioProjectPicker, StudioStatus, recordText, shotTime, studioAssetPath, studioVideoDuration } from '../lib/studio-ui';
 import { WordImportPanel } from '../components/WordImportPanel';
 import { ProjectProductPreparation } from '../components/ProjectProductPreparation';
+import { ProjectProductReferences, type ProductReferenceState } from '../components/ProjectProductReferences';
 import { ProjectProductionModels } from '../components/ProjectProductionModels';
 import { ProjectAudioPolicy } from '../components/ProjectAudioPolicy';
 import { ProjectVoicePreparation } from '../components/ProjectVoicePreparation';
@@ -27,6 +28,10 @@ const gpuReasonLabels:Record<string,string>={health_busy:'本地模型正占用G
 type VoicePreparationState = { ready:boolean;dirty:boolean;loading:boolean;busy:boolean;blockingReasons:string[] };
 type StudioRepairReport = { run_status:string; gpu_gate:{state:'idle'|'busy'|'unknown';reason:string}; actions:{code:string;status:string;message:string;visual_id?:string;provider_job_id?:string|null;references?:{shot_id:string;reference_count:number;roles:Record<string,number>}[]}[]; blockers:{node_id?:string;kind?:string;status?:string;code?:string;message:string}[];
   model_connections?: { service_id: string; name: string; model_id: string; status: string; message: string }[] };
+function isProductReferenceError(code:unknown,message:string){
+  return code==='product_reference_identity_conflict'||(code==='comfyui_execution_failed'&&
+    /商品参考身份不一致或无法确定|Model ImageCard did not establish one object subject for product-unit:/.test(message));
+}
 export function StudioPage() {
   const studio = useStudio();
   const { data, projectId, projects, loading } = studio;
@@ -50,7 +55,11 @@ export function StudioPage() {
   const [audioResolutionState,setAudioResolutionState]=useState<{scope:string;nodes:Record<string,boolean>}>({scope:'',nodes:{}});
   const audioResolutionBusy=audioResolutionState.scope===audioResolutionScope&&Object.values(audioResolutionState.nodes).some(Boolean);
   const onAudioResolutionBusy=useCallback((nodeId:string,value:boolean)=>{if(audioResolutionScopeRef.current===audioResolutionScope)setAudioResolutionState(previous=>({scope:audioResolutionScope,nodes:{...(previous.scope===audioResolutionScope?previous.nodes:{}),[nodeId]:value}}));},[audioResolutionScope]);
-  const pageBusy=Boolean(busy)||importReviewBusy||audioResolutionBusy;
+  const [productRepair,setProductRepair]=useState<{scope:string;nodeId:string}|null>(null);
+  const [productRepairState,setProductRepairState]=useState<(ProductReferenceState&{scope:string})|null>(null);
+  const repairNode=productRepair?.scope===audioResolutionScope?productRepair.nodeId:'';
+  const repairState=productRepairState?.scope===audioResolutionScope?productRepairState:null;
+  const pageBusy=Boolean(busy)||importReviewBusy||audioResolutionBusy||Boolean(repairState?.busy);
   const [voiceState,setVoiceState] = useState<VoicePreparationState & {projectId:string}>({projectId:'',ready:false,dirty:false,loading:true,busy:false,blockingReasons:[]});
   const onVoiceStateChange=useCallback((state:VoicePreparationState)=>setVoiceState({...state,projectId}),[projectId]);
   const voiceReady=voiceState.projectId===projectId&&voiceState.ready&&!voiceState.loading&&!voiceState.dirty&&!voiceState.busy;
@@ -69,19 +78,27 @@ export function StudioPage() {
   const [referenceState,setReferenceState]=useState({busy:false,dirty:false});
   const onReferenceStateChange=useCallback((state:{busy:boolean;dirty:boolean})=>setReferenceState(state),[]);
   const voiceUnsettled=(voiceState.projectId===projectId&&(voiceState.busy||voiceState.dirty))||referenceState.busy||referenceState.dirty;
-  const preparationUnsettled=voiceUnsettled||audioPolicyState.busy||audioPolicyState.dirty||modelState.busy||modelState.dirty||productReferenceState.busy||productReferenceState.dirty||framingState.busy||framingState.dirty;
+  const preparationUnsettled=voiceUnsettled||audioPolicyState.busy||audioPolicyState.dirty||modelState.busy||modelState.dirty||productReferenceState.busy||productReferenceState.dirty||framingState.busy||framingState.dirty||Boolean(repairState?.dirty);
   const activeRun=Boolean(data?.run&&!['completed','cancelled','failed','completed_with_errors','waiting_review'].includes(data.run.status));
+  const nodes = Array.isArray(data?.run?.nodes_json) ? data.run.nodes_json as Record<string, unknown>[] : [];
+  const completedNodes=new Set(nodes.filter(node=>node.status==='succeeded').map(node=>node.id));
+  const stalledProductRun=data?.run?.status==='running'&&
+    nodes.some(node=>node.kind==='video'&&node.status==='exception'&&isProductReferenceError(node.code,recordText(node.error)))&&
+    !nodes.some(node=>['dispatching','running','retrying','unknown'].includes(recordText(node.status))||
+      ['pending','waiting_dependencies'].includes(recordText(node.status))&&
+      (!Array.isArray(node.dependencies)||node.dependencies.every(dependency=>completedNodes.has(dependency))));
+  const productRunLocked=activeRun&&!['paused','exceptions'].includes(data?.run?.status||'');
   const productInputsChanged=Boolean(data?.run?.snapshot_json?.product_references_changed);
   const [focusPreparation,setFocusPreparation]=useState('');
   useEffect(()=>{if(projectId&&focusPreparation===projectId&&data?.project.id===projectId){const target=document.getElementById('project-voice-preparation');if(target){target.scrollIntoView?.({behavior:'smooth',block:'start'});setFocusPreparation('');}}},[projectId,focusPreparation,data?.project.id]);
   useEffect(()=>{if(!importReviewBusy)return;const guard=(event:MouseEvent)=>{if(event.button!==0||event.ctrlKey||event.metaKey||event.shiftKey||event.altKey)return;const target=event.target instanceof Element?event.target.closest('a[href]'):null;if(target){event.preventDefault();event.stopPropagation();setNotice('正在确认并保存剧本，请稍候再切换页面。');}};document.addEventListener('click',guard,true);return()=>document.removeEventListener('click',guard,true);},[importReviewBusy]);
   useEffect(()=>{
-    const busy=referenceState.busy||modelState.busy||audioPolicyState.busy||productReferenceState.busy||framingState.busy||audioResolutionBusy,dirty=referenceState.dirty||modelState.dirty||audioPolicyState.dirty||productReferenceState.dirty||framingState.dirty;
+    const busy=referenceState.busy||modelState.busy||audioPolicyState.busy||productReferenceState.busy||framingState.busy||audioResolutionBusy||repairState?.busy,dirty=referenceState.dirty||modelState.dirty||audioPolicyState.dirty||productReferenceState.dirty||framingState.dirty||repairState?.dirty;
     if((!busy&&!dirty)||voiceState.busy||voiceState.dirty)return;
     const unload=(event:BeforeUnloadEvent)=>{event.preventDefault();event.returnValue='';};
     const navigate=(event:MouseEvent)=>{if(event.defaultPrevented||event.button!==0||event.ctrlKey||event.metaKey||event.shiftKey||event.altKey)return;const link=event.target instanceof Element?event.target.closest<HTMLAnchorElement>('a[href]'):null;if(!link||link.hasAttribute('download')||(link.target&&link.target!=='_self'))return;const next=new URL(link.href,window.location.href),here=new URL(window.location.href);if(!['http:','https:'].includes(next.protocol)||next.origin===here.origin&&next.pathname===here.pathname&&next.search===here.search)return;if(busy){event.preventDefault();event.stopPropagation();setNotice('制作设置或人物参考图正在保存，请完成后再离开。');}else if(!window.confirm('制作设置或人物参考图有未保存的选择。确定放弃这些草稿并离开吗？')){event.preventDefault();event.stopPropagation();setNotice('已保留未保存的制作准备草稿。');}};
     document.addEventListener('click',navigate,true);window.addEventListener('beforeunload',unload);return()=>{document.removeEventListener('click',navigate,true);window.removeEventListener('beforeunload',unload);};
-  },[referenceState,modelState,audioPolicyState,productReferenceState,framingState,voiceState.busy,voiceState.dirty,audioResolutionBusy]);
+  },[referenceState,modelState,audioPolicyState,productReferenceState,framingState,voiceState.busy,voiceState.dirty,audioResolutionBusy,repairState]);
   async function perform(label: string, work: () => Promise<unknown>) {
     setBusy(label); setError(''); setNotice('');
     try { await work(); await studio.refreshList(); await studio.refreshAfterChange(); }
@@ -168,7 +185,6 @@ export function StudioPage() {
     }
   }
   const shots = data?.shots || [], characters = data?.characters || [], scenes = data?.scenes || [];
-  const nodes = Array.isArray(data?.run?.nodes_json) ? data.run.nodes_json as Record<string, unknown>[] : [];
   const videoCount = shots.filter(shot => shot.video?.relative_path).length;
   const finishedNodes = nodes.filter(node => ['succeeded', 'completed', 'reused', 'skipped'].includes(recordText(node.status))).length;
   const connections = repairReport?.model_connections || [];
@@ -212,7 +228,10 @@ export function StudioPage() {
     <section className="card studio-panel studio-preparation-step studio-role-settings" aria-label="第三步 角色设置"><p className="studio-step-label">第三步</p><h2>角色设置</h2><p>为每个角色保存声音与可选的人物参考图。绑定跟随角色 ID，未上传参考图时继续使用剧本描述和已有身份。</p>
     {projectId&&data?.project.id===projectId?<div id="project-voice-preparation"><ProjectVoicePreparation projectId={projectId} refreshKey={`${data?.script?.id||''}:${audioPolicyRevision}`} allowCloudCosts={cloudCosts} allowPaidFallback={paidFallback} disabled={pageBusy||Boolean(pendingImport)||quality.saving||(activeRun&&data.run?.status!=='paused')} onStateChange={onVoiceStateChange} onChanged={studio.refreshAfterChange}/></div>:null}
     {projectId&&data?.project.id===projectId?<ProjectCharacterReferences key={projectId} projectId={projectId} refreshKey={data.script?.id||''} disabled={pageBusy||Boolean(pendingImport)||(activeRun&&data.run?.status!=='paused')} onStateChange={onReferenceStateChange} onChanged={studio.refreshAfterChange}/>:<p className="form-hint">先导入剧本建立角色，再配置声音与人物参考图。</p>}
-    {projectId&&data?.project.id===projectId?<ProjectProductPreparation key={`products:${projectId}`} projectId={projectId} shots={shots.map(shot=>({id:shot.id,order:shot.order,title:shot.title}))} disabled={pageBusy||Boolean(pendingImport)||(activeRun&&data?.run?.status!=='paused')} onStateChange={onProductReferenceStateChange} onChanged={studio.refreshAfterChange}/>:null}
+    {projectId&&data?.project.id===projectId?<ProjectProductPreparation key={`products:${projectId}`} projectId={projectId}
+      shots={shots.map(shot=>({id:shot.id,order:shot.order,title:shot.title}))} bulkDisabled={productRunLocked}
+      disabled={pageBusy||Boolean(pendingImport)||Boolean(repairState?.dirty)||(productRunLocked&&!stalledProductRun)}
+      onStateChange={onProductReferenceStateChange} onChanged={studio.refreshAfterChange}/>:null}
     </section>
     {(error || studio.error) ? <div role="alert" className="inline-notice warning">{error || studio.error}<Link to="/settings">检查系统设置</Link></div> : null}
     {notice && !pendingImport ? <p className="inline-notice" role="status">{notice}</p> : null}
@@ -225,7 +244,7 @@ export function StudioPage() {
         {!data.run || ['completed','cancelled','failed','completed_with_errors','waiting_review'].includes(data.run.status) || (productInputsChanged||framingState.requiresNewRun)&&['paused','exceptions'].includes(data.run.status) ? <button className="button button-primary" disabled={pageBusy||preparationUnsettled||productReferenceState.overBudget||!voiceReady||!shots.length||quality.loading||quality.saving||!quality.profile||!quality.supported||!framingReady||Boolean(modelState.hasCloud&&!cloudCosts)} onClick={() => void control('start')}><Play size={15}/>开始／增量续作</button> : null}
         {data.run?.status === 'paused'&&!productInputsChanged&&!framingState.requiresNewRun ? <button className="button button-primary" disabled={pageBusy||preparationUnsettled||!framingReady||Boolean(modelState.hasCloud&&!cloudCosts)} onClick={() => void control('resume')}><Play size={15}/>继续制作</button> : null}
         {data.run && !['completed','cancelled','paused','failed','completed_with_errors'].includes(data.run.status) ? <button className="button button-secondary" disabled={pageBusy} onClick={() => void control('pause')}><Pause size={15}/>暂停后续任务</button> : null}
-        {data.run ? <button type="button" className="button button-secondary" disabled={pageBusy} onClick={() => void oneClickRepair()}><Wrench size={15}/>{busy==='repair'?'正在检查并恢复模型…':'一键修复'}</button> : null}
+        {data.run ? <button type="button" className="button button-secondary" disabled={pageBusy||Boolean(repairState?.dirty)} onClick={() => void oneClickRepair()}><Wrench size={15}/>{busy==='repair'?'正在检查并恢复模型…':'一键修复'}</button> : null}
         <Link className="button button-secondary" to={`/review?project=${encodeURIComponent(projectId)}`}>进入成片审核</Link></div></div>
         {repairError ? <p className="inline-notice warning" role="alert" aria-live="assertive">{repairError}</p> : null}
         {productInputsChanged?<p className="inline-notice">产品参考已更改。点击「开始／增量续作」使用新参考重新核对受影响镜头；已有视频保留。</p>:null}
@@ -248,7 +267,36 @@ export function StudioPage() {
       </section>
       {Boolean(data.exceptions?.length) ? <section className="card studio-panel studio-exceptions"><h2>需要处理的异常</h2><p>任务失败或条件缺失会保留真实错误。结果不明的服务请求须先核对，避免重复提交。</p>{data.exceptions?.map((item, index) => {
         const audioTooLong=Boolean(item.node_id)&&(item.code==='audio_longer_than_video'||recordText(item.message||item.error).includes('对白音频超过原片长度'));
-        return <article key={item.node_id || index}><div><strong>{recordText(item.message) || recordText(item.error)}</strong><small>{recordText(item.code)}{item.target_id ? ` · ${recordText(item.target_id)}` : ''}</small></div>{!audioTooLong&&item.node_id && ['failed','blocked','waiting_user','waiting_exception','exception'].includes(item.status) ? <button className="button button-secondary button-small" disabled={pageBusy} onClick={() => void control('retry', item.node_id)}>重试此任务</button> : null}{audioTooLong?<AudioDurationResolution key={`${audioResolutionScope}:${item.node_id}`} projectId={projectId} nodeId={String(item.node_id)} disabled={pageBusy} onBusyChange={value=>onAudioResolutionBusy(String(item.node_id),value)} onApplied={async()=>{if(audioResolutionScopeRef.current===audioResolutionScope)await studio.refreshAfterChange();}}/>:<Link to={item.kind?.includes('character') ? `/characters/${item.target_id}?project=${encodeURIComponent(projectId)}` : `/storyboard?project=${encodeURIComponent(projectId)}`}>查看并处理</Link>}</article>;
+        const nodeId=recordText(item.node_id),runId=recordText(data.run?.id),message=recordText(item.message)||recordText(item.error);
+        const targetId=recordText(item.target_id);
+        const frozenRun=data.run?.snapshot_json;
+        const frozenShot=frozenRun?.h3_context_by_shot?.[targetId]?.inputs?.screenplay_snapshot?.shot;
+        const frozenOrder=Array.isArray(frozenRun?.shot_ids)?frozenRun.shot_ids.indexOf(targetId)+1:0;
+        const shot=shots.find(shot=>shot.id===targetId)
+          ||(targetId&&frozenShot?.id===targetId?{id:targetId,order:frozenOrder,title:recordText(frozenShot.scene_title)||targetId}:null);
+        const retryable=['failed','blocked','waiting_user','waiting_exception','exception'].includes(item.status);
+        const productMismatch=Boolean(runId&&nodeId&&shot&&retryable&&item.kind==='video'
+          &&isProductReferenceError(item.code,message));
+        const repairing=productMismatch&&repairNode===nodeId;
+        return <article key={item.node_id || index}>
+          <div><strong>{message}</strong><small>{recordText(item.code)}{item.target_id ? ` · ${recordText(item.target_id)}` : ''}</small></div>
+          {productMismatch?<p className="form-hint">本镜产品图未通过商品主体识别。请选择清楚显示同一商品的照片，或清空本镜的视频产品图。</p>:null}
+          {productMismatch?<button type="button" className="button button-secondary button-small" aria-expanded={repairing}
+            disabled={pageBusy||repairing||productReferenceState.dirty||productReferenceState.busy||Boolean(repairState?.dirty)}
+            onClick={()=>setProductRepair({scope:audioResolutionScope,nodeId})}>重新选择此镜头商品图</button>:
+            !audioTooLong&&nodeId&&retryable?<button type="button" className="button button-secondary button-small" disabled={pageBusy||Boolean(repairState?.dirty)} onClick={()=>void control('retry',nodeId)}>重试此任务</button>:null}
+          {repairing&&shot?<ProjectProductReferences key={`${audioResolutionScope}:${nodeId}`} projectId={projectId} shots={[shot]}
+            retry={{runId,nodeId,shotId:shot.id}} disabled={pageBusy}
+            onStateChange={state=>{if(audioResolutionScopeRef.current===audioResolutionScope)setProductRepairState({...state,scope:audioResolutionScope});}}
+            onCancel={()=>setProductRepair(null)}
+            onChanged={async()=>{
+              if(audioResolutionScopeRef.current!==audioResolutionScope)return;
+              setNotice(`${shot.order>0?`第 ${shot.order} 镜`:'此分镜'}已保存新的视频商品图并提交重试。`);
+              await studio.refreshAfterChange();
+            }}/>:null}
+          {audioTooLong?<AudioDurationResolution key={`${audioResolutionScope}:${item.node_id}`} projectId={projectId} nodeId={String(item.node_id)} disabled={pageBusy} onBusyChange={value=>onAudioResolutionBusy(String(item.node_id),value)} onApplied={async()=>{if(audioResolutionScopeRef.current===audioResolutionScope)await studio.refreshAfterChange();}}/>:
+            !productMismatch?<Link to={item.kind?.includes('character') ? `/characters/${item.target_id}?project=${encodeURIComponent(projectId)}` : `/storyboard?project=${encodeURIComponent(projectId)}`}>查看并处理</Link>:null}
+        </article>;
       })}</section> : null}
       <div className="studio-two-column"><section className="card studio-panel"><h2>人物与复用身份</h2>{characters.length ? characters.map((character, index) => <article className="studio-asset-row" key={character.id || character.character_id || index}>{studioAssetPath(character) ? <img src={api.mediaUrl(studioAssetPath(character))} alt={recordText(character.display_name || character.name)}/> : <span className="studio-avatar-placeholder" aria-hidden="true">人</span>}<div><strong>{recordText(character.display_name || character.name) || recordText(character.character_id)}</strong><p>{recordText(character.description || character.identity || character.status)}</p><small>{recordText(character.character_id || character.id)}</small>{character.acceptance?.actor==='automation'&&character.current_approved_version_id!==character.version_id?<p className="studio-muted">自动技术采纳，待视频审片</p>:null}</div><Link to={`/characters/${character.character_id || character.id}?project=${encodeURIComponent(projectId)}`}>查看／修改</Link></article>) : <p>文档尚未建立人物关联。</p>}</section>
       <section className="card studio-panel"><h2>场景与环境素材</h2>{scenes.length ? scenes.map((scene, index) => <article className="studio-asset-row" key={scene.id || scene.scene_id || index}>{studioAssetPath(scene) ? <img src={api.mediaUrl(studioAssetPath(scene))} alt={recordText(scene.name || scene.title)}/> : null}<div><strong>{recordText(scene.name || scene.title || scene.scene_title)}</strong><p>{recordText(scene.description || scene.location || scene.status)}</p><small>{recordText(scene.scene_id || scene.id)}</small></div><Link to={`/storyboard?project=${encodeURIComponent(projectId)}`}>查看／修改</Link></article>) : <p>文档尚未建立场景记录。</p>}</section></div>
