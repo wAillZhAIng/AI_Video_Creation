@@ -12,9 +12,10 @@ import pytest
 from sqlalchemy import event, func, select
 
 from app import models as m
+from app.services.cinematic_import import build_ir
 from app.services.studio_import import content_fingerprint, language_extract
 from app.services.word_duration import parse_shot_duration
-from app.services.word_screenplay import read_blocks
+from app.services.word_screenplay import parse_blocks, read_blocks
 
 
 def screenplay(*, same_scene=False, second_weather='雨', extra_line='', name='赵舟', stable='studio_zhaozhou',
@@ -169,6 +170,65 @@ def test_structured_word_saves_existing_project_preview_without_waiting_for_a_mo
     assert saved.status_code == 200 and saved.json()['project_id'] == project['id'], saved.text
     assert len(saved.json()['shot_ids']) == 2
     assert len(client.get('/api/projects').json()) == 1
+
+
+def test_word_cast_unifies_numbered_headings_annotated_rosters_and_short_names(client):
+    doc = Document()
+    for text in (
+        '人物设定', '人物 人物甲 林知秋', '年龄：25', '身份：制陶师',
+        '角色乙：周向阳', '年龄：28', '身份：店主',
+        '正文剧情', '场景 1 工作室', '分镜 1 交谈', '画面：两人在桌旁交谈。',
+        '出场人物：林知秋（25岁，制陶师（负责制作、上釉））；周向阳（28岁，店主）',
+        '表演：知秋｜动作=放下杯子；情绪=平静\n向阳｜动作=点头；情绪=专注',
+        '对白：周向阳：我来看看。\n林知秋：请坐。\n周向阳：谢谢。',
+        '分镜 2 点头', '画面：两人看向杯子。',
+        '出场人物：林知秋、周向阳（均为成年、虚构人物）', '表演：人物甲｜动作=点头',
+        '对白：周向阳（轻声）：很好。', '字幕：待审核',
+    ):
+        doc.add_paragraph(text)
+    word = BytesIO()
+    doc.save(word)
+    response = upload(client, word.getvalue())
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result['status'] == 'pending_review' and result['parser']['language_model_called'] is False
+    preview = result['preview']
+    people = {person['name']: person for person in preview['characters']}
+    assert {name: (person['profile']['age'], person['profile']['description']) for name, person in people.items()} == {
+        '林知秋': (25, '制陶师'), '周向阳': (28, '店主'),
+    }
+    keys = {name: person['key'] for name, person in people.items()}
+    first, second = preview['shots']
+    for shot in (first, second):
+        assert {person['character_key'] for person in shot['participants']} == set(keys.values())
+        assert len(shot['participants']) == 2
+    assert {person['character_key']: person['performance']['action'] for person in first['participants']} == {
+        keys['林知秋']: '放下杯子', keys['周向阳']: '点头',
+    }
+    assert [(line['character_key'], line['text']) for line in first['dialogues']] == [
+        (keys['周向阳'], '我来看看。'), (keys['林知秋'], '请坐。'), (keys['周向阳'], '谢谢。'),
+    ]
+    assert second['dialogues'][0]['delivery']['emotion'] == '轻声'
+    assert second['participants'][0]['performance']['action'] == '点头'
+    confirmed = client.post(result['preview_url'] + '/confirm', json={
+        'revision': result['revision'], 'duplicate_strategy': 'new_project',
+    })
+    assert confirmed.status_code == 200, confirmed.text
+    assert len(confirmed.json()['new_characters']) == 2
+
+
+def test_ambiguous_short_name_and_malformed_cast_stay_in_review():
+    lines = [
+        '人物设定', '人物甲 林知秋', '人物乙 陈知秋', '正文剧情', '场景 1 工作室',
+        '分镜 1 交谈', '画面：两人在桌前。', '出场人物：林知秋（25岁，制陶师、陈知秋',
+        '对白：知秋：我来吧。', '对白：人物乙：谢谢。',
+    ]
+    blocks = [{'id': f'paragraph:{i}', 'kind': 'paragraph', 'text': text} for i, text in enumerate(lines)]
+    preview = build_ir(blocks, parse_blocks)
+    assert {person['name'] for person in preview['characters']} == {'林知秋', '陈知秋'}
+    assert {item['text'] for item in preview['unrecognized']} == {lines[-3], lines[-2]}
+    assert len(preview['shots'][0]['dialogues']) == 1
+    assert preview['shots'][0]['dialogues'][0]['character_key'] == preview['characters'][1]['key']
 
 
 def test_first_word_import_uses_the_selected_empty_project_without_revision_selection(client):

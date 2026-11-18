@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from app.core.errors import AppError
 from app.schemas_cinematic import ScreenplayIR
 from app.services.cinematic_rules import rules_bundle,field_provenance
+from app.services.word_cast import character_heading
 
 
 def paragraph(text,source):return {'id':source,'kind':'paragraph','style':'Compatibility normalized','text':text,'heading_level':None}
@@ -51,10 +52,9 @@ def normalize_blocks(blocks,rules):
             text='人物设定';in_people=True;scene=shot=False
         elif heading in ['故事梗概','剧情梗概','Synopsis']:text='梗概';in_people=False
         elif heading in ['剧本正文','剧情正文','故事正文','SCREENPLAY']:text='正文剧情';in_people=False
-        character=re.match(r'^(?:人物|角色|Character|CHARACTER)\s*(?:\d+|[一二三四五六七八九十])?\s*[:： -]\s*(.+)$',text)
+        character = character_heading(text)
         if character and not scene:
-            text='人物：'+character[1];names.append(character[1].strip());in_people=True
-        elif re.match(r'^(人物|角色)\s+\S+',text) and not scene:names.append(re.sub(r'^(人物|角色)\s+','',text).strip());in_people=True
+            names.append(character[0]);in_people=True
         compact=re.match(r'^([\u4e00-\u9fa5A-Za-z·]{2,20})[（(](\d{2})\s*岁?[,，、]?\s*(.*)[）)]$',text)
         if compact and in_people and not scene:
             name,age,identity=compact.groups();names.append(name)

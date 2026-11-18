@@ -11,6 +11,7 @@ from sqlalchemy import select, func
 from app.core.errors import AppError
 from app.services.cinematic_rules import field_provenance
 from app.services.imports import parse_uploaded_document
+from app.services.word_cast import cast_entries, character_heading, name_without_annotation
 from app.services.word_duration import parse_shot_duration
 from app.models import (Character, CharacterVersion, CharacterAlias, WordImport, Project, ScriptRevision,
     SourceDocument, Scene, StoryboardShot, ShotDetail, ShotCharacter, DialogueLine, AudioEvent)
@@ -68,7 +69,17 @@ def parse_blocks(blocks):
                'characters':[],'scenes':[],'shots':[],'unrecognized':[],'parser':'local_template_rules_v1'}
     person = scene = shot = None
     section = ''
-    name_map = {};declared_names=set();ambiguous_names=set()
+    name_map = {}
+    declared_names = set()
+    ambiguous_names = set()
+    local_labels = {}
+    ambiguous_labels = set()
+
+    def bind_label(label, item):
+        prior = local_labels.setdefault(label, item)
+        if prior is not item:
+            ambiguous_labels.add(label)
+
     def ensure_person(name,source,declaration=False):
         name = name.strip()
         if declaration and name in declared_names:
@@ -80,17 +91,48 @@ def parse_blocks(blocks):
             item={'key':'person_'+digest(name)[:12],'name':name,'aliases':[],'profile':{},'source':[source], 'decision':'new','match_character_id':None}
             preview['characters'].append(item); name_map[name]=item
         return name_map[name]
-    def participate(name,source):
-        stable=re.match(r'^.+?[\[（(]([A-Za-z0-9_-]+)[\]）)]$',name.strip())
-        if stable and stable[1] in name_map:name=stable[1]
-        if name.strip() in ambiguous_names:
-            original=name.strip();name=original+'（同名说话人待确认）'
-            if name not in name_map:
-                item=ensure_person(name,source);item['decision']='pending';item['unresolved_name']=original
-        p=ensure_person(name,source)
-        if not any(x['character_key']==p['key'] for x in shot['participants']):
-            shot['participants'].append({'character_key':p['key'],'performance':{},'source':[source]})
-        return next(x for x in shot['participants'] if x['character_key']==p['key'])
+
+    def short_name_matches(label):
+        if not re.fullmatch(r'[\u4e00-\u9fff]{2}', label):
+            return []
+        return [name for name in declared_names
+                if re.fullmatch(r'[\u4e00-\u9fff]{3,4}', name) and name.endswith(label)]
+
+    def resolve_person(label, source):
+        stable = re.fullmatch(r'.+?[\[（(]([A-Za-z0-9_-]+)[\]）)]', label)
+        if stable and stable[1] in local_labels and stable[1] not in ambiguous_labels:
+            return local_labels[stable[1]]
+        name = label
+        if name not in name_map and name not in local_labels:
+            name = name_without_annotation(label)
+        if name in name_map:
+            if name in ambiguous_names:
+                pending = ensure_person(name + '（同名说话人待确认）', source)
+                pending.update(decision='pending', unresolved_name=name)
+                return pending
+            return name_map[name]
+        if name in ambiguous_labels:
+            return None
+        if name in local_labels:
+            return local_labels[name]
+        candidates = short_name_matches(name)
+        if len(candidates) > 1 or (candidates and candidates[0] in ambiguous_names):
+            return None
+        return name_map[candidates[0]] if candidates else ensure_person(name, source)
+
+    def participate(label, source, original_text):
+        person = resolve_person(label.strip(), source) if label.strip() else None
+        if person is None:
+            preview['unrecognized'].append({'source':source,'text':original_text,'reason':'人物称谓无法唯一对应，请核对原文'})
+            return None
+        for participant in shot['participants']:
+            if participant['character_key'] == person['key']:
+                if source not in participant['source']:
+                    participant['source'].append(source)
+                return participant
+        participant = {'character_key':person['key'],'performance':{},'source':[source]}
+        shot['participants'].append(participant)
+        return participant
     env_fields={'地点':'location','时间':'time','天气':'weather','内外景':'interior_exterior','空间布局':'layout','环境':'description','氛围':'atmosphere','灯光':'lighting','主色调':'palette','关键道具':'props','连续性':'continuity'}
     perf_fields={'称谓':'scene_name','动作':'action','动作顺序':'action_order','姿态':'posture','路线':'route','互动':'interaction','表情':'expression','情绪':'emotion','情绪变化':'emotion_change','视线':'eyeline','位置':'position','朝向':'orientation','前后景':'depth','声音':'voice_profile','语速':'speed','音高':'pitch','发声状态':'vocal_state','服装':'wardrobe','发型':'hair','妆容':'makeup','道具':'props','连续性':'continuity'}
     camera_fields={'景别':'shot_size','机位':'camera_position','角度':'angle','构图':'composition','焦段':'lens','开始状态':'start_state','结束状态':'end_state','转场':'transition','衔接':'continuity'}
@@ -99,6 +141,7 @@ def parse_blocks(blocks):
     perf_fields.update({label:key for key,label in cinematic_rules['field_labels'].items() if key in cinematic_rules['fields']['action'] or key in cinematic_rules['performance_state_fields']})
     env_fields.update({label:key for key,label in cinematic_rules['field_labels'].items() if key in cinematic_rules['fields']['scene']})
     titles={b['id']:b.get('style','') for b in blocks if b.get('style') in ('Title','Subtitle')}
+    performance_source = None
     for text,source in block_lines(blocks):
         text=text.strip()
         if not text: continue
@@ -108,9 +151,14 @@ def parse_blocks(blocks):
             continue
         if text in ('项目基本信息','项目资料','人物设定','场景设定','正文剧情','分镜正文','音频信息','连续性要求','额外约束','全剧梗概','本集梗概','梗概','编写说明','制作资料'):
             section=text; person=None; shot=None; continue
-        found=re.match(r'^(?:人物|角色)(?:\s*[:：]\s*|\s+)(.+)$',text)
-        if found and section not in ('正文剧情','分镜正文'):
-            person=ensure_person(found[1],source,True); shot=None; continue
+        declared = character_heading(text)
+        if declared and section not in ('正文剧情','分镜正文'):
+            name, slot = declared
+            person = ensure_person(name, source, True)
+            if slot:
+                bind_label(slot, person)
+            shot = None
+            continue
         found=re.match(r'^场景\s*([A-Za-z\d一二三四五六七八九十]+)[\s：:.、-]*(.*)$',text)
         if found:
             scene={'key':'scene_'+str(len(preview['scenes'])+1),'name':found[2] or '场景'+found[1],'order':len(preview['scenes'])+1,'environment':{},'source':[source]}
@@ -133,17 +181,26 @@ def parse_blocks(blocks):
             field={'年龄':'age','年龄范围':'age_range','身份':'description','外观':'facial_features','性格':'personality','声音':'voice_profile','声音特征':'voice_profile','服装':'wardrobe','服装基准':'wardrobe','发型':'hair','肤质':'skin','风格':'style','人物关系':'relationships','人物ID':'character_id','眼睛':'eyes','眉毛':'eyebrows','鼻部':'nose','嘴唇':'lips','下颌':'jaw','发际线':'hairline','体态':'body','肩部':'shoulders','手部':'hands','稳定识别特征':'marks','动作习惯':'movement_style','固定身份特征':'immutable_traits'}.get(key)
             if key=='别名':
                 person['aliases']=[x.strip() for x in re.split('[、,，/]',value) if x.strip()]
-                for alias in person['aliases']: name_map[alias]=person
+                for alias in person['aliases']: bind_label(alias, person)
             elif field:
                 if field=='age' and re.fullmatch(r'\d+\s*岁?',value): value=int(re.search(r'\d+',value)[0])
                 person['profile'][field]=value
-                if field=='character_id':name_map[value]=person
+                if field=='character_id':bind_label(value, person)
             else: preview['unrecognized'].append({'source':source,'text':text,'reason':'人物字段待确认'})
             continue
         if shot:
+            # Word soft line breaks can continue a performance paragraph without a repeated label.
+            continuation = re.match(r'^([^:：｜|]+)[｜|]\s*([^=＝:：｜|]+)[=＝:：]', text)
+            if source == performance_source and continuation and continuation[2].strip() in perf_fields:
+                key, value = '表演', text
             if key in ('出场人物','参与人物'):
-                for name in re.split('[、,，]',value):
-                    if name.strip(): participate(name,source)
+                try:
+                    entries = cast_entries(value)
+                except ValueError as exc:
+                    preview['unrecognized'].append({'source':source,'text':text,'reason':str(exc)})
+                else:
+                    for label in entries:
+                        participate(label, source, text)
             elif key in ('画面','画面描述','视觉重点'): shot['visual_prompt']=value
             elif key=='动作': shot['action']=value
             elif key in ('运镜','镜头运动'):
@@ -164,9 +221,12 @@ def parse_blocks(blocks):
                     shot['suggested'] = [x for x in shot['suggested'] if x != 'duration_seconds']
             elif key in camera_fields: shot['photography'][camera_fields[key]]=value
             elif key=='表演':
+                performance_source = source
                 bits=re.split('[｜|]',value,maxsplit=1)
                 if len(bits)==2:
-                    p=participate(bits[0],source)
+                    p=participate(bits[0], source, text)
+                    if p is None:
+                        continue
                     for pair in re.split('[；;｜|]',bits[1]):
                         kv=re.split('[=＝:：]',pair,maxsplit=1)
                         if len(kv)==2 and kv[0].strip() in perf_fields: p['performance'][perf_fields[kv[0].strip()]]=kv[1].strip()
@@ -174,14 +234,16 @@ def parse_blocks(blocks):
                 else: preview['unrecognized'].append({'source':source,'text':text,'reason':'表演写法需为 人物｜动作=…；情绪=…'})
             elif key in ('环境声','音效','音乐'):
                 shot['audio_events'].append({'kind':{'环境声':'ambience','音效':'sfx','音乐':'music'}[key],'description':value,'source':[source]})
-            elif key=='对白' or key in name_map:
+            elif key=='对白' or key in name_map or key in local_labels or name_without_annotation(key) in name_map:
                 spoken=re.split('[:：]',value,maxsplit=1) if key=='对白' else [key,value]
                 if len(spoken)==2:
                     speaker=spoken[0].strip(); delivery={}
                     m=re.match(r'(.+?)[（(](.+)[）)]$',speaker)
-                    if m: speaker=m[1];delivery['emotion']=m[2]
-                    p=participate(speaker,source)
-                    shot['dialogues'].append({'character_key':p['character_key'],'text':spoken[1].strip(),'delivery':delivery,'source':[source]})
+                    if m and m[2] not in local_labels and speaker not in name_map and speaker not in local_labels:
+                        speaker=m[1].strip();delivery['emotion']=m[2]
+                    p=participate(speaker, source, text)
+                    if p is not None:
+                        shot['dialogues'].append({'character_key':p['character_key'],'text':spoken[1].strip(),'delivery':delivery,'source':[source]})
                 else: preview['unrecognized'].append({'source':source,'text':text,'reason':'对白缺少说话人'})
             else: preview['unrecognized'].append({'source':source,'text':text,'reason':'镜头正文待归类'})
             continue
