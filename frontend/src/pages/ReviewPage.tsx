@@ -24,6 +24,7 @@ import { useToast } from "../components/ToastProvider";
 import { Badge, EmptyState, ErrorState, FormField, LoadingState, PageHeader } from "../components/ui";
 
 const defaultInstruction = "保持当前绑定人物的脸型、发型、固定特征和服装不变；镜头运动更缓慢，保持动作连续，避免手部穿模。";
+const activeRevisionStatuses = ['queued', 'running', 'submitting', 'submitted', 'postprocessing'];
 type RevisionFailure = { videoId: string; stage: 'preview' | 'submit' | 'processing'; message: string; referenceError: boolean; input?: VideoRevisionInput };
 const isReferenceError = (message: string, code?: string | null) => /产品|product|identity|身份|人物参考/i.test(`${code ?? ''} ${message}`);
 
@@ -69,6 +70,8 @@ export function ReviewPage() {
   selectedVersion.current=selected;
   const processing = (selected?.metadata?.revision_postprocess ?? selected?.metadata_json?.revision_postprocess) as {state?:string;job_id?:string}|undefined;
   const recovery = (selected?.metadata?.revision_processing_recovery ?? selected?.metadata_json?.revision_processing_recovery) as {available?:boolean;required?:boolean;state?:string;reason?:string;final_video_id?:string}|undefined;
+  const lastRevision = (selected?.metadata?.latest_revision_job ?? selected?.metadata_json?.latest_revision_job) as
+    {id:string;status:string;error_message?:string|null}|undefined;
   const incompleteRevision = Boolean(processing && processing.state !== 'ready') || Boolean(recovery?.required && recovery.state !== 'ready');
   const reviewedRevision = revisionPreview?.videoId === selectedId ? revisionPreview : null;
   const selectedRevisionError = revisionError?.videoId === selectedId && (!revisionError.input ||
@@ -193,10 +196,13 @@ export function ReviewPage() {
     // A project reset must restore its selected raw revision even if the
     // processing metadata has not changed. Old-project details may arrive
     // while the next project's list is loading, so check ownership first.
-    if (projectId && (selected?.projectId ?? selected?.project_id) === projectId && processing?.state === 'processing' && processing.job_id) {
+    if (!projectId || (selected?.projectId ?? selected?.project_id) !== projectId) return;
+    if (processing?.state === 'processing' && processing.job_id) {
       setRevisionJobId(processing.job_id);setRevisionJobPhase('postprocessing');
+    } else if (lastRevision && activeRevisionStatuses.includes(lastRevision.status)) {
+      setRevisionJobId(lastRevision.id);setRevisionJobPhase(lastRevision.status);
     }
-  }, [projectId,selected?.projectId,selected?.project_id,processing?.job_id,processing?.state]);
+  }, [projectId,selected?.projectId,selected?.project_id,processing?.job_id,processing?.state,lastRevision?.id,lastRevision?.status]);
 
   useEffect(() => {
     if (!revisionJobId) return;
@@ -209,7 +215,7 @@ export function ReviewPage() {
         const job=await api.getJob(revisionJobId);
         if (!live) return;
         setRevisionJobPhase(job.status);
-        if (!["queued","running","submitting","submitted","postprocessing"].includes(job.status)) {
+        if (!activeRevisionStatuses.includes(job.status)) {
           await loadVideos(projectId);
           if (!live) return;
           const plan=(job.parameters?.revision_postprocess ?? job.parameters_json?.revision_postprocess) as {state?:string;final_video_id?:string;error?:{message?:string;code?:string}}|undefined;
@@ -273,7 +279,10 @@ export function ReviewPage() {
       }
       const result = await api.reviseVideo(selected.id, input);
       clearRevisionPreview();
-      if (result.job) setRevisionJobId(result.job.id);
+      if (result.job) {
+        setRevisionJobId(result.job.id);
+        setRevisionJobPhase('submitted');
+      }
       await loadVideos(projectId);
       notify("修订生成已提交；旧视频仍保留在版本历史中", "success");
     } catch (cause) {
@@ -518,7 +527,10 @@ export function ReviewPage() {
                     基于当前版本重新生成
                   </button>
                 </div>
-                {revisionJobId?<p role="status">{revisionJobPhase==='postprocessing'?'正在补齐修订的配音与画质，完成后可审核最终版本':revisionJobPhase==='connection_wait'?'连接暂时中断，正在等待读取原任务状态；请勿重复提交':'修订任务正在执行，旧版本与原片继续保留'}</p>:null}
+                {revisionJobId?<p role="status">{revisionJobPhase==='postprocessing'?'正在补齐修订的配音与画质，完成后可审核最终版本':revisionJobPhase==='connection_wait'?'连接暂时中断，正在等待读取原任务状态；请勿重复提交':'修订任务已提交，等待或执行参考图检查、Context-IR 编译及生成。'}</p>:null}
+                {!revisionJobId && !selectedRevisionError && lastRevision?.error_message
+                    && ['failed','cancelled','unknown'].includes(lastRevision.status)
+                  ? <p className="inline-notice" role="status">上次修订 · {lastRevision.error_message}</p> : null}
                 {recovery?.required && incompleteRevision?<div><p>{recovery.reason || '此历史修订仅保存了原片，尚未补齐原来的配音与画质。'}</p>{recovery.available?<button type="button" className="button button-secondary" disabled={Boolean(busy)||Boolean(revisionJobId)} onClick={()=>void resumeProcessing()}>恢复此修订的配音与画质</button>:null}</div>:null}
                 {recovery?.state==='ready'&&recovery.final_video_id&&recovery.final_video_id!==selectedId?<button type="button" className="button button-secondary" onClick={()=>setSelectedId(recovery.final_video_id!)}>查看配音与画质已完成版本</button>:null}
                 {shotVersions.length > 1 ? (

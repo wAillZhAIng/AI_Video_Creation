@@ -931,6 +931,7 @@ async def generate_for_shot(
     legacy_production: bool = False,
     production_scope: dict | None = None,
     revision_postprocess: dict | None = None,
+    revision_source: VideoRevision | None = None,
 ) -> tuple[GenerationJob, VideoRevision | None]:
     settings = settings_from(request)
     if revision_postprocess:
@@ -1021,7 +1022,8 @@ async def generate_for_shot(
         'service_snapshot','screenplay_snapshot','script_revision_id','output_relative_dir','character_version_id',
         'duration_seconds','negative_prompt','reference_manifest','motion_references','motion_inputs_hash',
         'actual_motion_reference_uploads','actual_reference_uploads','h3_workflow','context_inputs','context_silent','context_spoken_language',
-        'context_ir_enabled','context_ir_version','quality_request','production_scope','revision_postprocess')}
+        'context_ir_enabled','context_ir_version','quality_request','production_scope','revision_postprocess',
+        'based_on_video_id','original_prompt')}
     configured = service_snapshot['settings'] if service_snapshot else {}
     from app.services.model_lab import default_generation_parameters
     saved_defaults=default_generation_parameters(session,service_snapshot) if service_snapshot else {}
@@ -1048,6 +1050,10 @@ async def generate_for_shot(
         effective_parameters['service_snapshot'] = service_snapshot
     if production_scope:
         effective_parameters['production_scope'] = production_scope
+    if revision_source is not None:
+        from app.services.video_revisions import revision_source_job
+        source_job = revision_source_job(session, shot, revision_source)
+        effective_parameters.update(based_on_video_id=revision_source.id, original_prompt=source_job.prompt)
     job = GenerationJob(
         project_id=shot.project_id,
         shot_id=shot.id,
@@ -1240,12 +1246,14 @@ async def retry_job(request: Request, job_id: str, session: Session = Depends(ge
     params.pop("aspect_ratio", None)
     params.pop("negative_prompt", None)
     context_job = previous if previous.parameters_json.get('h3_workflow') else None
+    source_video_id = previous.parameters_json.get('based_on_video_id')
+    revision_source = session.get(VideoRevision, source_video_id) if source_video_id else None
     job, video = await generate_for_shot(request, session, shot,
         GenerationRequest(seed=previous.seed, parameters=params, service_id=selected_snapshot.get('service_id'),
                           model_id=selected_snapshot.get('model_id'), prompt_override=prompt_override),
         instruction=instruction, retry_count=previous.retry_count + 1, frozen_job=context_job,
         frozen_service=(selected_snapshot or None) if not context_job else None, legacy_production=not context_job,
-        revision_postprocess=previous.parameters_json.get('revision_postprocess'))
+        revision_postprocess=previous.parameters_json.get('revision_postprocess'), revision_source=revision_source)
     return {"job": row_dict(job), "video_revision": row_dict(video) if video else None, "retried_from": previous.id}
 
 
@@ -1281,6 +1289,19 @@ def get_video(video_id: str, request: Request, session: Session = Depends(get_db
     result["quality_checks"] = [row_dict(row) for row in session.scalars(select(QualityCheck).where(QualityCheck.video_revision_id == video.id).order_by(QualityCheck.created_at)).all()]
     from app.services.revision_postprocess import recovery_status
     result['metadata_json']['revision_processing_recovery'] = recovery_status(session, settings_from(request), video)
+    latest_revision = session.scalar(select(GenerationJob).where(
+        GenerationJob.project_id == video.project_id, GenerationJob.shot_id == video.shot_id,
+        GenerationJob.parameters_json['based_on_video_id'].as_string() == video.id,
+    ).order_by(GenerationJob.created_at.desc(), GenerationJob.id.desc()).limit(1))
+    if latest_revision:
+        from app.services.product_library import is_product_reference_error
+        message = (latest_revision.error_message or '').splitlines()
+        message = message[0] if message else None
+        if is_product_reference_error(latest_revision.error_code, message):
+            message = '这次修订在商品图识别阶段停止，视频尚未开始渲染。原图片和修订指令已保留。'
+        result['metadata_json']['latest_revision_job'] = {
+            'id': latest_revision.id, 'status': latest_revision.status, 'error_message': message,
+        }
     result["history"] = [row_dict(row) for row in session.scalars(select(VideoRevision).where(VideoRevision.shot_id == video.shot_id).order_by(VideoRevision.revision)).all()]
     return result
 
@@ -1333,7 +1354,8 @@ async def revise_video(request: Request, video_id: str, payload: RevisionRequest
         if payload.reference_images:
             raise AppError(409, 'revision_image_service_required', '图片修订需要本地 Context-IR H3 视频服务')
         generation = revision_generation_request(session, shot, current, payload)
-        job, video = await generate_for_shot(request, session, shot, generation, instruction=payload.instruction)
+        job, video = await generate_for_shot(request, session, shot, generation, instruction=payload.instruction,
+                                            revision_source=current)
     else:
         generation, service, quality, context = prepare_context_revision(session, settings, shot, current, payload)
         if payload.reference_images and payload.reference_preview_sha256 != revision_reference_digest(context, service):
@@ -1341,11 +1363,11 @@ async def revise_video(request: Request, video_id: str, payload: RevisionRequest
         from app.services.revision_postprocess import freeze_plan
         processing_plan = freeze_plan(session, settings, shot, current, payload.instruction, quality=quality)
         job, video = await generate_for_shot(request, session, shot, generation, instruction=payload.instruction,
-            frozen_service=service, frozen_quality=quality, frozen_context=context, revision_postprocess=processing_plan)
+            frozen_service=service, frozen_quality=quality, frozen_context=context, revision_postprocess=processing_plan,
+            revision_source=current)
     previous_job = session.get(GenerationJob, current.generation_job_id)
     if previous_job.provider == "comfyui_h3":
         previous_job.status = "revised"
-    job.parameters_json = {**job.parameters_json, "based_on_video_id": current.id, "original_prompt": previous_job.prompt}
     session.commit()
     return {
         "job": row_dict(job),

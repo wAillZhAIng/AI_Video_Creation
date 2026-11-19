@@ -82,7 +82,7 @@ export function RevisionReferencePicker({ videoId, images, disabled, onChange, o
             }}/>
         </FormField>)}
     </div>
-    <p className="form-hint">可搭配文字或只用图片。将图片指定给本镜对象时，会替换该对象在本次修订里的外观参考。</p>
+    <p className="form-hint">可搭配文字或只用图片。手持商品图可作为独立外观参考；指定本镜对象时会替换该对象本次修订的参考。</p>
     {uploading ? <p role="status">正在上传修订图片…</p> : null}
     {uploadError ? <p role="alert">{uploadError}</p> : null}
     {hasImages && targetError ? <p className="form-hint">无法读取本镜对象。已上传的图片可作为独立外观参考。</p> : null}

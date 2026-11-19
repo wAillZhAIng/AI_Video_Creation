@@ -116,6 +116,30 @@ function trackRevisionIntervals() {
   return active;
 }
 
+it.each(['running', 'failed'])('restores the latest %s revision status after reopening the original video', async (status) => {
+  const active = trackRevisionIntervals();
+  const attempt = { id: 'job-revision', status, error_message: status === 'failed' ? '参考图检查中止，视频尚未开始渲染。' : null };
+  const fetcher = vi.fn(async (url: string) => {
+    const path = new URL(url, 'http://localhost').pathname;
+    if (path === '/api/projects') return response([{ id: 'p1', name: '项目' }]);
+    if (path === '/api/projects/p1/videos') return response([video]);
+    if (path === '/api/videos/v1') return response({ ...video, metadata_json: { ...video.metadata_json, latest_revision_job: attempt } });
+    throw new Error(path);
+  });
+  vi.stubGlobal('fetch', fetcher);
+  render(<MemoryRouter initialEntries={['/review?project=p1&video=v1']}><ToastProvider><ReviewPage /></ToastProvider></MemoryRouter>);
+  if (status === 'running') {
+    await screen.findByText(/修订任务已提交/);
+    expect(screen.getByRole('button', { name: '基于当前版本重新生成' })).toBeDisabled();
+    expect(active.size).toBe(1);
+  } else {
+    await screen.findByText(/上次修订.*视频尚未开始渲染/);
+    expect(screen.getByRole('button', { name: '基于当前版本重新生成' })).toBeEnabled();
+    expect(active.size).toBe(0);
+  }
+  expect(fetcher.mock.calls.some(([url]) => url.endsWith('/revise'))).toBe(false);
+});
+
 it('keeps preview validation errors beside the retained instruction after the toast expires and clears them on edit', async () => {
   const expireToasts = captureToastExpiry();
   const message = '此镜头参考与修改约束冲突，请核对原图';

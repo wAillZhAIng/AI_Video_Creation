@@ -19,7 +19,7 @@ from starlette.requests import Request
 
 from app import models as m
 from app.api.diagnostics import revision_preview
-from app.api.routes import retry_job, revise_video, upload_video_revision_image, video_revision_reference_targets
+from app.api.routes import get_video, retry_job, revise_video, upload_video_revision_image, video_revision_reference_targets
 from app.core.db import Base, build_engine, build_session_factory
 from app.core.errors import AppError
 from app.schemas import RevisionRequest
@@ -278,6 +278,61 @@ def test_image_only_review_freezes_scoped_attachments_in_preview_and_actual_requ
     binding = case.db.scalar(select(m.ShotProductBinding).where(m.ShotProductBinding.shot_id == case.shot.id))
     assert binding.image_ids_json == [ref['id'] for ref in case.references]
     assert case.source.status == 'generated'
+
+
+def test_unbound_review_photo_replays_old_snapshot_without_a_synthetic_product_group(dispatch_case, settings, monkeypatch):
+    from app.services.cinematic_rules import fingerprint
+    from app.services.revision_postprocess import freeze_plan
+    from app.services.video_revisions import prepare_context_revision
+
+    case = dispatch_case
+    binding = case.db.scalar(select(m.ShotProductBinding).where(m.ShotProductBinding.shot_id == case.shot.id))
+    binding.image_ids_json = []
+    case.source.parameters_json = {'quality_request': {'processing': 'ai_upscale'}}
+    case.db.commit()
+    image = BytesIO()
+    Image.new('RGB', (48, 48), 'orange').save(image, 'PNG')
+    upload = UploadFile(BytesIO(image.getvalue()), filename='held-bottle.png')
+    photo = asyncio.run(upload_video_revision_image(case.video.id, case.request, upload, 'product', case.db))
+    payload = RevisionRequest(instruction='修改产品图', reference_images=[{'image_id': photo['id']}])
+    preview = revision_preview(case.video.id, payload, case.request, case.db)
+    assert preview['asset_ids'] == [photo['id']]
+    assert preview['production_contract']['product_groups'] == {}
+    _, service, quality, context = prepare_context_revision(case.db, settings, case.shot, case.video, payload)
+    context['references'][0]['product_id'] = photo['id']
+    context.pop('fingerprint')
+    context['fingerprint'] = fingerprint(context)
+    plan = freeze_plan(case.db, settings, case.shot, case.video, payload.instruction, quality=quality)
+    assert plan and plan['state'] == 'waiting_generation'
+    previous = m.GenerationJob(project_id=case.project.id, shot_id=case.shot.id, provider='comfyui_h3',
+        status='failed', seed=743, prompt=context['prompt'], error_code='comfyui_execution_failed',
+        error_message='商品参考身份不一致或无法确定：无法唯一定位商品及独立操作者。',
+        parameters_json={'based_on_video_id': case.video.id, 'h3_workflow': service['h3_workflow'],
+            'service_snapshot': service, 'quality_request': quality, 'context_inputs': context,
+            'revision_postprocess': plan, 'instruction': payload.instruction})
+    case.db.add(previous)
+    case.db.commit()
+    old_attempt = get_video(case.video.id, case.request, case.db)['metadata_json']['latest_revision_job']
+    assert old_attempt['id'] == previous.id and '尚未开始渲染' in old_attempt['error_message']
+
+    async def capture(self, request):
+        tray, declarations, _, contract = provider.prepare_context_compilation(
+            request.prompt, request.negative_prompt, request.reference_assets, request.motion_references,
+            request.parameters['context_inputs'])
+        assert request.reference_assets[0]['asset_id'] == photo['id']
+        assert request.instruction == payload.instruction and request.seed == previous.seed
+        assert declarations['reference_groups'] == '' and declarations['required_references'] == 'picture1'
+        assert contract['product_groups'] == {} and 'product-unit:' not in tray[0]['note']
+        raise AppError(422, 'fixture_no_sampling', 'Captured actual retry')
+
+    monkeypatch.setattr(provider.ContextIRH3Provider, 'submit', capture)
+    with pytest.raises(AppError) as err:
+        asyncio.run(retry_job(case.request, previous.id, case.db))
+    assert err.value.code == 'fixture_no_sampling'
+    attempt = get_video(case.video.id, case.request, case.db)['metadata_json']['latest_revision_job']
+    retried = case.db.get(m.GenerationJob, attempt['id'])
+    assert retried.id != previous.id and retried.parameters_json['context_inputs'] == context
+    assert retried.parameters_json['revision_postprocess'] == plan
 
 
 def test_reference_scale_use_policy_only_changes_the_explicitly_revised_product_group():

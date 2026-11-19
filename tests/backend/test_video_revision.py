@@ -82,10 +82,12 @@ def test_explicit_revision_settings_win_and_new_service_does_not_inherit_unrelat
 def test_revision_route_passes_text_and_native_inputs_and_retains_original(client, revision_source, monkeypatch):
     from app.api import routes
     captured = {}
-    async def capture_generation(request, session, shot, payload, *, instruction=None):
-        captured.update(payload=payload, instruction=instruction, shot_id=shot.id)
+    async def capture_generation(request, session, shot, payload, *, instruction=None, revision_source=None):
+        captured.update(payload=payload, instruction=instruction, shot_id=shot.id, source_id=revision_source.id)
+        based_on = {'based_on_video_id': revision_source.id,
+                    'original_prompt': session.get(m.GenerationJob, revision_source.generation_job_id).prompt}
         job = m.GenerationJob(project_id=shot.project_id, shot_id=shot.id, provider='isolated-contract-test',
-                              status='queued', prompt='isolated revised prompt', parameters_json=payload.parameters)
+                              status='queued', prompt='isolated revised prompt', parameters_json={**payload.parameters, **based_on})
         session.add(job); session.flush()
         return job, None
     monkeypatch.setattr(routes, 'generate_for_shot', capture_generation)
@@ -95,6 +97,7 @@ def test_revision_route_passes_text_and_native_inputs_and_retains_original(clien
     assert response.status_code == 202, response.text
     assert captured['instruction'] == '记录本全程保持合上，镜头移动更缓慢。'
     assert captured['shot_id'] == source.shot_id
+    assert captured['source_id'] == source.video_id
     assert captured['payload'].parameters == {'width':1024,'height':576,'steps':30}
     assert captured['payload'].service_id == 'source-service'
     result = response.json()
@@ -213,7 +216,8 @@ def test_retry_retains_edited_prompt_but_rebuilds_compiled_metadata(client, revi
         session.commit()
     captured = {}
     async def generate(request, session, shot, payload, *, instruction=None, retry_count=0,
-                       frozen_job=None, frozen_service=None, legacy_production=False, revision_postprocess=None):
+                       frozen_job=None, frozen_service=None, legacy_production=False, revision_postprocess=None,
+                       revision_source=None):
         captured.update(prompt_override=payload.prompt_override, parameters=payload.parameters,
                         instruction=instruction, retry_count=retry_count,
                         frozen_job_id=frozen_job.id if frozen_job else None,

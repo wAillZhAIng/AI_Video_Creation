@@ -93,10 +93,11 @@ def resolve_revision_images(session, settings, shot, source_video_id, selections
         if kind == 'character':
             ref['character_id'] = target_id or identifier
         else:
-            ref.update(product_id=target_id or identifier,
-                       product_name=target['name'] if target else f'附加道具商品图 {len(references) + 1}')
-            if target and target.get('logical_id'):
-                ref['product_logical_id'] = target['logical_id']
+            ref['product_name'] = target['name'] if target else f'附加道具商品图 {len(references) + 1}'
+            if target:
+                ref['product_id'] = target_id
+                if target.get('logical_id'):
+                    ref['product_logical_id'] = target['logical_id']
         ref['absolute_path'] = str(verified_image(settings, ref))
         references.append(ref)
     return references
@@ -104,6 +105,14 @@ def resolve_revision_images(session, settings, shot, source_video_id, selections
 
 def replaced_targets(references, role):
     return {ref['target_id'] for ref in references if ref['role'] == role and ref.get('target_id')}
+
+
+def revision_image_evidence(ref):
+    result = {key: value for key, value in ref.items() if key not in {'absolute_path', 'picture_index', 'constraint_target_keys'}}
+    if ref.get('role') == 'product' and not ref.get('target_id') and ref.get('product_id') == ref['asset_id']:
+        # Earlier review snapshots stored the upload ID as a synthetic product ID.
+        result.pop('product_id')
+    return result
 
 
 def revision_image_preview(ref, index):

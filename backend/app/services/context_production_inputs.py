@@ -17,7 +17,7 @@ from app.services.revision_constraints import (
     apply_revision_overrides, extract_revision_constraints, revision_constraints_text,
 )
 from app.services.revision_cinematography import apply_cinematography_override
-from app.services.revision_references import replaced_targets, resolve_revision_images
+from app.services.revision_references import replaced_targets, resolve_revision_images, revision_image_evidence
 from app.services.screenplay import shot_bundle
 
 
@@ -302,9 +302,8 @@ def restore_context_inputs(session, settings, shot, snapshot):
         raise AppError(409, 'context_input_snapshot_stale', '镜头所属剧本已变化，未使用原任务以外的剧本')
     source = data.get('revision_reference_source')
     extra = resolve_revision_images(session, settings, shot, source['video_id'], source['selections']) if source else []
-    frozen_extra = [{key: value for key, value in ref.items() if key not in {'picture_index', 'constraint_target_keys'}}
-                    for ref in data['references'] if ref.get('source') == 'video_revision_reference']
-    if _without_paths(extra) != frozen_extra:
+    frozen_extra = [revision_image_evidence(ref) for ref in data['references'] if ref.get('source') == 'video_revision_reference']
+    if [revision_image_evidence(ref) for ref in extra] != frozen_extra:
         raise AppError(409, 'revision_reference_changed', '本次修订图片或应用对象已变化，请重新预览')
     preflight = shot_preflight(session, settings, shot, require_visual=False, context_inputs=True,
                                explicit_visual_ids=data['explicit_visual_ids'], explicit_motion=data['explicit_motion'],

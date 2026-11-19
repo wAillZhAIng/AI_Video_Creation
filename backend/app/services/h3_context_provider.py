@@ -122,9 +122,14 @@ def reference_layout(images, motion, *, prop_states=None):
         role = ref.get('role') or ref.get('asset_type')
         actor = ref.get('actor_id') or ref.get('character_id')
         product = ref.get('product_id')
+        review_photo = ref.get('source') == 'video_revision_reference'
+        product_appearance_only = review_photo and role == 'product' and not ref.get('target_id')
         note = 'Use the visible elements of this shot reference only where the shot calls for them.'
         tray_role = 'subject'
-        if role == 'product' or (role == 'product_image' and product):
+        if product_appearance_only:
+            note = ('Review photo for the physical product appearance. Describe the actual object, its shape, finish and markings. '
+                    'Any visible hand, holder, packaging or background is context for the photo.')
+        elif role == 'product' or (role == 'product_image' and product):
             if product:
                 groups['product', str(product)].append(label)
                 image_notes = ' '.join(str(ref.get('image_notes') or '').split())[:500]
@@ -143,7 +148,13 @@ def reference_layout(images, motion, *, prop_states=None):
                     'illustrations and lettering, which are features of the surface carrying them. Appearance follows '
                     'the individually bound references where present.')
         tray.append({'kind': 'picture', 'label': label, 'role': tray_role, 'note': note})
-        if ref.get('source') == 'video_revision_reference':
+        if product_appearance_only:
+            directions.append(f'Use <Picture {index}> as the appearance reference for the prop or product in this revision. '
+                              'Its visible shape, material, colors and markings take priority over older details of that product. '
+                              'Keep the requested action, scene and camera. '
+                              'Treat any photographed hand as context only. Cite the picture in the product definition '
+                              'and use that same defined subject in the numbered shot.')
+        elif review_photo:
             target = ' '.join(str(ref.get('target_name') or '').split())
             kind = 'character' if role == 'identity' else 'prop or product'
             directions.append(f'Use <Picture {index}> as the appearance reference for the {kind}'
