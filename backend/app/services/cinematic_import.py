@@ -15,6 +15,7 @@ from app.services.cinematic_rules import rules_bundle,field_provenance
 from app.services.word_cast import character_heading
 from app.services.word_duration import is_time_range
 from app.services.word_files import blocks_text
+from app.services.music_cues import MIXED_MUSIC_FIELDS, MUSIC_FIELDS, word_music_sections
 
 
 def paragraph(text,source):return {'id':source,'kind':'paragraph','style':'Compatibility normalized','text':text,'heading_level':None}
@@ -36,6 +37,8 @@ _WORD_FIELDS = {
     'subtitles':'字幕','captions':'字幕','on-screen text':'字幕',
     '画幅比例':'画幅','宽高比':'画幅','aspect ratio':'画幅','aspect':'画幅',
 }
+_WORD_FIELDS.update(dict.fromkeys(MUSIC_FIELDS, '音乐'))
+_WORD_FIELDS.update(dict.fromkeys(MIXED_MUSIC_FIELDS, '音乐与音效'))
 _TIMELINE_HEADINGS = {'分镜时间轴','分镜时间线','时间轴','镜头列表','分镜表','镜头表','shot list','shot timeline',
                       'storyboard','timeline'}
 _TABLE_FIELDS = set(_WORD_FIELDS.values()) | {'时间','画面','动作','构图','人物','对白','时长','音效','音乐','环境声','景别','机位','地点'}
@@ -206,7 +209,8 @@ def normalize_blocks(blocks,rules):
 
 
 def build_ir(blocks,legacy_parser):
-    rules=rules_bundle();normalized,notes=normalize_blocks(blocks,rules)
+    screenplay_blocks,music=word_music_sections(blocks)
+    rules=rules_bundle();normalized,notes=normalize_blocks(screenplay_blocks,rules)
     ir=legacy_parser(normalized)
     if not ir['scenes'] or not ir['shots']:
         # All readable Word is previewable. Unknown free text is not fabricated
@@ -218,6 +222,8 @@ def build_ir(blocks,legacy_parser):
         ir['shots'][0]['source']=[b['id'] for b in blocks]
         ir['unrecognized']=[{'source':b['id'],'text':b.get('text',str(b.get('rows',[]))),'reason':'未确定的自由格式原文，需人工确认语义与拆分'} for b in blocks]
         notes.append({'source':source,'kind':'unresolved_semantics','message':'原文没有可直接识别的分镜结构。全文已载入预览，请核对人物、场景和镜头拆分'})
+    if music:
+        ir['project']['background_music']=music
     source_versions={}
     for b in blocks:
         for key in rules['versions']:

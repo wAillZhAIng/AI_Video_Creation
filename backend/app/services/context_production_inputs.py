@@ -242,6 +242,10 @@ def collect_context_inputs(session, settings, shot, *, prompt_override=None, ins
     if scene:
         from app.services.screenplay import row
         audio_events = [row(event) for event in session.scalars(select(m.AudioEvent).where(m.AudioEvent.scene_id==scene.id))] + audio_events
+    music_is_separate = any(event['kind']=='music' for event in audio_events) or bool(
+        script and script.parsed_json.get('project', {}).get('background_music'))
+    if music_is_separate:
+        parts.append('背景音乐在成片时单独合成。只在原片保留剧本指定的对白、环境声和动作音效，原片不生成配乐。')
     spoken_language = 'Chinese' if any(re.search(r'[\u3400-\u9fff]', line['台词']) for line in lines) else 'English'
     for label, value in (
         ('场景与材质', scene.environment_json if scene else None),
@@ -249,7 +253,7 @@ def collect_context_inputs(session, settings, shot, *, prompt_override=None, ins
         ('道具镜头状态', prop_states), ('道具说明', prop_notes),
         ('对白', lines if audio_policy != 'skip' else None),
         ('声音事件', [{key: event.get(key) for key in ('kind','description','start_seconds','end_seconds','volume')}
-                      for event in audio_events]),
+                      for event in audio_events if event['kind']!='music']),
         ('已绑定制作设定', [{'名称': e['name'], '类别': e['kind'], '内容': e['spec']} for e in effective_specs]),
         ('动作节拍', production.get('beats')),
     ):

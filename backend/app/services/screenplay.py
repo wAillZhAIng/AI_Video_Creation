@@ -268,7 +268,7 @@ def generation_inputs(session, shot, settings):
         'Camera: '+shot.camera_move+' '+json.dumps(photography,ensure_ascii=False),
         production_heading,*performances,*dialogue,
         'overall_soundscape:', '\n'.join(json.dumps({k:x.get(k) for k in ('kind','description','start_seconds','end_seconds','volume')},ensure_ascii=False) for x in audio if x['kind']!='music' and not x.get('relative_path')) or shot.audio_direction or 'Quiet room tone accompanies the visible actions.',
-        'non_diegetic_music:', '\n'.join(x['description'] for x in audio if x['kind']=='music' and not x.get('relative_path')) or 'N/A'])
+        'non_diegetic_music:', 'N/A'])
     if cinematic:
         prompt=prompt.replace('[Shot 1] ',cinematic['contact_directions']+'\n[Shot 1] ',1)
         text='Cinematic production rules (version '+cinematic['versions']['production_rules_version']+'):\n'+cinematic['rules_text']+'\nReviewed production designs, timed actions and continuity states: '+json.dumps({k:cinematic[k] for k in ['production','entities']},ensure_ascii=False)

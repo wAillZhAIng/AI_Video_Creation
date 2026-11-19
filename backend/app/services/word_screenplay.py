@@ -147,7 +147,7 @@ def parse_blocks(blocks):
         caption_field=key.casefold() in CAPTION_FIELDS
         if shot and (caption_field or (source==caption_source and key not in {
                 '对白','画面','画面描述','视觉重点','动作','出场人物','参与人物','运镜','镜头运动',
-                '时长','时段','表演','环境声','音效','音乐','灯光','画幅',*camera_fields})):
+                '时长','时段','表演','环境声','音效','音乐','音乐与音效','灯光','画幅',*camera_fields})):
             caption_source=source
             caption=value if caption_field else text
             current=shot['photography'].get('subtitle_text','')
@@ -270,8 +270,13 @@ def parse_blocks(blocks):
                         if len(kv)==2 and kv[0].strip() in perf_fields: p['performance'][perf_fields[kv[0].strip()]]=kv[1].strip()
                         elif pair.strip(): preview['unrecognized'].append({'source':source,'text':pair,'reason':'人物表演字段待确认'})
                 else: preview['unrecognized'].append({'source':source,'text':text,'reason':'表演写法需为 人物｜动作=…；情绪=…'})
-            elif key in ('环境声','音效','音乐'):
-                shot['audio_events'].append({'kind':{'环境声':'ambience','音效':'sfx','音乐':'music'}[key],'description':value,'source':[source]})
+            elif key in ('环境声','音效','音乐','音乐与音效'):
+                shot['audio_events'].append({'kind':{'环境声':'ambience','音效':'sfx'}.get(key,'music'),'description':value,'source':[source]})
+                if key=='音乐与音效':
+                    from app.services.music_cues import music_effects
+                    effects=music_effects(value)
+                    if effects:
+                        shot['audio_events'].append({'kind':'sfx','description':effects,'source':[source]})
             elif key=='对白' or key in name_map or key in local_labels or name_without_annotation(key) in name_map:
                 spoken=re.split('[:：]',value,maxsplit=1) if key=='对白' else [key,value]
                 if len(spoken)==2:
@@ -551,7 +556,7 @@ def commit_import(session,batch,payload):
         reference_scene_id=old_scene_candidates.get(semantic_digest({'name':s['name'],'environment':s.get('environment',{})}))
         scene=Scene(project_id=project.id,script_revision_id=script.id,order=s['order'],name=s['name'],environment_json=s.get('environment',{}),source_json={'blocks':s.get('source',[]),'import_id':batch.id,'suggested':s.get('suggested',[]),'reviewed_edit':s.get('reviewed_edit',False),**({'reference_scene_id':reference_scene_id} if reference_scene_id else {})})
         session.add(scene);session.flush();smap[s['key']]=scene;scene_states[signature]=scene
-        for a in s.get('audio_events',[]): session.add(AudioEvent(scene_id=scene.id,kind=a['kind'],description=a['description'],source_json={'blocks':a.get('source',[])}))
+        for a in s.get('audio_events',[]): session.add(AudioEvent(scene_id=scene.id,kind=a['kind'],description=a['description'],start_seconds=a.get('start_seconds',0),end_seconds=a.get('end_seconds'),volume=a.get('volume',1),source_json={'blocks':a.get('source',[])}))
     designs={};scene_designs={}
     from app.models import ProductionEntity
     for design in p.get('designs',[]):
@@ -593,7 +598,7 @@ def commit_import(session,batch,payload):
             item=ShotCharacter(shot_id=shot.id,character_id=c.id,character_version_id=v.id if v else None,order=n,reference_asset_ids_json=refs,performance_json=person.get('performance',{}),source_json={'blocks':person.get('source',[])})
             session.add(item);session.flush();participants[person['character_key']]=item
         for n,line in enumerate(s.get('dialogues',[]),1): session.add(DialogueLine(shot_id=shot.id,participant_id=participants[line['character_key']].id,order=n,text=line['text'],delivery_json=line.get('delivery',{}),source_json={'blocks':line.get('source',[])}))
-        for a in s.get('audio_events',[]): session.add(AudioEvent(shot_id=shot.id,kind=a['kind'],description=a['description'],source_json={'blocks':a.get('source',[])}))
+        for a in s.get('audio_events',[]): session.add(AudioEvent(shot_id=shot.id,kind=a['kind'],description=a['description'],start_seconds=a.get('start_seconds',0),end_seconds=a.get('end_seconds'),volume=a.get('volume',1),source_json={'blocks':a.get('source',[])}))
         session.flush()
         detail=session.scalar(select(ShotDetail).where(ShotDetail.shot_id==shot.id))
         detail.source_json={**detail.source_json,'import_semantic_hash':persisted_shot_digest(session,shot)}

@@ -20,6 +20,8 @@ from app.core.paths import safe_media_path
 from app.models import AIService, AssemblyRender, VideoRevision, GenerationJob, CharacterGenerationJob
 from app.schemas_product import TimelineRequest
 from app.services.ai_services import resolve_service
+from app.services.background_music import append_mix, clip_music_plan, freeze_service, prepare_render
+from app.services.music_cues import script_music_plan
 from app.services.quality import inspect_media
 
 TRANSITIONS = {'cut': '直接切换', 'crossfade': '淡入淡出', 'fadeblack': '黑场过渡', 'fadewhite': '白场过渡', 'dissolve': '溶解', 'slide': '滑动', 'push': '推入', 'wipe': '擦除'}
@@ -187,7 +189,9 @@ def validate_timeline(session, settings, project_id, payload: TimelineRequest, *
                 cues.append({'start':offset+n*available/len(lines),'end':offset+(n+1)*available/len(lines),'text':person.display_name+'：'+line.text,'source_dialogue_id':line.id})
             offset+=available
         if not cues:raise AppError(422,'subtitle_dialogue_missing','所选镜头没有对白文本，无法创建字幕')
-    return {'clips': clips, 'transitions': transitions, 'output': output,'subtitle_cues':cues,'subtitle_timing':'shot segments, not speech alignment' if cues else None, 'service_snapshot': snapshot, 'duration': round(duration, 8), 'expected_frames': round(duration * output['fps']), 'output_directory': f'assemblies/{project_id}/'}
+    music = script_music_plan(session, project_id, clips, transitions) if output['audio_policy'] != 'mute' else []
+    return {'clips': clips, 'transitions': transitions, 'output': output,'subtitle_cues':cues,'subtitle_timing':'shot segments, not speech alignment' if cues else None, 'service_snapshot': snapshot, 'duration': round(duration, 8), 'expected_frames': round(duration * output['fps']), 'output_directory': f'assemblies/{project_id}/',
+            **({'background_music': music, 'music_service_snapshot': freeze_service(session, project_id)} if music else {})}
 
 
 def preview_snapshot(snapshot, index):
@@ -206,6 +210,8 @@ def preview_snapshot(snapshot, index):
     result['output'].update(width=384, height=216, codec='libx264', resolution_mode='custom', allow_downscale=True)
     result['duration'] = sum(clip['duration'] for clip in result['clips']) - edge['duration']
     result['subtitle_cues']=[{**cue,'start':max(0,cue['start']-preview_start),'end':min(result['duration'],cue['end']-preview_start)} for cue in snapshot.get('subtitle_cues',[]) if cue['end']>preview_start and cue['start']<preview_start+result['duration']]
+    if snapshot.get('background_music'):
+        result['background_music'] = clip_music_plan(snapshot['background_music'], preview_start, result['duration'])
     if result['output'].get('subtitles') and not result['subtitle_cues']:result['output']['subtitles']=False
     result['expected_frames'] = round(result['duration'] * result['output']['fps'])
     result['preview_transition_index'] = index
@@ -223,7 +229,7 @@ def effect(edge):
     return edge['type']
 
 
-def command_for(settings, snapshot, destination):
+def command_for(settings, snapshot, destination, music_assets=()):
     output, clips = snapshot['output'], snapshot['clips']
     command = [snapshot['service_snapshot']['settings'].get('ffmpeg_path') or settings.ffmpeg_path, '-hide_banner', '-n', '-filter_complex_threads', '1']
     filters = []
@@ -270,6 +276,8 @@ def command_for(settings, snapshot, destination):
                 filters.append(f'[{a}][a{index+1}]concat=n=2:v=0:a=1[{next_a}]')
         v, a = next_v, next_a
         elapsed += clips[index+1]['duration'] - overlap
+    if output['audio_policy'] != 'mute':
+        a = append_mix(settings, snapshot, command, filters, a, music_assets)
     if output['audio_policy'] == 'fade' and output['fade_duration']:
         fade = output['fade_duration']
         filters.append(f'[{a}]afade=t=in:d={fade}:st=0,afade=t=out:d={fade}:st={max(0,elapsed-fade):.8f}[outa]')
@@ -281,14 +289,14 @@ def command_for(settings, snapshot, destination):
             return f'{hours:02}:{minutes:02}:{seconds:02},{millis:03}'
         cues=snapshot.get('subtitle_cues',[])
         subtitle_file.write_text('\n\n'.join(str(i+1)+'\n'+timestamp(c['start'])+' --> '+timestamp(c['end'])+'\n'+c['text'].replace('\r',' ').replace('\n',' ') for i,c in enumerate(cues))+'\n',encoding='utf-8')
-        command+=['-i',str(subtitle_file),'-map',f'{len(clips)}:s:0','-c:s','mov_text','-metadata:s:s:0','language=zho']
+        command+=['-i',str(subtitle_file),'-map',f'{len(clips)+len(music_assets)}:s:0','-c:s','mov_text','-metadata:s:s:0','language=zho']
     command += ['-filter_complex', ';'.join(filters), '-map', f'[{v}]']
     command += ['-an'] if output['audio_policy'] == 'mute' else ['-map', f'[{a}]', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000']
     command += ['-c:v', output['codec'], '-crf', '18', '-preset', 'fast', '-pix_fmt', 'yuv420p', '-r', str(fps), '-t', f'{snapshot["duration"]:.8f}', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', str(destination)]
     return command
 
 
-def run_render(settings, session_factory, identifier):
+def run_render(settings, session_factory, identifier, music_assets=()):
     with session_factory() as session:
         claimed = session.execute(update(AssemblyRender).where(AssemblyRender.id==identifier,AssemblyRender.status=='queued').values(status='running'))
         session.commit()
@@ -334,7 +342,7 @@ def run_render(settings, session_factory, identifier):
                     if not shot or not expected or expected!=generation_inputs_hash(session,shot):
                         raise AppError(409,'draft_video_changed','草稿镜头输入已变化，不能继续渲染')
                     _valid_video(session,settings,video)
-        command = command_for(settings, snapshot, dest)
+        command = command_for(settings, snapshot, dest, music_assets)
         lines = queue.Queue()
         with logfile.open('w', encoding='utf-8') as log:
             log.write(json.dumps({'command': command, 'snapshot': snapshot}, ensure_ascii=False)+'\n')
@@ -403,6 +411,12 @@ def run_render(settings, session_factory, identifier):
                     'input_actual_resolutions':[{'video_id':c['video_id'],'width':c['source']['width'],'height':c['source']['height'],'provenance':c.get('source_provenance',{})} for c in snapshot['clips']],
                     'method':'ordinary_lanczos_scaling','ai_super_resolution':False,'some_inputs_ai_super_resolution':any(c.get('source_provenance',{}).get('ai_super_resolution') for c in snapshot['clips']),
                     'native_generation':False,'visual_review':'human_review_required'}}
+            if music_assets:
+                row.metadata_json = {**row.metadata_json, 'background_music': [
+                    {**audio, 'description': cue['description'], 'directions': cue['directions'],
+                     'placements': cue['placements']}
+                    for cue, audio in zip(snapshot['background_music'], music_assets)
+                ]}
             service = session.get(AIService, snapshot['service_snapshot']['service_id'])
             if service and service.revision == snapshot['service_snapshot']['service_revision']:
                 previous_effects = service.capabilities_json.get('transitions',{}).get('effects',[])
@@ -433,8 +447,13 @@ async def assembly_worker(settings, session_factory):
                 gpu_image=session.scalar(select(CharacterGenerationJob.id).where(CharacterGenerationJob.status.in_(['submitting','submitted','running','cancelling']),CharacterGenerationJob.snapshot_json['service_snapshot']['provider'].as_string()=='comfyui').limit(1))
                 row = None if gpu_video or gpu_image else session.scalar(select(AssemblyRender).where(AssemblyRender.status == 'queued').order_by(AssemblyRender.created_at).limit(1))
                 identifier = row.id if row else None
+                snapshot = row.snapshot_json if row else {}
             if identifier:
-                await asyncio.to_thread(run_render, settings, session_factory, identifier)
+                sounds = ()
+                if snapshot.get('background_music'):
+                    sounds = await prepare_render(settings, session_factory, identifier, snapshot)
+                if sounds is not None:
+                    await asyncio.to_thread(run_render, settings, session_factory, identifier, sounds)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

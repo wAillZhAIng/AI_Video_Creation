@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import math
 import ssl
 import subprocess
 import time
@@ -25,7 +26,7 @@ from app.core.trusted_service_origins import (confirmed_local_origin, is_trusted
 MODULES = {'character_generation': {'comfyui','openai_compatible','cloud_draft'},
     'video_generation': {'comfyui','video_api','cloud_draft'}, 'final_assembly': {'ffmpeg'},
     'language_processing':{'openai_compatible','local_llm','cloud_draft'},
-    'speech_recognition': {'local_asr'},
+    'speech_recognition': {'local_asr'}, 'background_music': {'comfyui'},
     'dialogue_generation':{'local_runtime','openai_tts','cloud_draft'},
     'lip_sync':{'local_runtime','cloud_draft'},'video_upscale':{'comfyui','local_runtime','cloud_draft'},
     'quality_check':{'ffmpeg','openai_compatible','cloud_draft'}}
@@ -57,6 +58,13 @@ def validate_configuration(module, provider, base_url, options):
     if any(key.lower() in {'api_key', 'token', 'authorization', 'secret', 'password', 'headers'} for key in options):
         raise AppError(422, 'secret_in_settings', '密钥只能通过专用密码字段保存')
     allowed = {'timeout', 'concurrency', 'width', 'height', 'duration', 'candidate_model', 'text_encoder', 'vae', 'workflow_path', 'workflow_profile', 'h3_context_ir', 'local_service_origin', 'ffmpeg_path', 'ffprobe_path', 'fps', 'codec', 'audio_policy', 'image_api_format', 'video_contract','max_tokens','runtime_family','voice','response_format','max_prompt_characters'}
+    if module == 'background_music':
+        from app.services.background_music import GAIN_DB, validate_endpoint
+        validate_endpoint(base_url)
+        allowed = {'timeout', 'concurrency', 'music_gain_db'}
+        gain = options.get('music_gain_db', GAIN_DB)
+        if type(gain) not in (int, float) or not math.isfinite(gain) or not -42 <= gain <= -3:
+            raise AppError(422, 'music_invalid_gain', '背景音乐混音音量须在 −42 至 −3 dB 之间')
     if set(options) - allowed or any(isinstance(value, (dict, list)) for value in options.values()):
         raise AppError(422, 'invalid_service_settings', '仅接受当前适配器定义的简单参数，禁止在普通配置中保存认证信息')
     if options.get('local_service_origin'):
@@ -325,6 +333,13 @@ async def probe_service(service, settings):
     try:
         if service.provider=='cloud_draft':
             result.update(status='unsupported',error='此云端档案没有执行适配器；未发请求，不能选择为已验证服务')
+        elif service.module == 'background_music':
+            from app.services.background_music import probe_model
+            capability = await probe_model(settings, snapshot)
+            result.update(status='connected', http_status=200,
+                          models=[{'id': snapshot['model_id'], 'source': '已安装的本机 ACE-Step 权重'}],
+                          notice='模型已就绪。含配乐指令的剧本会在合成时使用此服务。',
+                          capabilities={'background_music': capability})
         elif service.provider == 'local_asr':
             from app.services.speech_recognition import service_health
             health = await service_health(settings, snapshot)
