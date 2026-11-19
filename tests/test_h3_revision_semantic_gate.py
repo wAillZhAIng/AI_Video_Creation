@@ -18,7 +18,7 @@ from unittest.mock import patch
 import h3ir.compile as compiler
 import h3ir.prose as prose
 import h3ir.repair as repair
-from h3ir.models import (AssetKind, Brief, Finding, IRDocument, ManifestEntry, Mode,
+from h3ir.models import (AssetKind, Brief, DialogueLine, Finding, IRDocument, ManifestEntry, Mode,
                          Plan, Role, SubjectPlan, Target)
 from h3ir.validate import Context
 
@@ -379,6 +379,56 @@ class NativeRevisionSemanticGateTests(unittest.TestCase):
             self.assertEqual(calls, [doc.prompt])
             passed = json.loads((self.directory / 'compiler-002/revision-semantics.final.json').read_text(encoding='utf-8'))
             self.assertEqual(passed['status'], 'PASS')
+
+
+class DraftStructuralTextTests(unittest.TestCase):
+    def test_native_draft_accepts_fullwidth_punctuation_and_preserves_literal_text(self):
+        line = '台词（保留）［原样］'
+        caption = '字幕（保留）［原样］'
+        brief = Brief(intent='The camera watches 门口（暖光） and ［屏幕］ beside “标牌（原样）”.',
+                      seconds=3, aspect='9:16', shots=1,
+                      dialogue=[DialogueLine(line, language='Chinese', voiceover=True)],
+                      onscreen_text=[caption])
+        original_brief = deepcopy(brief)
+        backend = SimpleNamespace(cfg=SimpleNamespace(model=profile.MODEL),
+                                  require_available=lambda: None,
+                                  server_version=lambda: 'fixture')
+
+        with patch.object(compiler, 'render_ir', inspect.unwrap(compiler.render_ir)), \
+             patch.object(compiler, 'token_count', return_value=220):
+            profile._install_structural_render_compatibility()
+            with self.assertRaisesRegex(compiler.CompilerInvariantError, 'H1-unicode-hazard'):
+                compiler.compile_brief(brief, backend=backend, llm=False)
+
+            scope = profile._ACTIVE.set({})
+            try:
+                document = compiler.compile_brief(brief, backend=backend, llm=False)
+            finally:
+                profile._ACTIVE.reset(scope)
+
+        self.assertEqual(brief, original_brief)
+        self.assertEqual([finding for finding in document.findings if finding.severity == 'ERROR'], [])
+        self.assertIn('门口(暖光) and [屏幕]', document.prompt)
+        self.assertIn('"标牌（原样）"', document.prompt)
+        self.assertIn(f'"{caption}"', document.prompt)
+        self.assertIn(line, document.prompt)
+        self.assertIn('门口(暖光)', document.sections['integrated_multimodal_description'])
+        self.assertIn('门口（暖光）', document.plan.shots[0].body)
+
+    def test_normalized_reference_still_requires_real_attached_media(self):
+        brief = Brief(intent='A static shot of the scene with ＜Picture 1＞.', shots=1)
+        backend = SimpleNamespace(cfg=SimpleNamespace(model=profile.MODEL),
+                                  require_available=lambda: None,
+                                  server_version=lambda: 'fixture')
+        with patch.object(compiler, 'render_ir', inspect.unwrap(compiler.render_ir)), \
+             patch.object(compiler, 'token_count', return_value=220):
+            profile._install_structural_render_compatibility()
+            scope = profile._ACTIVE.set({})
+            try:
+                with self.assertRaisesRegex(compiler.CompilerInvariantError, 'L3-phantom-media'):
+                    compiler.compile_brief(brief, backend=backend, llm=False)
+            finally:
+                profile._ACTIVE.reset(scope)
 
 
 if __name__ == '__main__':

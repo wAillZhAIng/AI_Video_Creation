@@ -10,7 +10,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 import datetime as dt
 import difflib
 import functools
@@ -33,7 +33,7 @@ from .media_bindings import ground_writer_messages, repair_media_bindings, writt
 
 
 VERSION='local-h3ir-qwen4b-v3'
-POLICY_REVISION='written-media-bindings-v7'
+POLICY_REVISION='structural-unicode-v8'
 MODEL='Qwen/Qwen3-VL-4B-Instruct'
 MAX_OUTPUT=4096
 CARD_OUTPUT=3072
@@ -54,7 +54,10 @@ COMPOSE_BRIEF_SHA256='ba398867bdff893f2dfac97cb23caa0e33a73fa7349a5e4956a66bc4ed
 FIX_WITH_FINDINGS_SHA256='0c9ac3ac2c296a507f07b1ea06c4eab12ea777eb8d2719d21bc87ff6205a6e59'
 REPAIR_BRIEF_SHA256='fa9740d40b41f6e66ae7b13750b457c4284768744c45e1386a534dd4f9b5026e'
 FIX_LABELS_SHA256='d0f6d472700a5f64b3e0d02a17c7ec3b5a762ec092cae1748d44fbe9897a0f40'
+RENDER_IR_SHA256='a71e800d15624be4624b7cea1d5507ffcb22e7e218f9a6be37410cab8303da42'
+ASSESS_SHA256='5d1218f03aa822deb9aee055ce858d5049af67ae1da6f1dea7a4200155a14a53'
 _CAMERA_REPAIR='restored the frozen camera sentence in the numbered shot'
+_VERBATIM_SPANS=re.compile(r'<d>.*?</d>|"[^"]*"|“([^"”]*)”',re.S)
 _REFERENCE_FINDING_RULES=frozenset(('F2-duplicate-definition','F3-required-reference',
     'F4-conflicting-groups','F5-declared-group-binding','F6-declared-binding-projection',
     'F7-locked-onscreen-text'))
@@ -70,6 +73,48 @@ class LocalProfileBlocked(LocalProfileFailure):
 
 def source_hash(function):
     return hashlib.sha256(inspect.getsource(function).encode('utf-8')).hexdigest()
+
+
+def _normalize_structural_text(text, table):
+    """Translate the validator's known hazards while preserving literal video content."""
+    parts = []
+    offset = 0
+    for match in _VERBATIM_SPANS.finditer(text):
+        parts.append(text[offset:match.start()].translate(table))
+        caption = match[1]
+        parts.append(match[0] if caption is None else '"' + caption + '"')
+        offset = match.end()
+    parts.append(text[offset:].translate(table))
+    return ''.join(parts)
+
+
+def _install_structural_render_compatibility():
+    import h3ir.compile as compiler
+    from h3ir.validate import UNICODE_HAZARDS
+
+    with _INSTALL_LOCK:
+        original = compiler.render_ir
+        if getattr(original, '_factory_structural_render', False):
+            return
+        if source_hash(original) != RENDER_IR_SHA256 or source_hash(compiler._assess) != ASSESS_SHA256:
+            raise LocalProfileFailure('The audited native render-before-validation path changed')
+        table = str.maketrans(UNICODE_HAZARDS)
+
+        @functools.wraps(original)
+        def render(plan, opts=None):
+            result = original(plan, opts)
+            if _ACTIVE.get() is None:
+                return result
+            prompt = _normalize_structural_text(result.prompt, table)
+            if prompt == result.prompt:
+                return result
+            return replace(result, prompt=prompt,
+                sections={key: _normalize_structural_text(value, table) for key, value in result.sections.items()},
+                shot_bodies={key: _normalize_structural_text(value, table) for key, value in result.shot_bodies.items()},
+                notes=[*result.notes, 'normalized structural Unicode outside verbatim dialogue and on-screen text'])
+
+        render._factory_structural_render = True
+        compiler.render_ir = render
 
 
 def _product_subject_labels(doc,contract,sources,*,prompt=None):
@@ -798,6 +843,7 @@ def install_compiler_gate(compile_here):
     _install_document_gate(namespace)
     _install_analysis_capture()
     _install_revision_validation()
+    _install_structural_render_compatibility()
     return {'compile_here_sha256':COMPILER_CALL_SHA256,'serializer_sha256':SERIALIZER_SHA256,
             'source_field':'actual h3ir.models.IRDocument.source',
             'required_source':'written','location':'before vendor serializer returns body to Main; before H3 loaders'}
