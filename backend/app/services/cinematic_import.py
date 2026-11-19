@@ -13,13 +13,59 @@ from app.core.errors import AppError
 from app.schemas_cinematic import ScreenplayIR
 from app.services.cinematic_rules import rules_bundle,field_provenance
 from app.services.word_cast import character_heading
+from app.services.word_duration import is_time_range
+from app.services.word_files import blocks_text
 
 
 def paragraph(text,source):return {'id':source,'kind':'paragraph','style':'Compatibility normalized','text':text,'heading_level':None}
 
 
+_WORD_FIELDS = {
+    '镜号':'分镜','镜头编号':'分镜','分镜编号':'分镜','shot no.':'分镜','shot number':'分镜','shot id':'分镜',
+    '时间码':'时段','时间段':'时段','时间轴':'时段','时间区间':'时段','起止时间':'时段','timecode':'时段',
+    'time range':'时段','timecode range':'时段','timing':'时段','timeline':'时段','time':'时间',
+    '开始时间':'开始时间','起始时间':'开始时间','start time':'开始时间','in time':'开始时间',
+    '结束时间':'结束时间','end time':'结束时间','out time':'结束时间',
+    '视觉与动作':'画面','画面与动作':'画面','visual and action':'画面','visual description':'画面',
+    '摄影与构图':'摄影与构图','camera and framing':'摄影与构图','cinematography':'摄影与构图',
+    '机位与运镜':'运镜','camera movement':'运镜','camera move':'运镜',
+    '照明与氛围':'灯光','lighting and atmosphere':'灯光','lighting':'灯光',
+    '场景设定':'场景设定','setting':'场景设定','场景描述':'场景设定',
+    '音频与音效':'音效','音频设计':'音效','sound design':'音效','sfx':'音效',
+    '字幕':'字幕','字幕内容':'字幕','屏幕文字':'字幕','屏幕文本':'字幕','字幕与屏幕文字':'字幕',
+    'subtitles':'字幕','captions':'字幕','on-screen text':'字幕',
+    '画幅比例':'画幅','宽高比':'画幅','aspect ratio':'画幅','aspect':'画幅',
+}
+_TIMELINE_HEADINGS = {'分镜时间轴','分镜时间线','时间轴','镜头列表','分镜表','镜头表','shot list','shot timeline',
+                      'storyboard','timeline'}
+_TABLE_FIELDS = set(_WORD_FIELDS.values()) | {'时间','画面','动作','构图','人物','对白','时长','音效','音乐','环境声','景别','机位','地点'}
+_NUMBERED_SHOT = re.compile(
+    r'^(?:第\s*([\d一二三四五六七八九十]+)\s*镜(?:头)?|'
+    r'(?:镜头|分镜|shots?|cuts?)\s*[#＃]?\s*([\d一二三四五六七八九十]+))'
+    r'\s*[:：.、|｜\-]*\s*(.*)$', re.I,
+)
+
+
+def timeline_table(block, canonical_field):
+    rows=block['rows']
+    for index, row in enumerate(rows):
+        headers=[canonical_field(cell.strip()) for cell in row]
+        fields=set(headers)
+        if (fields&{'场景','分镜','时段','时间'} or {'开始时间','结束时间'}<=fields) and (
+                len(fields&_TABLE_FIELDS)>=2 and index+1<len(rows)):
+            if not fields&{'场景','分镜','时段','开始时间','结束时间'} and not any(
+                    len(values)>headers.index('时间') and is_time_range(values[headers.index('时间')],timeline=True)
+                    for values in rows[index+1:]):
+                return None
+            return index, headers
+        # Only leading empty or merged title rows precede the column headers.
+        if len([cell for cell in row if cell.strip()])>1:
+            break
+    return None
+
+
 def normalize_blocks(blocks,rules):
-    result=[];notes=[];names=[];scene=False;shot=False;in_people=False
+    result=[];notes=[];names=[];scene=False;shot=False;in_people=False;timeline=False;prelude=False
     aliases={name.casefold():canonical for canonical,values in rules['aliases'].items() for name in values}
 
     def canonical_field(label):
@@ -27,25 +73,52 @@ def normalize_blocks(blocks,rules):
         base = re.sub(r'\s*\(\s*(?:秒|s|sec(?:s|onds?)?)\s*\)$', '', key)
         if aliases.get(base) == '时长' or base in {'镜头时长', '分镜时长', 'shot duration'}:
             return '时长'
-        return aliases.get(key, label)
+        return _WORD_FIELDS.get(key, aliases.get(key, label))
 
     for block in blocks:
         if block['kind']=='table':
             rows=block['rows'];headers=rows[0] if rows else []
             canon=[canonical_field(h.strip()) for h in headers]
-            if any(v in canon for v in ['场景','分镜']) and len(rows)>1:
-                for n,values in enumerate(rows[1:],1):
+            layout=timeline_table(block,canonical_field)
+            if layout:
+                start,canon=layout
+                last_scene=None
+                for n,values in enumerate(rows[start+1:],start+1):
+                    if not any(v.strip() for v in values) or [canonical_field(v.strip()) for v in values]==canon:
+                        continue
                     data=dict(zip(canon,values));source=f"{block['id']}:row:{n}"
-                    if data.get('场景'):result.append(paragraph('场景 '+str(n)+' '+data['场景'],source));scene=True;shot=False
-                    result.append(paragraph('分镜 '+str(n)+' '+(data.get('分镜') or '待核对画面'),source));shot=True
-                    for k,v in data.items():
-                        if k not in ['场景','分镜'] and v.strip():result.append(paragraph(k+'：'+v,source))
+                    if data.get('场景','').strip() and data['场景'].strip()!=last_scene:
+                        last_scene=data['场景'].strip()
+                        result.append(paragraph('场景 '+str(n)+' '+last_scene,source));scene=True;shot=False
+                    period=data.get('时段','').strip()
+                    if not period and all(data.get(k,'').strip() for k in ('开始时间','结束时间')):
+                        period=data['开始时间'].strip()+'–'+data['结束时间'].strip()
+                    if not period and is_time_range(data.get('时间',''),timeline=True):
+                        period=data['时间'].strip()
+                    result.append(paragraph('分镜 '+str(n)+' '+(data.get('分镜','').strip() or period or '待核对画面'),source))
+                    shot=True
+                    if period:
+                        result.append(paragraph('时段：'+period,source))
+                    for k,v in zip(canon,values):
+                        if k not in {'场景','分镜','时段','开始时间','结束时间'} and (k!='时间' or not period) and v.strip():
+                            result.append(paragraph(k+'：'+v if k else v,source))
+                    for value in values[len(canon):]:
+                        if value.strip():result.append(paragraph(value,source))
                 notes.append({'source':block['id'],'kind':'table_normalized','message':'场景/分镜表转为统一结构，逐行保留来源'})
             else:result.append({**block,'rows':[canon,*rows[1:]]})
             continue
         original=block['text'];text=re.sub(r'^\s*(?:#{1,6}\s*|[-•]\s*)','',original).strip();source=block['id']
         if not text:result.append(block);continue
         heading=re.sub(r'^\d+(?:\.\d+)*[.)、\s]+','',text)
+        heading_key=unicodedata.normalize('NFKC',heading).casefold().strip(' :：')
+        if heading_key in _TIMELINE_HEADINGS:
+            timeline=True;prelude=False;shot=False;in_people=False
+            result.append(paragraph('分镜正文',source))
+            continue
+        if heading_key in {'物理与画面硬性规范','全片制作规范','全片约束','制作规范','technical requirements'}:
+            prelude=True;timeline=False;shot=False;in_people=False
+            result.append(paragraph('额外约束',source))
+            continue
         if heading in ['项目基本信息','项目资料','人物设定','场景设定','正文剧情','分镜正文','连续性要求','额外约束','编写说明','梗概','制作资料']:
             scene=shot=False;in_people=heading=='人物设定'
         if heading in ['角色介绍','角色设定','主要人物','人物介绍','人物小传','人物表','Characters','CHARACTERS','Cast']:
@@ -71,13 +144,43 @@ def normalize_blocks(blocks,rules):
             if spatial[3]:result.append(paragraph('时间：'+spatial[3],source))
             scene=True;shot=False;in_people=False;continue
         if re.match(r'^场景\s*[\d一二三四五六七八九十]+',text):scene=True;shot=False;in_people=False
-        shot_heading=re.match(r'^(?:镜头|分镜|Shot|SHOT)\s*([\d一二三四五六七八九十]+)\s*[:：.、 -]*\s*(.*)$',text)
+        first,_,remainder=text.partition('\n')
+        shot_heading=_NUMBERED_SHOT.fullmatch(first)
+        period=first.strip('[]【】()（） ')
+        if is_time_range(period,timeline=timeline):
+            index=sum(x.get('text','').startswith('分镜 ') for x in result)+1
+            result.extend([paragraph(f'分镜 {index} {period}',source),paragraph('时段：'+period,source)])
+            if remainder:
+                result.append({**block,'text':remainder,'style':'Compatibility normalized'})
+            shot=True;prelude=False;in_people=False
+            continue
         if shot_heading:
             numbers={v:str(i) for i,v in enumerate('一二三四五六七八九',1)}
-            text='分镜 '+numbers.get(shot_heading[1],shot_heading[1])+' '+(shot_heading[2] or '待命名镜头');shot=True
+            number=shot_heading[1] or shot_heading[2]
+            title=shot_heading[3] or '待命名镜头'
+            text='分镜 '+numbers.get(number,number)+' '+title
+            candidates=[title, *re.findall(r'[（(\[【](.*?)[）)\]】]',title)]
+            shot_period=next((value for value in candidates if is_time_range(value,timeline=True)),None)
+            if shot_period:
+                text+='\n时段：'+shot_period
+            if remainder:text+='\n'+remainder
+            shot=True;prelude=False
         parts=re.split('[:：]',text,maxsplit=1)
         if len(parts)==2:
             key,value=parts[0].strip(),parts[1].strip();canonical=canonical_field(key)
+            if canonical=='场景设定' and not shot and value:
+                index=sum(x.get('text','').startswith('场景 ') for x in result)+1
+                result.extend([paragraph(f'场景 {index} 场景设定',source),paragraph('环境：'+value,source)])
+                scene=True;in_people=False
+                continue
+            if canonical=='时段' and is_time_range(value,timeline=True) and (timeline or not shot):
+                index=sum(x.get('text','').startswith('分镜 ') for x in result)+1
+                result.extend([paragraph(f'分镜 {index} {value}',source),paragraph('时段：'+value,source)])
+                shot=True;prelude=False;in_people=False
+                continue
+            if not shot and prelude and canonical not in {'画幅','项目名称','标题','目标时长','地点','时间','天气'}:
+                result.append(paragraph('制作约束：'+text,source))
+                continue
             if canonical not in ['人物','场景','分镜']:text=canonical+'：'+value
             speaking=re.match(r'^(.+?)(?:说道|说|问|答|低声说|says)$',key)
             if speaking and speaking[1].strip() in names:text='对白：'+speaking[1].strip()+'：'+value
@@ -110,10 +213,11 @@ def build_ir(blocks,legacy_parser):
         # into a cast or story; the proposed envelope must be confirmed.
         source=blocks[0]['id'] if blocks else 'document:empty'
         fallback=[paragraph('正文剧情',source),paragraph('场景 1 待确认场景',source),paragraph('分镜 1 待确认正文',source)]
-        raw='\n'.join(b.get('text','') if b['kind']=='paragraph' else '\n'.join(' | '.join(r) for r in b['rows']) for b in blocks)
-        fallback.append(paragraph('画面：'+raw,source));ir=legacy_parser(fallback)
+        ir=legacy_parser(fallback)
+        ir['shots'][0]['visual_prompt']=blocks_text(blocks)
+        ir['shots'][0]['source']=[b['id'] for b in blocks]
         ir['unrecognized']=[{'source':b['id'],'text':b.get('text',str(b.get('rows',[]))),'reason':'未确定的自由格式原文，需人工确认语义与拆分'} for b in blocks]
-        notes.append({'source':source,'kind':'unresolved_semantics','message':'没有可验证的本地语义模型；保留全部原文，不假定人物、动作或场景已被正确理解'})
+        notes.append({'source':source,'kind':'unresolved_semantics','message':'原文没有可直接识别的分镜结构。全文已载入预览，请核对人物、场景和镜头拆分'})
     source_versions={}
     for b in blocks:
         for key in rules['versions']:

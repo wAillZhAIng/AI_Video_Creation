@@ -4,6 +4,7 @@ The deterministic parser remains available without any language provider. Free
 prose is never advertised as understood unless a configured language endpoint
 actually returns a validated, source-grounded extraction.
 """
+import asyncio
 import hashlib
 import json
 from copy import deepcopy
@@ -25,6 +26,7 @@ from app.services.word_screenplay import (block_lines, commit_import, duration_r
 
 
 SEMANTIC_REVIEW_WARNINGS = {'unresolved_semantics', 'suggested_attribution', 'suggested_split'}
+WORD_IMPORT_MODEL_WAIT_SECONDS = 40
 
 
 def content_fingerprint(blocks):
@@ -137,11 +139,12 @@ async def language_extract(session, settings, project_id, blocks, allow_cloud_co
     # read transaction before waiting for an external reply.
     session.rollback()
     try:
-        response=await service_request(settings,snapshot,'POST','/chat/completions',secret,json={
+        response=await asyncio.wait_for(service_request(settings,snapshot,'POST','/chat/completions',secret,json={
             'model':snapshot['model_id'],'messages':[{'role':'system','content':instructions},
                 {'role':'user','content':json.dumps(source,ensure_ascii=False)}],
             'response_format':{'type':'json_object'},'max_tokens':int(parameters.get('max_tokens',snapshot['settings'].get('max_tokens',12000))),
-            **({'temperature':parameters['temperature']} if 'temperature' in parameters else {})})
+            **({'temperature':parameters['temperature']} if 'temperature' in parameters else {})}),
+            timeout=WORD_IMPORT_MODEL_WAIT_SECONDS)
         receipt.update(http_status=response.status_code,provider_request_id=response.headers.get('x-request-id'))
         response.raise_for_status()
         payload=response.json();content=payload['choices'][0]['message']['content']
@@ -168,6 +171,9 @@ async def language_extract(session, settings, project_id, blocks, allow_cloud_co
         preview['parse_warnings'] += [{'kind':'unresolved_semantics','message':v} for v in uncertainty]
         receipt.update(status='extracted',output_sha256=hashlib.sha256(content.encode()).hexdigest(),usage=payload.get('usage',{}))
         return preview,receipt
+    except TimeoutError:
+        receipt.update(status='timed_out',reason='在导入等待时间内未收到语义解析结果，已保存原文和本地预览')
+        return None,receipt
     except Exception as exc:
         # No retry: an interrupted cloud extraction might have been billed.
         receipt.update(status='failed',error=redact(str(exc)[:2000],secret),error_type=type(exc).__name__)
@@ -183,17 +189,17 @@ async def import_word(session, settings, filename, data, *, project_id=None,
         # Use the same exact-target, full-video evidence as Settings and
         # save_profile. The legacy manifest probe only knows 720p landscape.
         if not quality_plan(quality,sr_status(settings),seedvr_capabilities(session,settings))['supported']:raise AppError(409,'quality_method_unverified','所选画质方式尚未验证，未创建项目或提交模型')
-    if Path(filename).suffix.lower()!='.docx':
-        raise AppError(415,'docx_required','请上传真正的 .docx；旧 .doc 请另存为 .docx')
     if len(data)>settings.import_max_bytes:raise AppError(413,'document_too_large','文档超过大小限制')
     if project_id and not session.get(Project,project_id):raise AppError(404,'project_missing','目标项目不存在')
     if new_revision and not project_id:raise AppError(422,'project_required','新剧本版本必须指定项目')
-    blocks=read_blocks(data,settings.import_max_bytes)
+    session.rollback()
+    blocks=await run_in_threadpool(read_blocks,data,settings.import_max_bytes,filename)
     sha=hashlib.sha256(data).hexdigest();fingerprint=content_fingerprint(blocks)
     previous=previous_import(session,sha,fingerprint,project_id)
     if previous and not new_revision:return import_response(previous,session,reused=True)
     check_import_target(session,project_id,new_revision)
-    preview=build_ir(blocks,parse_blocks)
+    session.rollback()
+    preview=await run_in_threadpool(build_ir,blocks,parse_blocks)
     parser={'mode':'local_source_preserving_rules','language_model_called':False}
     issues=ambiguities(session,match_characters(session,deepcopy(preview)))
     # Explicit shots can go straight to review, with every unclassified source
@@ -202,8 +208,13 @@ async def import_word(session, settings, filename, data, *, project_id=None,
         or any(not (shot['visual_prompt'] or shot['action'] or shot['dialogues']) for shot in preview['shots']))
     if issues and needs_structure and not duration_review_issues(preview):
         session.rollback()
-        extracted,parser=await language_extract(session,settings,project_id,blocks,allow_cloud_costs,allow_paid_fallback)
-        if extracted is not None:preview=extracted
+        try:
+            extracted,parser=await language_extract(session,settings,project_id,blocks,allow_cloud_costs,allow_paid_fallback)
+        except (AppError,OSError,ValueError) as exc:
+            parser={**parser,'status':'unavailable',
+                    'reason':exc.message if isinstance(exc,AppError) else '语言服务暂不可用，已保存原文和本地预览'}
+        else:
+            if extracted is not None:preview=extracted
     preview['content_fingerprint']=fingerprint;preview['semantic_parser']=parser
     session.rollback()
     return await run_in_threadpool(_persist_word_import, session, settings, filename, data, blocks, sha, preview,
@@ -220,7 +231,7 @@ def _persist_word_import(session, settings, filename, data, blocks, sha, preview
         session.rollback()
 
     batch_id=new_id('import')
-    relative_path=f'word_imports/{batch_id}/original.docx'
+    relative_path=f'word_imports/{batch_id}/original{Path(filename).suffix.lower()}'
     destination=safe_file(settings.media_root,relative_path)
 
     def stage_word_import():

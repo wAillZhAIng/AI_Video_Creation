@@ -6,7 +6,7 @@ import {afterEach,expect,it,vi} from 'vitest';
 import {request} from '../lib/api';
 import {StudioPage} from './StudioPage';
 vi.mock('../lib/api',async original=>({...await original<typeof import('../lib/api')>(),request:vi.fn()}));
-vi.mock('../components/WordImportPanel',()=>({WordImportPanel:({onImported}:{onImported:(id:string)=>Promise<void>})=><button onClick={()=>void onImported('p_new')}>确认歧义测试</button>}));
+vi.mock('../components/WordImportPanel',()=>({WORD_FILE_ACCEPT:'.docx',WordImportPanel:({onImported}:{onImported:(id:string)=>Promise<void>})=><button onClick={()=>void onImported('p_new')}>确认歧义测试</button>}));
 const mocked=vi.mocked(request);
 afterEach(()=>{cleanup();mocked.mockReset();});
 it('disables project switching and generation while an explicit quality save is pending',async()=>{
@@ -71,7 +71,7 @@ it('retains import quality across ambiguous Word confirmation and stops for voic
   await user.selectOptions(screen.getByLabelText('制作质量模式'),'high');
   await user.click(screen.getByRole('checkbox',{name:/允许本项目调用已配置的云端生成服务/}));
   await user.click(screen.getByRole('checkbox',{name:/允许本次制作在已保存策略许可时回退/}));
-  await user.upload(screen.getByLabelText('剧本文档（.docx）'),new File(['fixture'],'test.docx',{type:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}));
+  await user.upload(screen.getByLabelText('Word 剧本文档'),new File(['fixture'],'test.docx',{type:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}));
   await user.click(screen.getByRole('button',{name:'导入并配置制作'}));
   const confirm=await screen.findByRole('button',{name:'确认歧义测试'});
   const importCall=mocked.mock.calls.find(([url])=>url==='/api/studio/import')!;

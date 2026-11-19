@@ -183,7 +183,7 @@ def test_word_cast_unifies_numbered_headings_annotated_rosters_and_short_names(c
         '对白：周向阳：我来看看。\n林知秋：请坐。\n周向阳：谢谢。',
         '分镜 2 点头', '画面：两人看向杯子。',
         '出场人物：林知秋、周向阳（均为成年、虚构人物）', '表演：人物甲｜动作=点头',
-        '对白：周向阳（轻声）：很好。', '字幕：待审核',
+        '对白：周向阳（轻声）：很好。', '字幕：待审核', '镜头色卡编号：待审核',
     ):
         doc.add_paragraph(text)
     word = BytesIO()
@@ -554,8 +554,111 @@ def test_docx_signature_and_size_are_checked_before_persistence(client):
     response=client.post('/api/studio/import',files={'file':('bad.docx',b'not a real Word file')})
     assert response.status_code in (400,415,422)
     response=client.post('/api/studio/import',files={'file':('old.doc',b'old binary')})
-    assert response.status_code==415
+    assert response.status_code==422
+    assert response.json()['error']['code']=='invalid_docx'
     assert len(client.get('/api/projects').json())==0
+
+
+def test_four_timecode_headings_import_locally_with_exact_duration_and_framing(client, monkeypatch):
+    from app.services import studio_import
+
+    async def unexpected_model(*args, **kwargs):
+        pytest.fail('Explicit time ranges must use the local parser')
+
+    monkeypatch.setattr(studio_import, 'language_extract', unexpected_model)
+    doc=Document()
+    doc.add_heading('城市短片',0)
+    doc.add_heading('物理与画面硬性规范',1)
+    doc.add_paragraph('场景设定：夜晚的街口，雨水从雨棚滴落。')
+    doc.add_paragraph('技术参数：保持低饱和度。')
+    doc.add_heading('分镜时间轴',1)
+    for period,action in zip(('00:00-00:02','00:02–00:05','00:05—00:08','00:08-00:10'),
+                             ('打开房门','停在雨中','转向街灯','推开雨伞')):
+        doc.add_heading(period,2)
+        doc.add_paragraph('摄影与构图：竖屏 9:16，固定机位，近景。')
+        doc.add_paragraph('视觉与动作：'+action)
+        doc.add_paragraph('照明与氛围：暖色路灯。')
+    raw=BytesIO();doc.save(raw)
+    response=client.post('/api/studio/import',files={'file':('时间轴.docx',raw.getvalue())})
+    assert response.status_code==200,response.text
+    result=response.json()
+    assert result['status']=='imported',result.get('issues')
+    assert result['parser']['language_model_called'] is False
+    with client.app.state.session_factory() as db:
+        shots=db.scalars(select(m.StoryboardShot).where(m.StoryboardShot.project_id==result['project_id'])
+                        .order_by(m.StoryboardShot.order)).all()
+        assert [shot.duration_seconds for shot in shots]==[2,3,3,2]
+        assert [shot.aspect_ratio for shot in shots]==['9:16']*4
+        assert shots[2].visual_prompt=='转向街灯'
+        assert shots[2].lighting=='暖色路灯。'
+
+
+def test_multiline_subtitles_only_keep_explicit_dialogue_for_tts(client):
+    doc=Document()
+    doc.add_heading('夜路',0)
+    for text in ('人物设定','人物 林夏','人物 周云','正文剧情','场景 1 车站',
+                 '分镜 1 等候','画面：两人站在雨棚下。','时长：8秒',
+                 '对白：林夏：车来了。\n周云：看到了。',
+                 '字幕：林夏：车来了。\n周云：看到了。',
+                 '对白：周云：看到了。'):
+        doc.add_paragraph(text)
+    data=BytesIO();doc.save(data)
+    response=client.post('/api/word-imports',files={'file':('字幕.docx',data.getvalue())})
+    assert response.status_code==201,response.text
+    first=response.json()['preview_json']['shots'][0]
+    assert [line['text'] for line in first['dialogues']]==['车来了。','看到了。','看到了。']
+    assert first['photography']['subtitle_text']=='林夏：车来了。\n周云：看到了。'
+    assert not response.json()['preview_json']['unrecognized']
+
+
+def test_timed_table_keeps_row_order_and_recovers_interrupted_import(client):
+    doc=Document()
+    doc.add_heading('拍摄计划',0)
+    table=doc.add_table(rows=1,cols=4)
+    table.rows[0].cells[0].merge(table.rows[0].cells[3]).text='拍摄时间表'
+    for row in (('Start Time','End Time','Visual Description','Camera Movement'),
+                ('00:01.250','00:04.125','A door opens.','Push in.'),
+                ('00:04.125','00:09','The light comes on.','Static shot.')):
+        for cell,value in zip(table.add_row().cells,row):
+            cell.text=value
+    raw=BytesIO();doc.save(raw)
+    created=client.post('/api/word-imports',files={'file':('shots.dotx',raw.getvalue())}).json()
+    with client.app.state.session_factory() as db:
+        old=db.get(m.WordImport,created['id']);old.status='parsing';db.commit()
+    url='/api/word-imports/'+created['id']+'/retry'
+    stale=client.post(url,params={'expected_revision':created['revision']-1})
+    assert stale.status_code==409
+    retry=client.post(url,params={'expected_revision':created['revision']})
+    assert retry.status_code==200,retry.text
+    parsed=retry.json()
+    assert parsed['status']=='pending_review'
+    assert parsed['revision']==created['revision']+1
+    assert [row['duration_seconds'] for row in parsed['preview_json']['shots']]==[2.875,4.875]
+    assert [row['visual_prompt'] for row in parsed['preview_json']['shots']]==['A door opens.','The light comes on.']
+
+
+def test_slow_word_semantics_returns_original_text_and_review_preview(client, monkeypatch):
+    from app.services import ai_services, studio_import
+
+    with client.app.state.session_factory() as db:
+        db.add(m.AIService(module='language_processing',provider='local_llm',name='Local contract',
+                          base_url='http://127.0.0.1:8772/v1',default_model='local-contract',is_default=True))
+        db.commit()
+
+    async def slow_model(*args,**kwargs):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(ai_services,'service_request',slow_model)
+    monkeypatch.setattr(studio_import,'WORD_IMPORT_MODEL_WAIT_SECONDS',.02)
+    doc=Document()
+    doc.add_paragraph('雨落在屋檐上。')
+    doc.add_paragraph('门缓缓打开。')
+    raw=BytesIO();doc.save(raw)
+    result=upload(client,raw.getvalue()).json()
+    assert result['status']=='pending_review'
+    assert result['parser']['status']=='timed_out'
+    assert result['parser']['language_model_called'] is True
+    assert result['preview']['shots'][0]['visual_prompt']=='雨落在屋檐上。\n门缓缓打开。'
 
 
 def test_editing_one_shot_reuses_other_shot_and_preserves_video_record(client):

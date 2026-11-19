@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 from fastapi import APIRouter, Depends, Request, UploadFile, File
 from fastapi.responses import FileResponse
-from sqlalchemy import select, func, Integer, Float, JSON
+from sqlalchemy import select, update, func, Integer, Float, JSON
 from sqlalchemy.orm import Session
 from pydantic import ValidationError
 from app.core.config import PROJECT_ROOT
@@ -17,10 +17,12 @@ from app.services.screenplay import (row, get, shot_bundle, touch_shot, add_part
     validate_participant, remove_participant, PERFORMANCE_FIELDS)
 from app.services.word_screenplay import (read_blocks, parse_blocks, match_characters, validate_preview,
     summary, commit_import)
+from app.services.word_files import WORD_EXTENSIONS
 from app.services.content_manager import (RESOURCES, public_record, build_plan, public_plan, execute_delete,
     task_public, file_outbox, restore_task, safe_file, label)
 
 router=APIRouter(prefix='/api')
+REVIEWABLE_WORD_IMPORTS = {'uploaded','parsing','failed','pending_review'}
 
 
 @router.get('/projects/{project_id}/scenes')
@@ -230,16 +232,35 @@ def import_public(batch,session):
 
 
 def parse_import(session,settings,batch):
-    batch.status='parsing';batch.error_message=None;session.commit()
+    identifier, revision, filename, relative_path = batch.id, batch.revision, batch.filename, batch.relative_path
+    expected_sha = batch.sha256
+    had_preview = bool(batch.preview_json)
+    session.rollback()
     try:
-        if Path(batch.filename).suffix.lower()!='.docx':raise AppError(415,'legacy_doc','仅支持 .docx；旧版 .doc 请用 Word 或 LibreOffice 另存为 .docx')
-        data=safe_file(settings.media_root,batch.relative_path).read_bytes()
-        batch.blocks_json=read_blocks(data,settings.import_max_bytes)
+        path=safe_file(settings.media_root,relative_path)
+        with path.open('rb') as source:
+            data=source.read(settings.import_max_bytes+1)
+        if len(data)<=settings.import_max_bytes and hashlib.sha256(data).hexdigest()!=expected_sha:
+            raise AppError(409,'word_original_changed','已保存的原文无法验证，请重新上传文档')
+        blocks=read_blocks(data,settings.import_max_bytes,filename)
         from app.services.cinematic_import import build_ir
-        batch.preview_json=match_characters(session,build_ir(batch.blocks_json,parse_blocks));batch.status='pending_review';batch.revision+=1
+        from app.services.studio_import import content_fingerprint
+        preview=match_characters(session,build_ir(blocks,parse_blocks))
+        preview['semantic_parser']={'mode':'local_source_preserving_rules','language_model_called':False}
+        preview['content_fingerprint']=content_fingerprint(blocks)
+        changes={'blocks_json':blocks,'preview_json':preview,'status':'pending_review','error_message':None}
     except (AppError,OSError,ValueError) as exc:
-        batch.status='failed';batch.error_message=exc.message if isinstance(exc,AppError) else type(exc).__name__+'：文档读取失败'
-    session.commit();return import_public(batch,session)
+        changes={'status':'pending_review' if had_preview else 'failed',
+                 'error_message':exc.message if isinstance(exc,AppError) else '无法读取已保存的 Word 原文'}
+    session.rollback()
+    result=session.execute(update(m.WordImport).where(
+        m.WordImport.id==identifier,m.WordImport.revision==revision,
+        m.WordImport.status.in_(REVIEWABLE_WORD_IMPORTS)).values(**changes,revision=revision+1))
+    if result.rowcount!=1:
+        session.rollback()
+        raise AppError(409,'import_stale','预览已变化，请重新读取当前版本')
+    session.commit()
+    return import_public(get(session,m.WordImport,identifier),session)
 
 
 @router.post('/word-imports',status_code=201)
@@ -247,9 +268,10 @@ async def upload_word(request:Request,file:UploadFile=File(...),session:Session=
     limit=request.app.state.settings.import_max_bytes
     data=await file.read(limit+1)
     if len(data)>limit:raise AppError(413,'document_too_large','文档超过大小限制')
-    batch=m.WordImport(filename=Path((file.filename or 'document.docx').replace('\\','/')).name[:240],sha256=hashlib.sha256(data).hexdigest(),relative_path='')
+    batch=m.WordImport(filename=Path((file.filename or 'document.docx').replace('\\','/')).name[:240],sha256=hashlib.sha256(data).hexdigest(),relative_path='',status='uploaded')
     session.add(batch);session.flush()
-    batch.relative_path='word_imports/'+batch.id+'/original'+Path(batch.filename).suffix.lower()
+    suffix=Path(batch.filename).suffix.lower()
+    batch.relative_path='word_imports/'+batch.id+'/original'+(suffix if suffix in WORD_EXTENSIONS else '.bin')
     path=safe_file(request.app.state.settings.media_root,batch.relative_path);path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data);session.commit()
     return await asyncio.to_thread(parse_import,session,request.app.state.settings,batch)
 
@@ -265,9 +287,11 @@ def import_detail(import_id:str,session:Session=Depends(get_db)):
 
 
 @router.post('/word-imports/{import_id}/retry')
-def retry_import(import_id:str,request:Request,session:Session=Depends(get_db)):
+def retry_import(import_id:str,request:Request,session:Session=Depends(get_db),expected_revision:int|None=None):
     batch=get(session,m.WordImport,import_id)
-    if batch.status not in ('failed','pending_review'):raise AppError(409,'import_not_retryable','已导入记录不可重新解析覆盖，请新建导入批次')
+    if batch.status not in REVIEWABLE_WORD_IMPORTS:raise AppError(409,'import_not_retryable','已导入记录不可重新解析覆盖，请新建导入批次')
+    if expected_revision is not None and batch.revision!=expected_revision:
+        raise AppError(409,'import_stale','预览已变化，请重新读取当前版本')
     return parse_import(session,request.app.state.settings,batch)
 
 

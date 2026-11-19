@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import socket
+import zipfile
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,7 @@ from app.core.config import Settings
 from app.core.errors import AppError
 from app.services.imports import parse_uploaded_document, validate_url_target
 from app.services.parser import DeterministicScriptParser
+from app.services.word_screenplay import read_blocks
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,6 +48,26 @@ def test_text_and_docx_importers_extract_visible_content() -> None:
     assert docx_mime.endswith("wordprocessingml.document")
     assert "雨夜街口" in docx_text
     assert "咖啡店窗边" in docx_text
+
+
+@pytest.mark.parametrize("extension", [".docx", ".docm", ".dotx", ".dotm"])
+def test_word_processes_content_controls_textboxes_and_tracked_insertions(extension):
+    xml=b'''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                        xmlns:v="urn:schemas-microsoft-com:vml">
+       <w:body><w:sdt><w:sdtContent><w:p><w:r><w:t>Controlled text</w:t></w:r></w:p></w:sdtContent></w:sdt>
+       <w:p><w:r><w:t>Before</w:t><w:br/><w:t>after</w:t></w:r>
+         <w:ins><w:r><w:t> inserted</w:t></w:r></w:ins><w:del><w:r><w:delText> removed</w:delText></w:r></w:del>
+       </w:p><w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent>
+       <w:p><w:r><w:t>Inside the box</w:t></w:r></w:p>
+       </w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p></w:body></w:document>'''
+    raw=BytesIO()
+    with zipfile.ZipFile(raw,"w") as archive:
+        archive.writestr("word/document.xml",xml)
+    blocks=read_blocks(raw.getvalue(),2_000_000,"layout"+extension)
+    assert [row["text"] for row in blocks]==["Controlled text","Before\nafter inserted","Inside the box"]
+    flat,mime=parse_uploaded_document("layout"+extension,raw.getvalue(),2_000_000)
+    assert flat=="Controlled text\nBefore\nafter inserted\nInside the box"
+    assert mime.startswith("application/")
 
 
 @pytest.mark.parametrize(

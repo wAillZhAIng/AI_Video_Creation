@@ -43,7 +43,7 @@ def _timecode(value: str) -> Decimal | None:
     return seconds + minutes * 60 + int(hours or 0) * 3600
 
 
-def _interval_seconds(text: str, declared: Decimal | None) -> Decimal | None:
+def _interval_seconds(text: str, declared: Decimal | None, *, timeline=False) -> Decimal | None:
     bounds = _INTERVAL_SEPARATOR.split(text, maxsplit=1)
     if len(bounds) != 2:
         return None
@@ -52,7 +52,7 @@ def _interval_seconds(text: str, declared: Decimal | None) -> Decimal | None:
         start, end = map(_seconds, bounds)
         # A bare numerical range could be an estimate for a single duration.
         # A declared elapsed value or a zero origin establishes an interval.
-        if declared is None and start != 0:
+        if not timeline and declared is None and start != 0:
             return None
     if start is None or end is None:
         return None
@@ -61,7 +61,16 @@ def _interval_seconds(text: str, declared: Decimal | None) -> Decimal | None:
     return end - start
 
 
-def parse_shot_duration(value: str) -> float:
+def is_time_range(value: str, *, timeline=False) -> bool:
+    text = unicodedata.normalize('NFKC', value).strip()
+    bounds = _INTERVAL_SEPARATOR.split(text, maxsplit=1)
+    if len(bounds) != 2:
+        return False
+    return all(_TIMECODE.fullmatch(part.strip()) for part in bounds) or (
+        timeline and all(_SECONDS.fullmatch(part.strip()) for part in bounds))
+
+
+def parse_shot_duration(value: str, *, timeline=False) -> float:
     """Return elapsed seconds, or explain what needs confirmation."""
     text = ' '.join(unicodedata.normalize('NFKC', value).split())
     seconds = _elapsed(text)
@@ -77,7 +86,7 @@ def parse_shot_duration(value: str) -> float:
             if declared is None:
                 raise ValueError('时间区间附带的时长无法识别')
             text = annotation['interval']
-        seconds = _interval_seconds(text, declared)
+        seconds = _interval_seconds(text, declared, timeline=timeline)
         if seconds is None:
             raise ValueError('无法确定时长，请填写秒数或明确的起止时间码')
         if declared is not None:

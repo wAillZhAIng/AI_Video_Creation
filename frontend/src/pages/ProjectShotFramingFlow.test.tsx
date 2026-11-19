@@ -77,7 +77,7 @@ it.each([['studio',StudioPage,'开始／增量续作',false],['studio',StudioPag
   await screen.findByText(/无法读取实际镜头画幅/);
   expect(screen.getByRole('button',{name:action})).toBeDisabled();
   expect(screen.getByRole('button',{name:'重新读取镜头画幅'})).toBeEnabled();
-  if(name==='studio')expect(screen.getByLabelText('剧本文档（.docx）')).toBeEnabled();
+  if(name==='studio')expect(screen.getByLabelText('Word 剧本文档')).toBeEnabled();
   failed=false;await user.click(screen.getByRole('button',{name:'重新读取镜头画幅'}));
   await waitFor(()=>expect(screen.queryByText(/无法读取实际镜头画幅/)).toBeNull());
   await waitFor(()=>expect(screen.getByRole('button',{name:action})).toBeEnabled());

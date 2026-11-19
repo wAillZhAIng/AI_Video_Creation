@@ -3,6 +3,8 @@ import { request, api } from '../lib/api';
 import { FormField } from './ui';
 type Row=Record<string,any>;
 
+export const WORD_FILE_ACCEPT='.docx,.docm,.dotx,.dotm,.doc,.dot,.rtf';
+
 export function WordImportPanel({onClose, importId, studioMode=false, initialProjectId='', onImported,onBusyChange}: {onClose?:()=>void; importId?:string; studioMode?:boolean; initialProjectId?:string; onImported?:(projectId:string)=>Promise<void>;onBusyChange?:(busy:boolean)=>void}) {
   const resumeId=importId || new URLSearchParams(window.location.search).get('import');
   const [batch,setBatch]=useState<Row|null>(null),[preview,setPreview]=useState<Row|null>(null),[busy,setBusy]=useState(''),[error,setError]=useState('');
@@ -15,6 +17,15 @@ export function WordImportPanel({onClose, importId, studioMode=false, initialPro
     setBusy('正在读取正文与表格');setError('');setResult(null);
     try {const body=new FormData();body.append('file',file);const b=await request<Row>('/api/word-imports',{method:'POST',body});setBatch(b);setPreview(b.preview_json);setStrategy(b.duplicates.length?'':'new_project');if(b.status==='failed')setError(b.error_message);}
     catch(e){setError(String(e));}finally{setBusy('');}
+  }
+  async function reparse() {
+    if(!batch||busy||preview!==batch.preview_json)return;
+    setBusy('正在重新读取原文');setError('');
+    try {
+      const path='/api/word-imports/'+batch.id+'/retry?expected_revision='+batch.revision;
+      const next=await request<Row>(path,{method:'POST'});
+      setBatch(next);setPreview(next.preview_json);setError(next.error_message||(next.issues||[]).join('；'));
+    }catch(e){setError(String(e));}finally{setBusy('');}
   }
   async function confirm() {
     if(!batch||!preview)return;setBusy('正在保存预览并校验');setError('');
@@ -30,14 +41,14 @@ export function WordImportPanel({onClose, importId, studioMode=false, initialPro
   function mergeShot(index:number) {update(p=>{const a=p.shots[index],b=p.shots[index+1];if(a.scene_key!==b.scene_key)return;a.visual_prompt+='\n'+b.visual_prompt;a.dialogues.push(...b.dialogues);a.audio_events.push(...b.audio_events);a.source.push(...b.source);for(const person of b.participants)if(!a.participants.some((x:Row)=>x.character_key===person.character_key))a.participants.push(person);p.shots.splice(index+1,1);});}
   return <section className="card word-import-panel" aria-label="Word剧本导入">
     <div className="section-heading"><div><h2>{studioMode?'处理剧本导入异常':'导入 Word 剧本'}</h2><p>{studioMode?'核对下方身份或解析歧义；确认后先配置角色配音与画质，再开始制作。':'上传 → 核对角色与分镜 → 确认入库。解析阶段不会创建业务人物或分镜。'}</p></div>{onClose?<button className="button button-ghost" disabled={Boolean(busy)} onClick={onClose}>关闭导入</button>:null}</div>
-    <div className="toolbar"><a className="button button-secondary" href={api.mediaUrl('/api/word-imports/templates/blank')}>下载 Word 模板</a><a className="button button-secondary" href={api.mediaUrl('/api/word-imports/templates/example')}>下载完整示例</a><a href="/content?resource=imports">查看导入记录与失败重试</a></div>
-    <p className="muted">标准模板与通用自然语言 Word 使用同一中间结构。兼容解析会保留未知内容并标出推断，不冒充已连接通用语义大模型。旧版 .doc 请先另存为 .docx。</p>
-    {!studioMode?<label className="drop-zone">选择 Word 剧本<input aria-label="上传Word剧本" type="file" accept=".docx,.doc" disabled={!!busy} onChange={e=>{const file=e.target.files?.[0];if(file)void upload(file);}}/></label>:null}
+    <div className="toolbar"><a className="button button-secondary" href={api.mediaUrl('/api/word-imports/templates/blank')}>下载 Word 模板</a><a className="button button-secondary" href={api.mediaUrl('/api/word-imports/templates/example')}>下载完整示例</a><a href="/content?resource=imports">查看导入记录</a>{batch&&['uploaded','parsing','failed','pending_review'].includes(batch.status)?<button type="button" className="button button-secondary" disabled={!!busy||preview!==batch.preview_json} onClick={()=>void reparse()}>重新读取原文</button>:null}</div>
+    {!studioMode?<label className="drop-zone">选择 Word 剧本<input aria-label="上传Word剧本" type="file" accept={WORD_FILE_ACCEPT} disabled={!!busy} onChange={e=>{const file=e.target.files?.[0];if(file)void upload(file);}}/><small>支持 DOCX、DOCM、DOTX、DOTM、DOC、DOT 和 RTF</small></label>:null}
     {busy?<p role="status">{busy}…</p>:null}{error?<p role="alert" className="inline-notice warning">{error}</p>:null}
-    {batch&&batch.status!=='failed'&&preview?<>
+    {batch&&batch.status!=='failed'&&preview?.project&&Array.isArray(preview.shots)?<>
       <div className="import-summary" data-testid="word-summary">{batch.summary.characters} 人物 · {batch.summary.scenes} 场景 · {batch.summary.shots} 分镜 · {batch.summary.dialogues} 对白 · {batch.summary.suggestions} 参数建议 · {batch.summary.unrecognized} 未归类片段</div>
       {preview.versions?<details className="workspace-details" open><summary>统一制作规范与生成前报告</summary><p>{preview.mode==='standard'?'标准模板模式':'通用兼容模式'} · {preview.versions.production_rules_version} · {preview.versions.screenplay_schema_version}</p><p>规则提取置信度只表示来源依据，不代表语义理解或电影质量评分。原文、建议、继承、未知与冲突均可追溯。</p>{batch.production_report?<><p>{batch.production_report.counts?.blocker||0} 阻塞 · {batch.production_report.counts?.review||0} 待确认 · {batch.production_report.counts?.suggestion||0} 建议；计划 {batch.production_report.estimate?.keyframes||0} 关键画面 / {batch.production_report.estimate?.video_jobs||0} 视频任务。</p>{batch.production_report.findings.map((f:Row,i:number)=><p key={i}>{f.message} {f.source_ids?.join('，')}</p>)}</>:null}</details>:null}
-      <p>状态：{({pending_review:'待审核',completed:'已导入'} as Row)[batch.status]||batch.status} · 来源 {batch.filename} · 预览 v{batch.revision}</p>
+      <p role="status">{batch.status==='pending_review'?'Word 预览已就绪，等待确认':batch.status==='completed'?'已导入':batch.status} · {batch.filename}</p>
+      {preview.semantic_parser?.status==='timed_out'||preview.semantic_parser?.status==='unavailable'?<p className="form-hint">{preview.semantic_parser.reason}</p>:null}
       <FormField label="项目标题"><input value={preview.project.name} onChange={e=>update(p=>{p.project.name=e.target.value;})}/></FormField>
       <details className="workspace-details" open><summary>人物匹配与档案</summary>{preview.characters.map((c:Row,index:number)=><div className="import-character" key={c.key}>
         <h3>{c.name} {c.aliases.length?'· 别名 '+c.aliases.join('、'):''}</h3><small>原文位置：{c.source.join('，')}</small>

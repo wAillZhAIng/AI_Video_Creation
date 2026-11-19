@@ -5,7 +5,7 @@ import { ApiError, api, MODEL_CONNECTIONS_RECHECKED, request } from '../lib/api'
 import type { PipelineStart, StudioOverview } from '../lib/studio-contract';
 import { PageHeader, EmptyState, LoadingState, FormField } from '../components/ui';
 import { useStudio, StudioProjectPicker, StudioStatus, recordText, shotTime, studioAssetPath, studioVideoDuration } from '../lib/studio-ui';
-import { WordImportPanel } from '../components/WordImportPanel';
+import { WORD_FILE_ACCEPT, WordImportPanel } from '../components/WordImportPanel';
 import { ProjectProductPreparation } from '../components/ProjectProductPreparation';
 import { ProjectProductReferences, type ProductReferenceState } from '../components/ProjectProductReferences';
 import { ProjectProductionModels } from '../components/ProjectProductionModels';
@@ -199,7 +199,7 @@ export function StudioPage() {
       <div className="studio-import-copy"><FileUp size={28} aria-hidden="true"/><div><h2>导入 Word，准备制作</h2><p>{projectId ? `导入至「${data?.project.name || projects.find(p => p.id === projectId)?.name || '当前项目'}」，相同文档按已有记录复用。` : '未选择项目时，根据剧本自动创建项目。'} 导入后先配置角色参考音频，再确认开始制作。</p></div></div>
       {data?.script?<div className="inline-notice" role="status"><strong>已加载保存的剧本</strong><p>{recordText(data.project.source_filename||data.script.filename||data.script.source_filename||data.script.title)||'已保存的结构化剧本和源文档'} · {scenes.length} 个场景 · {shots.length} 个分镜 · {characters.length} 位角色 · 解析状态：{recordText(data.script.status)||'已保存'}</p><p>已识别角色：{characters.map(character=>recordText(character.display_name||character.name)).join('、')||'暂无角色'}</p><p>已识别场景：{scenes.map(scene=>recordText(scene.name||scene.title)).join('、')||'暂无场景'}</p><p>此项目可直接继续制作，无需重新导入同一份 Word。下面仅用于导入新的文档或修订。</p></div>:null}
       <form onSubmit={importWord}>
-        <FormField label="剧本文档（.docx）" hint="请选择 Word 实际保存的 .docx 文件。"><input key={fileInputKey} type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={e => setFile(e.target.files?.[0] || null)} disabled={pageBusy||preparationUnsettled||Boolean(pendingImport)}/></FormField>
+        <FormField label="Word 剧本文档" hint="支持 DOCX、DOCM、DOTX、DOTM、DOC、DOT 和 RTF。"><input key={fileInputKey} type="file" accept={WORD_FILE_ACCEPT} onChange={e => setFile(e.target.files?.[0] || null)} disabled={pageBusy||preparationUnsettled||Boolean(pendingImport)}/></FormField>
         {projectId?<label className="studio-check"><input type="checkbox" checked={newRevision} onChange={e=>setNewRevision(e.target.checked)}/><span>将改动的 Word 保存为本项目新剧本修订。相同文档会复用已有结果，原人物身份、素材和历史视频保留。</span></label>:null}
         <label className="studio-check"><input type="checkbox" checked={cloudCosts} onChange={e => {setCloudCosts(e.target.checked);if(!e.target.checked)setPaidFallback(false);}} disabled={pageBusy||preparationUnsettled}/><span>允许本项目调用已配置的云端生成服务，并承担供应商实际费用。未勾选时仅执行获准的本地任务。</span></label>
         <label className="studio-check"><input type="checkbox" checked={paidFallback} onChange={e=>setPaidFallback(e.target.checked)} disabled={pageBusy||preparationUnsettled||!cloudCosts}/><span>允许本次制作在已保存策略许可时回退到付费云端；仅开启云端调用不会自动授权付费回退。</span></label><div className="studio-import-bottom"><span>导入仅建立制作数据；确认配音与画质后再派发生成任务。</span><button className="button button-primary" disabled={pageBusy||preparationUnsettled||Boolean(pendingImport)||!file||quality.loading||quality.saving||!quality.profile||!quality.supported}><FileUp size={16}/>{busy === 'import' ? '正在解析并创建制作数据…' : '导入并配置制作'}</button></div>

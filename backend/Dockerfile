@@ -26,7 +26,7 @@ ARG DEBIAN_MIRROR=https://deb.debian.org/debian
 ARG DEBIAN_SECURITY_MIRROR=https://deb.debian.org/debian-security
 RUN python /usr/local/lib/video-factory-configure-apt.py \
     && apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates ffmpeg fonts-noto-cjk \
+    && apt-get install --no-install-recommends -y ca-certificates ffmpeg fonts-noto-cjk libreoffice-writer \
     && sh /usr/local/lib/video-factory-collect-source.sh \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 factory \

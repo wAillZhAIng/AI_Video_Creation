@@ -189,7 +189,7 @@ describe('Studio UI contracts', () => {
   it('uploads Word through unified import with cloud costs disabled until explicitly selected', async () => {
     const user=userEvent.setup();
     render(<MemoryRouter><StudioPage/></MemoryRouter>);
-    const input=screen.getByLabelText('剧本文档（.docx）');
+    const input=screen.getByLabelText('Word 剧本文档');
     await user.upload(input,new File(['contract fixture'],'scene.docx',{type:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}));
     await user.click(screen.getByRole('button',{name:'导入并配置制作'}));
     await waitFor(()=>expect(mockRequest.mock.calls.some(([path])=>path==='/api/studio/import')).toBe(true));

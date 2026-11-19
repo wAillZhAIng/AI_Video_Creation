@@ -3,14 +3,10 @@ import hashlib
 import json
 import re
 from difflib import SequenceMatcher
-from io import BytesIO
-from docx import Document
-from docx.table import Table
-from docx.text.paragraph import Paragraph
 from sqlalchemy import select, func
 from app.core.errors import AppError
 from app.services.cinematic_rules import field_provenance
-from app.services.imports import parse_uploaded_document
+from app.services.word_files import read_word_blocks
 from app.services.word_cast import cast_entries, character_heading, name_without_annotation
 from app.services.word_duration import parse_shot_duration
 from app.models import (Character, CharacterVersion, CharacterAlias, WordImport, Project, ScriptRevision,
@@ -19,21 +15,22 @@ from app.schemas import ShotCreate
 from app.schemas_product import IdentityProfile
 
 
+CAPTION_FIELDS = {'字幕','字幕内容','字幕与屏幕文字','屏幕文字','屏幕文本','subtitles','captions','on-screen text'}
+VALID_ASPECTS = {'16:9', '9:16', '1:1'}
+_ASPECT = re.compile(r'(?<![\d:：])(?:16\s*[:：]\s*9|9\s*[:：]\s*16|1\s*[:：]\s*1)(?![\d:：])')
+
+
+def _declared_aspect(value):
+    aspects={re.sub(r'\s+', '', match.replace('：', ':')) for match in _ASPECT.findall(value)}
+    return next(iter(aspects)) if len(aspects)==1 else None
+
+
 def digest(value):
     return hashlib.sha256(value.encode('utf-8')).hexdigest()
 
 
-def read_blocks(data, limit):
-    parse_uploaded_document('source.docx',data,limit)  # zip expansion/signature/content limits
-    doc = Document(BytesIO(data))
-    blocks = []
-    for index, element in enumerate(doc.iter_inner_content()):
-        if isinstance(element,Paragraph):
-            blocks.append({'id':f'paragraph:{index}','kind':'paragraph','style':element.style.name if element.style else '',
-                           'text':element.text,'heading_level':int(element.style.name[-1]) if element.style and re.match(r'Heading [1-9]$',element.style.name) else None})
-        elif isinstance(element,Table):
-            blocks.append({'id':f'table:{index}','kind':'table','rows':[[c.text for c in r.cells] for r in element.rows]})
-    return blocks
+def read_blocks(data, limit, filename='source.docx'):
+    return read_word_blocks(filename, data, limit)
 
 
 def block_lines(blocks):
@@ -141,10 +138,22 @@ def parse_blocks(blocks):
     perf_fields.update({label:key for key,label in cinematic_rules['field_labels'].items() if key in cinematic_rules['fields']['action'] or key in cinematic_rules['performance_state_fields']})
     env_fields.update({label:key for key,label in cinematic_rules['field_labels'].items() if key in cinematic_rules['fields']['scene']})
     titles={b['id']:b.get('style','') for b in blocks if b.get('style') in ('Title','Subtitle')}
-    performance_source = None
+    performance_source = caption_source = None
     for text,source in block_lines(blocks):
         text=text.strip()
         if not text: continue
+        parts=re.split(r'[:：]',text,maxsplit=1)
+        key,value=(parts[0].strip(),parts[1].strip()) if len(parts)==2 else ('',text)
+        caption_field=key.casefold() in CAPTION_FIELDS
+        if shot and (caption_field or (source==caption_source and key not in {
+                '对白','画面','画面描述','视觉重点','动作','出场人物','参与人物','运镜','镜头运动',
+                '时长','时段','表演','环境声','音效','音乐','灯光','画幅',*camera_fields})):
+            caption_source=source
+            caption=value if caption_field else text
+            current=shot['photography'].get('subtitle_text','')
+            shot['photography']['subtitle_text']='\n'.join(v for v in (current,caption) if v)
+            continue
+        caption_source=None
         if source in titles:
             if titles[source]=='Title' and preview['project']['name']=='未命名剧本':preview['project']['name']=text[:200]
             else:preview['project']['notes']=preview['project'].get('notes','')+'\n'+text
@@ -162,18 +171,28 @@ def parse_blocks(blocks):
         found=re.match(r'^场景\s*([A-Za-z\d一二三四五六七八九十]+)[\s：:.、-]*(.*)$',text)
         if found:
             scene={'key':'scene_'+str(len(preview['scenes'])+1),'name':found[2] or '场景'+found[1],'order':len(preview['scenes'])+1,'environment':{},'source':[source]}
-            preview['scenes'].append(scene); person=None; shot=None; continue
-        found=re.match(r'^(?:分镜|镜头)\s*([A-Za-z\d]+)[\s：:.、-]*(.*)$',text)
+            preview['scenes'].append(scene); section='正文剧情'; person=None; shot=None; continue
+        found=re.match(r'^(?:分镜|镜头)\s*([A-Za-z\d一二三四五六七八九十]+)[\s：:.、-]*(.*)$',text)
         if found:
             if not scene:
                 scene={'key':'scene_1','name':'待确认场景','order':1,'environment':{},'source':[], 'suggested':['name']};preview['scenes'].append(scene)
             shot={'key':'shot_'+str(len(preview['shots'])+1),'scene_key':scene['key'],'title':found[2] or '分镜'+found[1], 'visual_prompt':'','action':'','camera_move':'固定','duration_seconds':5,'participants':[],'dialogues':[],'audio_events':[],'photography':{},'source':[source],'suggested':['duration_seconds','camera_move']}
             preview['shots'].append(shot);person=None;continue
-        parts=re.split(r'[:：]',text,maxsplit=1)
-        key,value=(parts[0].strip(),parts[1].strip()) if len(parts)==2 else ('',text)
         if key in ('项目名称','标题','题材','目标时长','画幅','风格','补充说明') and not shot and not person:
             mapped={'项目名称':'name','标题':'name','题材':'genre','目标时长':'target_duration','画幅':'aspect_ratio','风格':'style','补充说明':'notes'}[key]
-            preview['project'][mapped]=value;continue
+            if key=='画幅':
+                aspect=_declared_aspect(value)
+                if aspect:
+                    preview['project']['aspect_ratio']=aspect
+                    preview['project'].setdefault('provenance',{})['aspect_ratio']=field_provenance(aspect,[source])
+                else:
+                    preview['unrecognized'].append({'source':source,'text':text,'reason':'项目画幅需确认'})
+            else:
+                preview['project'][mapped]=value
+            continue
+        if key=='制作约束' and not shot and not person:
+            preview['project']['constraints']=(preview['project'].get('constraints','')+'\n'+value).strip()
+            continue
         if section in ('全剧梗概','本集梗概','梗概','连续性要求','额外约束') and not shot:
             field='synopsis' if '梗概' in section else 'constraints'
             preview['project'][field]=preview['project'].get(field,'')+'\n'+text;continue
@@ -201,16 +220,35 @@ def parse_blocks(blocks):
                 else:
                     for label in entries:
                         participate(label, source, text)
-            elif key in ('画面','画面描述','视觉重点'): shot['visual_prompt']=value
+            elif key in ('画面','画面描述','视觉重点'):
+                shot['visual_prompt']='\n'.join(v for v in (shot['visual_prompt'],value) if v)
             elif key=='动作': shot['action']=value
             elif key in ('运镜','镜头运动'):
                 shot['camera_move']=value;shot['suggested']=[x for x in shot['suggested'] if x!='camera_move']
-            elif key in ('时长','建议时长'):
+            elif key in ('画幅','摄影与构图'):
+                if key=='摄影与构图':
+                    shot['photography']['composition']=value
+                    if value and len(value)<=200 and 'camera_move' in shot['suggested']:
+                        shot['camera_move']=value
+                        shot['suggested'].remove('camera_move')
+                if aspect:=_declared_aspect(value):
+                    shot['aspect_ratio']=aspect
+                    shot.setdefault('provenance',{})['aspect_ratio']=field_provenance(aspect,[source])
+                elif key=='画幅':
+                    preview['unrecognized'].append({'source':source,'text':text,'reason':'镜头画幅需确认'})
+            elif key=='灯光':
+                shot['photography']['lighting']=value
+            elif key in ('时长','建议时长','时段'):
                 if not value:
                     continue
+                if key=='时段':
+                    shot['time_range']=value
                 provenance = shot.setdefault('provenance', {})
                 try:
-                    shot['duration_seconds'] = parse_shot_duration(value)
+                    seconds=parse_shot_duration(value,timeline=key=='时段')
+                    if 'duration_seconds' not in shot['suggested'] and abs(shot['duration_seconds']-seconds)>.001:
+                        raise ValueError('时间区间和标注的时长不一致')
+                    shot['duration_seconds']=seconds
                 except ValueError as exc:
                     provenance['duration_seconds'] = {
                         **field_provenance(value, [source], 'conflict', str(exc)), 'source_text': value[:240]}
@@ -245,6 +283,8 @@ def parse_blocks(blocks):
                     if p is not None:
                         shot['dialogues'].append({'character_key':p['character_key'],'text':spoken[1].strip(),'delivery':delivery,'source':[source]})
                 else: preview['unrecognized'].append({'source':source,'text':text,'reason':'对白缺少说话人'})
+            elif not key and shot.get('time_range'):
+                shot['visual_prompt']='\n'.join(v for v in (shot['visual_prompt'],text) if v)
             else: preview['unrecognized'].append({'source':source,'text':text,'reason':'镜头正文待归类'})
             continue
         if scene and key in env_fields: scene['environment'][env_fields[key]]=value;continue
@@ -252,6 +292,9 @@ def parse_blocks(blocks):
             scene.setdefault('audio_events',[]).append({'kind':'ambience' if key=='环境声' else 'music','description':value,'source':[source]});continue
         if '剧本模板' in text or '剧本示例' in text: continue
         preview['unrecognized'].append({'source':source,'text':text,'reason':'未识别内容，确认前请核对'})
+    explicit_aspects={item['aspect_ratio'] for item in preview['shots'] if item.get('aspect_ratio')}
+    if len(explicit_aspects)==1 and 'aspect_ratio' not in preview['project'].get('provenance',{}):
+        preview['project']['aspect_ratio']=next(iter(explicit_aspects))
     return preview
 
 
@@ -336,7 +379,7 @@ def validate_preview(session,p):
             if not isinstance(participant.get('performance',{}),dict) or any(not isinstance(v,str) for v in participant.get('performance',{}).values()):issues.append('人物表演字段无效')
         for line in shot['dialogues']:
             if not isinstance(line.get('text'),str) or not line['text'].strip() or len(line['text'])>20000:issues.append('对白文本无效')
-        try: ShotCreate(order=1,scene_title=shot.get('title',''),duration_seconds=shot.get('duration_seconds',5),visual_prompt=shot.get('visual_prompt',''),camera_move=shot.get('camera_move',''))
+        try: ShotCreate(order=1,scene_title=shot.get('title',''),duration_seconds=shot.get('duration_seconds',5),visual_prompt=shot.get('visual_prompt',''),camera_move=shot.get('camera_move',''),aspect_ratio=shot.get('aspect_ratio') or '16:9')
         except ValueError: issues.append('分镜标题、时长或摄影参数无效')
     return [*issues, *duration_review_issues(p)]
 
@@ -531,8 +574,8 @@ def commit_import(session,batch,payload):
     for order,s in enumerate(p['shots'],1):
         if s['key'] in reused:shot_ids.append(reused[s['key']].id);continue
         scene=smap[s['scene_key']]
-        aspect=p['project'].get('aspect_ratio','16:9')
-        shot=StoryboardShot(project_id=project.id,order=order,scene_title=s['title'],visual_prompt=s.get('visual_prompt',''),action=s.get('action',''),camera_move=s.get('camera_move',''),location=scene.environment_json.get('location',scene.name),lighting=scene.environment_json.get('lighting',''),duration_seconds=s['duration_seconds'],aspect_ratio=aspect if aspect in ['16:9','9:16','1:1'] else '16:9')
+        aspect=s.get('aspect_ratio') or p['project'].get('aspect_ratio','16:9')
+        shot=StoryboardShot(project_id=project.id,order=order,scene_title=s['title'],visual_prompt=s.get('visual_prompt',''),action=s.get('action',''),camera_move=s.get('camera_move',''),location=scene.environment_json.get('location',scene.name),lighting=s.get('photography',{}).get('lighting',scene.environment_json.get('lighting','')),duration_seconds=s['duration_seconds'],aspect_ratio=aspect if aspect in VALID_ASPECTS else '16:9')
         session.add(shot);session.flush();shot_ids.append(shot.id)
         import copy
         production=copy.deepcopy(s.get('production',{}))

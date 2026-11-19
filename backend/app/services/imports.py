@@ -2,24 +2,18 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-import zipfile
 from html.parser import HTMLParser
-from io import BytesIO
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
-from docx import Document
-from docx.oxml.ns import qn
-from docx.table import Table
-from docx.text.paragraph import Paragraph
-
 from app.core.config import Settings
 from app.core.errors import AppError
+from app.services.word_files import WORD_MIME_TYPES, blocks_text, read_word_blocks
 
 
 TEXT_EXTENSIONS = {".txt", ".md", ".markdown"}
-DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+DOCX_MIME = WORD_MIME_TYPES[".docx"]
 
 
 class _TextExtractor(HTMLParser):
@@ -65,46 +59,9 @@ def parse_uploaded_document(filename: str, data: bytes, max_bytes: int) -> tuple
         if not text.strip():
             raise AppError(422, "empty_document", "文档没有可见文本")
         return text.strip(), "text/markdown" if extension in {".md", ".markdown"} else "text/plain"
-    if extension == ".docx":
-        if not data.startswith(b"PK"):
-            raise AppError(422, "invalid_docx", "DOCX 文件签名无效")
-        text = _extract_docx(data, max_bytes)
-        return text, DOCX_MIME
-    raise AppError(415, "unsupported_document_type", "仅支持 .txt、.md、.docx")
-
-
-def _extract_docx(data: bytes, max_bytes: int) -> str:
-    try:
-        with zipfile.ZipFile(BytesIO(data)) as archive:
-            expanded_size = sum(item.file_size for item in archive.infolist())
-            if expanded_size > max_bytes * 20:
-                raise AppError(413, "docx_expanded_too_large", "DOCX 解压后内容过大")
-            if "word/document.xml" not in archive.namelist():
-                raise AppError(422, "invalid_docx", "DOCX 缺少正文")
-        document = Document(BytesIO(data))
-    except AppError:
-        raise
-    except Exception as exc:
-        raise AppError(422, "invalid_docx", "DOCX 文件损坏或无法解析") from exc
-
-    lines: list[str] = []
-    for block in document.iter_inner_content():
-        if isinstance(block, Paragraph):
-            text = "".join(node.text or "" for node in block._element.iter(qn("w:t"))).strip()
-            if text:
-                lines.append(text)
-        elif isinstance(block, Table):
-            for row in block.rows:
-                values = []
-                for cell in row.cells:
-                    value = "".join(node.text or "" for node in cell._element.iter(qn("w:t"))).strip()
-                    values.append(value)
-                if any(values):
-                    lines.append("\t".join(values))
-    text = "\n".join(lines).strip()
-    if not text:
-        raise AppError(422, "empty_document", "DOCX 没有可见文本")
-    return text
+    if extension in WORD_MIME_TYPES:
+        return blocks_text(read_word_blocks(filename, data, max_bytes)), WORD_MIME_TYPES[extension]
+    raise AppError(415, "unsupported_document_type", "请选择文本、Markdown 或 Word 文档")
 
 
 def _is_forbidden_ip(address: str) -> bool:
