@@ -127,8 +127,10 @@ def generation_inputs_hash(session,shot):
     return fingerprint({'visual':visual_inputs(session,shot),'duration':shot.duration_seconds,'aspect_ratio':shot.aspect_ratio,'dialogue':dialogue,'audio':audio})
 
 
-def shot_preflight(session,settings,shot,require_visual=True,*,context_inputs=False,explicit_visual_ids=None,explicit_motion=None):
+def shot_preflight(session,settings,shot,require_visual=True,*,context_inputs=False,explicit_visual_ids=None,explicit_motion=None,
+                   revision_references=()):
     from app.services.screenplay import shot_bundle
+    from app.services.revision_references import replaced_targets
     from app.core.paths import safe_media_path
     detail,scene,script,prod,entities=production_context(session,shot);findings=[];bundle=shot_bundle(session,shot.id)
     enabled=bool(script and script.parsed_json.get('versions'))
@@ -139,7 +141,9 @@ def shot_preflight(session,settings,shot,require_visual=True,*,context_inputs=Fa
                         and (f['severity'] in ['blocker','review'] or f['code'] in OPTIONAL_DESIGN_FINDINGS)
                         and not(context_inputs and f['code']=='cast_unknown'))
     if not enabled and not context_inputs:findings.append(issue('legacy_rules','review','旧镜头未采用电影规范；须主动建立新修订以应用新规范',shot.id))
-    image_participants=[p for p in bundle['participants'] if p['reference_asset_ids_json']] if context_inputs else bundle['participants']
+    replaced_actors = replaced_targets(revision_references, 'identity')
+    image_participants = [p for p in bundle['participants'] if p['reference_asset_ids_json']
+                          and p['character_id'] not in replaced_actors] if context_inputs else bundle['participants']
     for p in bundle['participants']:
         if context_inputs:
             version=session.get(m.CharacterVersion,p['character_version_id']) if p.get('character_version_id') else None
@@ -157,7 +161,7 @@ def shot_preflight(session,settings,shot,require_visual=True,*,context_inputs=Fa
     from app.services.product_library import shot_references
     product_references=[]
     try:
-        product_references=shot_references(session,settings,shot)
+        product_references=shot_references(session,settings,shot,exclude_product_ids=replaced_targets(revision_references, 'product'))
     except AppError as exc:
         findings.append(issue(exc.code,'blocker',exc.message,shot.id,repair='product'))
     for e in entities:
@@ -211,7 +215,8 @@ def shot_preflight(session,settings,shot,require_visual=True,*,context_inputs=Fa
     if enabled and require_visual and not any(v.kind=='keyframe' for v in visuals):findings.append(issue('keyframe_review_required','review','先生成并审核本镜关键画面，再提交电影镜头',shot.id))
     policy=prod.get('requested_controls',{}).get('identity_reference_policy','full_reference')
     if policy not in {'full_reference','independent_faces_scene'}:findings.append(issue('identity_reference_policy_unsupported','blocker','未实现此身份参考路由',shot.id))
-    reference_count=sum(len(p['reference_asset_ids_json']) for p in bundle['participants'])+len(product_references)+sum(not(policy=='independent_faces_scene' and v.kind=='keyframe') for v in visuals)
+    reference_count=(sum(len(p['reference_asset_ids_json']) for p in image_participants)
+                     +len(product_references)+sum(not(policy=='independent_faces_scene' and v.kind=='keyframe') for v in visuals))
     if reference_count>9:findings.append(issue('reference_limit','blocker','H3实际最多9张参考，本镜超过上限',shot.id))
     acceptance=(detail.source_json or {}).get('studio_acceptance',{}) if detail else {}
     if acceptance.get('actor')=='automation' and acceptance.get('inputs_hash')==input_hash:

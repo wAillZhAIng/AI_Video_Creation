@@ -56,6 +56,8 @@ def test_container_legacy_port_requires_explicit_context_profile(settings):
     ({'memory_policy': 'unverified'}, 'context_ir_runtime_required'),
     ({'watcher_running': False}, 'context_ir_runtime_required'),
     ({'source_baseline': {'ok': False}}, 'context_ir_runtime_required'),
+    ({'ready': False, 'memory_policy': 'unverified', 'source_baseline': {'ok': False, 'manifest_sha256': 'b' * 64},
+      'installation_check': {'ready': True, 'manifest_sha256': 'a' * 64}}, 'context_ir_runtime_stale'),
     ({'ready': False}, 'context_ir_runtime_not_ready'),
     ({'qwen_health': {**runtime_receipt()['qwen_health'], 'max_model_len': 8192}}, 'context_ir_qwen_identity'),
     ({'qwen_health': {**runtime_receipt()['qwen_health'], 'loaded': True}}, 'context_ir_qwen_starting'),

@@ -46,6 +46,9 @@
 .reference-preview figure { margin: 0 0 16px; }
 .reference-preview img { height: 180px; width: auto; border-radius: 12px; }
 .reference-preview figcaption { font-size: 11px; max-width: 220px; overflow-wrap: anywhere; }
+.revision-reference-gallery { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 145px), 1fr)); gap: 12px; }
+.revision-reference-gallery figure { min-width: 0; }
+.revision-reference-gallery img { width: 100%; height: 112px; object-fit: contain; background: var(--surface-2, #f3f4f6); }
 .final-section { padding: 24px; margin-bottom: 24px; }
 .final-clips { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; }
 .final-clips video { aspect-ratio: 5/3; width: 100%; border-radius: 12px; background: #18181b; }

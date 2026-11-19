@@ -90,20 +90,27 @@ def revision_preview(video_id: str, payload: RevisionRequest, request: Request, 
     video = required(session, VideoRevision, video_id, "视频版本")
     shot = required(session, StoryboardShot, video.shot_id, "分镜")
     settings = request.app.state.settings
+    if settings.h3_demo_mode and payload.reference_images:
+        raise AppError(409, 'revision_image_service_required', '图片修订需要本地 Context-IR H3 视频服务')
     if not settings.h3_demo_mode:
         from app.services.h3_context_provider import prepare_context_compilation
-        from app.services.video_revisions import prepare_context_revision
+        from app.services.revision_references import revision_image_preview
+        from app.services.video_revisions import prepare_context_revision, revision_reference_digest
         generation, service, _, context = prepare_context_revision(session, settings, shot, video, payload)
         if service.get('h3_workflow'):
             people = context['screenplay_snapshot']['participants']
             person = people[0] if people else {}
             _,_,intent,production_contract=prepare_context_compilation(context['prompt'],context['negative_prompt'],
                 context['references'],context['motion_references'],context,silent=context['silent'])
+            photos = [revision_image_preview(ref, index) for index, ref in enumerate(context['references'], 1)
+                      if ref.get('source') == 'video_revision_reference']
             return {'prompt': intent, 'negative_prompt': context['negative_prompt'], 'preview_stage': 'context_ir_input',
                     'character_id': person.get('character_id'), 'character_version_id': person.get('character_version_id'),
                     'asset_ids': [ref['asset_id'] for ref in context['references']],
                     'instruction': payload.instruction, 'based_on': video.id, 'h3_workflow': service['h3_workflow'],
-                    'production_contract':production_contract}
+                    'production_contract':production_contract,
+                    **({'revision_images': photos, 'reference_preview_sha256': revision_reference_digest(context, service)}
+                       if photos else {})}
         from app.api.routes import _legacy_generation_inputs
         from app.services.model_lab import frozen_generation_inputs
         version, references, _, prompt, negative, _ = _legacy_generation_inputs(session, settings, shot,

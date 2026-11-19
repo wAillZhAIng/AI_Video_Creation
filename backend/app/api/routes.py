@@ -8,7 +8,7 @@ import uuid
 from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, status
 from fastapi.responses import FileResponse
@@ -1303,17 +1303,41 @@ def recheck_video_duration(video_id: str, request: Request, session: Session = D
     return row_dict(video)
 
 
+@router.get('/videos/{video_id}/revision-reference-targets')
+def video_revision_reference_targets(video_id: str, session: Session = Depends(get_db)):
+    from app.services.revision_references import revision_targets
+    video = required(session, VideoRevision, video_id, '视频版本')
+    shot = required(session, StoryboardShot, video.shot_id, '分镜')
+    targets = revision_targets(session, shot)
+    return {kind: list(items.values()) for kind, items in targets.items()}
+
+
+@router.post('/videos/{video_id}/revision-images', status_code=status.HTTP_201_CREATED)
+async def upload_video_revision_image(video_id: str, request: Request, file: UploadFile = File(...),
+        kind: Literal['character', 'product'] = Form(...), session: Session = Depends(get_db)):
+    from app.services.revision_references import store_revision_image
+    from app.services.screenplay_generation_media import LIMITS
+    video = required(session, VideoRevision, video_id, '视频版本')
+    data = await file.read(LIMITS['image']['max_bytes'] + 1)
+    return await run_in_threadpool(store_revision_image, session, settings_from(request),
+                                   video, kind, file.filename or '', data)
+
+
 @router.post("/videos/{video_id}/revise", status_code=status.HTTP_202_ACCEPTED)
 async def revise_video(request: Request, video_id: str, payload: RevisionRequest, session: Session = Depends(get_db)) -> dict[str, Any]:
     current = required(session, VideoRevision, video_id, "视频版本")
     shot = required(session, StoryboardShot, current.shot_id, "分镜")
-    from app.services.video_revisions import prepare_context_revision, revision_generation_request
+    from app.services.video_revisions import prepare_context_revision, revision_generation_request, revision_reference_digest
     settings = settings_from(request)
     if settings.h3_demo_mode:
+        if payload.reference_images:
+            raise AppError(409, 'revision_image_service_required', '图片修订需要本地 Context-IR H3 视频服务')
         generation = revision_generation_request(session, shot, current, payload)
         job, video = await generate_for_shot(request, session, shot, generation, instruction=payload.instruction)
     else:
         generation, service, quality, context = prepare_context_revision(session, settings, shot, current, payload)
+        if payload.reference_images and payload.reference_preview_sha256 != revision_reference_digest(context, service):
+            raise AppError(409, 'revision_reference_preview_changed', '请重新预览当前的修订要求和图片，再确认提交')
         from app.services.revision_postprocess import freeze_plan
         processing_plan = freeze_plan(session, settings, shot, current, payload.instruction, quality=quality)
         job, video = await generate_for_shot(request, session, shot, generation, instruction=payload.instruction,
@@ -1327,7 +1351,8 @@ async def revise_video(request: Request, video_id: str, payload: RevisionRequest
         "job": row_dict(job),
         "video_revision": row_dict(video) if video else None,
         "based_on": current.id,
-        "editing_semantics": "基于相同人物参考重新生成，不保证逐帧或局部像素不变",
+        "editing_semantics": ("按本次选择的角色和道具商品图片重新生成" if payload.reference_images
+                              else "基于相同人物参考重新生成，不保证逐帧或局部像素不变"),
     }
 
 

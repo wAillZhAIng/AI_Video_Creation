@@ -1,4 +1,9 @@
+import asyncio
 import copy
+from hashlib import sha256
+import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -118,3 +123,50 @@ def test_repair_probes_enabled_services_and_keeps_config_and_verified_capabiliti
         qwen = session.get(m.AIService, 'qwen')
         assert qwen.revision == 4 and qwen.default_model == 'qwen' and qwen.base_url == recovery.VAST_QWEN
         assert qwen.last_test_json['status'] == 'connected' and qwen.capabilities_json['other']['state'] == 'verified'
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='Vast runtime recovery takes the real Linux Qwen file lock')
+@pytest.mark.parametrize('blocker', [None, 'worker', 'peer', 'qwen', 'foreign'])
+def test_only_a_stale_owned_idle_vast_gateway_is_restarted(tmp_path, monkeypatch, blocker):
+    runtime_root = tmp_path / 'native'
+    (runtime_root / 'cache/qwen').mkdir(parents=True)
+    manifest = tmp_path / 'runtime-manifests/context-ir-native-v1.json'
+    manifest.parent.mkdir()
+    manifest.write_bytes(b'verified new source manifest')
+    checksum = sha256(manifest.read_bytes()).hexdigest()
+    (runtime_root / 'native-runtime.json').write_text(json.dumps({
+        'profile_id': 'local-h3ir-qwen4b-v3', 'runtime_root': str(runtime_root),
+        'comfy_origin': recovery.VAST_CONTEXT_WORKER, 'peer_comfy_origin': recovery.VAST_COMFY,
+        'source_manifest_sha256': checksum,
+    }))
+    healthy = {'pid': 617, 'busy': blocker == 'qwen', 'loaded': False, 'inference_phase': 'idle'}
+    stale = {'schema_version': 1, 'service': 'video-factory-native-context-runtime-v1',
+             'profile_id': 'local-h3ir-qwen4b-v3', 'ready': False, 'busy': False, 'watcher_running': True,
+             'source_baseline': {'ok': False, 'manifest_sha256': checksum},
+             'installation_check': {'ready': True, 'manifest_sha256': 'a' * 64},
+             'active_prompts': [], 'qwen_health': healthy,
+             'checks': [{'kind': 'qwen_owned_process', 'ok': True}]}
+    calls = []
+    endpoints = {recovery.VAST_CONTEXT_WORKER + '/queue': 'worker', recovery.VAST_COMFY + '/queue': 'peer'}
+
+    async def status(_client, url):
+        if url in endpoints:
+            return {'queue_running': ['active'] if endpoints[url] == blocker else [], 'queue_pending': []}, False
+        if url == recovery.VAST_QWEN.removesuffix('/v1') + '/health':
+            return healthy, False
+        assert url == recovery.VAST_CONTEXT + recovery.CONTEXT_RUNTIME
+        return ({**stale, 'ready': True, 'memory_policy': 'runtime_owned',
+                 'source_baseline': {'ok': True, 'manifest_sha256': checksum}} if 'restart' in calls else stale), False
+
+    def supervisor(action, program):
+        assert program == 'ai-video-context'
+        calls.append(action)
+        return SimpleNamespace(returncode=0, stdout='311\n')
+
+    monkeypatch.setattr(recovery, 'PROJECT_ROOT', tmp_path)
+    monkeypatch.setattr(recovery, 'VAST_NATIVE_ROOT', runtime_root)
+    monkeypatch.setattr(recovery, '_read_status', status)
+    monkeypatch.setattr(recovery, '_supervisor', supervisor)
+    monkeypatch.setattr(recovery.os, 'getpgid', lambda pid: 444 if blocker == 'foreign' else 311)
+    assert asyncio.run(recovery._refresh_stale_vast_runtime(None, stale)) is (blocker is None)
+    assert ('restart' in calls) is (blocker is None)

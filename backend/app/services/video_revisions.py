@@ -5,6 +5,20 @@ from app.models import GenerationJob
 from app.schemas import GenerationRequest
 
 
+def revision_reference_digest(context, service):
+    from app.services.cinematic_rules import fingerprint
+
+    return fingerprint({
+        'source': context['revision_reference_source'], 'shot_revision': context['shot_revision'],
+        'prompt': context['prompt'], 'negative_prompt': context['negative_prompt'],
+        'references': [{key: value for key, value in ref.items() if key != 'participant_id'}
+                       for ref in context['references']],
+        'motion': context['motion_references'],
+        'workflow': service['h3_workflow'], 'service_id': service['service_id'],
+        'service_revision': service['service_revision'],
+    })
+
+
 def revision_source_job(session, shot, current):
     previous = session.get(GenerationJob, current.generation_job_id)
     if previous is None:
@@ -83,6 +97,8 @@ def prepare_context_revision(session, settings, shot, current, payload):
         raise AppError(409, 'context_ir_service_required',
                        '本次明确选择了项目本地H3，请为项目绑定本地Context-IR H3服务；不会改发云端或其他视频服务')
     if not context_required:
+        if payload.reference_images:
+            raise AppError(409, 'revision_image_service_required', '图片修订需要本项目的本地 Context-IR H3 视频服务')
         # A cloud or generic provider never goes through the local Qwen/H3
         # compiler merely because this request originates in the review page.
         _, service, _ = select_video_service(session, settings, shot.project_id, service_id, model_id)
@@ -92,10 +108,13 @@ def prepare_context_revision(session, settings, shot, current, payload):
                                         quality_mode=quality['mode'])
     original_context = (previous.parameters_json or {}).get('context_inputs') or {}
     audio_policy = original_context.get('audio_policy')
+    source = {'video_id': current.id, 'selections': [item.model_dump() for item in payload.reference_images]} if payload.reference_images else None
+    instruction = payload.instruction or '使用本次审片图片修订对应角色或道具商品的外观，保留分镜原有的动作、构图、运镜与对白。'
     context = collect_context_inputs(session, settings, shot, prompt_override=generation.prompt_override,
-        instruction=payload.instruction, image_ids=original_context.get('explicit_visual_ids'),
+        instruction=instruction, image_ids=original_context.get('explicit_visual_ids'),
         motion_values=original_context.get('explicit_motion'),
-        audio_policy=audio_policy if audio_policy is not None else get_audio_policy(session, shot.project_id))
+        audio_policy=audio_policy if audio_policy is not None else get_audio_policy(session, shot.project_id),
+        revision_reference_source=source)
     return generation, service, quality, context
 
 

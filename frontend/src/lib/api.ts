@@ -21,8 +21,23 @@ const configuredBase = (import.meta.env.VITE_API_BASE_URL ?? "").trim().replace(
 export const API_BASE_URL = configuredBase;
 
 type JsonRecord = Record<string, unknown>;
-export type VideoRevisionInput = { instruction: string; use_project_video_service: boolean };
-export type VideoRevisionPreview = { prompt: string; character_id: string | null; character_version_id: string | null };
+export type RevisionImageKind = 'character' | 'product';
+export type RevisionImage = { id: string; kind: RevisionImageKind; filename: string; media_url: string };
+export type RevisionImageDraft = RevisionImage & { targetId: string };
+export type RevisionReferenceTargets = Record<RevisionImageKind, { id: string; name: string }[]>;
+export type VideoRevisionInput = {
+  instruction: string;
+  use_project_video_service: boolean;
+  reference_images?: { image_id: string; target_id: string | null }[];
+  reference_preview_sha256?: string;
+};
+export type VideoRevisionPreview = {
+  prompt: string;
+  character_id: string | null;
+  character_version_id: string | null;
+  revision_images?: (RevisionImage & { target_name: string | null; picture_index: number })[];
+  reference_preview_sha256?: string;
+};
 
 export class ApiError extends Error {
   status: number;
@@ -658,6 +673,18 @@ export const api = {
 
   getVideo: async (id: string, signal?: AbortSignal) =>
     normalizeVideo(unwrap<VideoRevision>(await request(`/api/videos/${encodeURIComponent(id)}`, { signal }))),
+
+  revisionReferenceTargets: async (id: string, signal?: AbortSignal) =>
+    unwrap<RevisionReferenceTargets>(await request(`/api/videos/${encodeURIComponent(id)}/revision-reference-targets`, { signal })),
+
+  uploadRevisionImage: async (id: string, kind: RevisionImageKind, file: File, signal?: AbortSignal) => {
+    const form = new FormData();
+    form.append('kind', kind);
+    form.append('file', file);
+    return unwrap<RevisionImage>(await request(`/api/videos/${encodeURIComponent(id)}/revision-images`, {
+      method: 'POST', body: form, signal,
+    }));
+  },
 
   previewVideoRevision: async (id: string, input: VideoRevisionInput, signal?: AbortSignal) =>
     unwrap<VideoRevisionPreview>(

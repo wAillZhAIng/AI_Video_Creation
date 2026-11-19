@@ -28,6 +28,58 @@ const response = (body: unknown) => new Response(JSON.stringify(body), { headers
 const video = { id: 'v1', project_id: 'p1', shot_id: 's1', revision: 1, relative_path: 'original.mp4',
   review_status: 'pending', metadata_json: { mode: 'cloud', provider: 'cloud_lk888_h3_v2' } };
 
+it('uploads optional character and product images and submits the reviewed attachments without text', async () => {
+  const uploads: string[] = [];
+  const requests: unknown[] = [];
+  const previewDigest = 'a'.repeat(64);
+  const locallyGenerated = { ...video, metadata_json: { mode: 'local', provider: 'comfyui_h3' } };
+  const images = [
+    { id: 'image-character', kind: 'character', filename: '人物.png', media_url: '/api/media/actor.png', picture_index: 1, target_name: null },
+    { id: 'image-product', kind: 'product', filename: '商品.png', media_url: '/api/media/product.png', picture_index: 2, target_name: '本镜水杯' },
+  ];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+    const path = new URL(url, 'http://localhost').pathname;
+    if (path === '/api/projects') return response([{ id: 'p1', name: '项目' }]);
+    if (path === '/api/projects/p1/videos') return response([locallyGenerated]);
+    if (path === '/api/videos/v1') return response(locallyGenerated);
+    if (path.endsWith('/revision-images')) {
+      const form = init.body as FormData;
+      const kind = String(form.get('kind'));
+      const image = images.find(item => item.kind === kind)!;
+      uploads.push((form.get('file') as File).name);
+      return response(image);
+    }
+    if (path.endsWith('/revision-reference-targets')) {
+      return response({ character: [], product: [{ id: 'product-1', name: '本镜水杯' }] });
+    }
+    requests.push(JSON.parse(String(init.body)));
+    if (path.endsWith('/revision-preview')) {
+      return response({ prompt: '实际修订预览', revision_images: images, reference_preview_sha256: previewDigest });
+    }
+    if (path.endsWith('/revise')) return response({});
+    throw new Error(path);
+  }));
+  const user = userEvent.setup();
+  render(<MemoryRouter initialEntries={['/review?project=p1']}><ToastProvider><ReviewPage /></ToastProvider></MemoryRouter>);
+  await user.clear(await screen.findByLabelText('本次修改要求'));
+  const start = screen.getByRole('button', { name: '基于当前版本重新生成' });
+  expect(start).toBeDisabled();
+  await user.upload(screen.getByLabelText('添加角色图片（可选）'), new File(['actor'], '人物.png', { type: 'image/png' }));
+  await screen.findByRole('button', { name: '移除 人物.png' });
+  await user.upload(screen.getByLabelText('添加道具或商品图片（可选）'), new File(['prop'], '商品.png', { type: 'image/png' }));
+  await user.selectOptions(await screen.findByLabelText('商品.png 的应用对象'), 'product-1');
+  await user.click(start);
+  const dialog = await screen.findByRole('dialog', { name: '修订完整提示词' });
+  expect(dialog).toHaveTextContent('Picture 2 · 道具或商品 · 本镜水杯');
+  await user.click(screen.getByRole('button', { name: '提交真实修订' }));
+  await waitFor(() => expect(requests).toHaveLength(2));
+  expect(uploads).toEqual(['人物.png', '商品.png']);
+  const input = { instruction: '', use_project_video_service: false, reference_images: [
+    { image_id: 'image-character', target_id: null }, { image_id: 'image-product', target_id: 'product-1' },
+  ] };
+  expect(requests).toEqual([input, { ...input, reference_preview_sha256: previewDigest }]);
+});
+
 function captureToastExpiry() {
   const callbacks: Array<() => void> = [];
   const setTimeout = window.setTimeout.bind(window);

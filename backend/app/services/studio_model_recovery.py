@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -12,12 +14,14 @@ import httpx
 from sqlalchemy import select
 
 from app import models as m
+from app.core.config import PROJECT_ROOT
 from app.core.errors import AppError
 from app.core.secrets import redact
 from app.core.trusted_service_origins import local_service_client
 from app.models.entities import utcnow
 from app.services.ai_services import probe_service
 from app.services.gpu_gate import _connection_refused
+from app.services.h3_context_provider import context_runtime_baseline_stale
 
 
 VAST_COMFY = 'http://127.0.0.1:18188'
@@ -26,18 +30,21 @@ VAST_CONTEXT_WORKER = 'http://127.0.0.1:28188'
 VAST_QWEN = 'http://127.0.0.1:8772/v1'
 SUPERVISOR_CONFIG = Path('/etc/supervisor/supervisord.conf')
 CONTEXT_RUNTIME = '/video_factory/runtime'
+VAST_NATIVE_ROOT = PROJECT_ROOT / '.vast/context-runtime'
 _PROGRAMS = frozenset({'comfyui', 'ai-video-context-comfy', 'ai-video-context'})
 _CONTEXT_NO_SUBMISSION = frozenset({'context_ir_comfy_starting', 'context_ir_comfy_unavailable',
     'context_ir_qwen_starting', 'context_ir_qwen_unavailable', 'context_ir_runtime_required',
-    'context_ir_runtime_not_ready', 'context_ir_qwen_release_unknown', 'context_ir_gpu_wait_timeout'})
+    'context_ir_runtime_not_ready', 'context_ir_runtime_stale', 'context_ir_qwen_release_unknown', 'context_ir_gpu_wait_timeout'})
 _UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 
 
 def _supervisor(action, program):
-    if action not in {'status', 'start'} or program not in _PROGRAMS:
+    if program not in _PROGRAMS or action not in (
+            {'status', 'start', 'restart', 'pid'} if program == 'ai-video-context' else {'status', 'start'}):
         raise ValueError('Unsupported model process operation')
     return subprocess.run(['supervisorctl', '-c', str(SUPERVISOR_CONFIG), action, program],
-                          cwd=SUPERVISOR_CONFIG.parent, capture_output=True, text=True, timeout=12, check=False)
+                          cwd=SUPERVISOR_CONFIG.parent, capture_output=True, text=True,
+                          timeout=30 if action == 'restart' else 12, check=False)
 
 
 async def _read_status(client, url):
@@ -83,6 +90,75 @@ async def _start_if_stopped(client, program, url):
         return None, False
 
 
+def _queue_idle(queue):
+    return isinstance(queue, dict) and all(queue.get(key) == [] for key in ('queue_running', 'queue_pending'))
+
+
+async def _refresh_stale_vast_runtime(client, status):
+    """Restart only the configured Vast gateway after proving its old runtime is idle."""
+    if not context_runtime_baseline_stale(status):
+        return False
+    import fcntl
+
+    try:
+        root = VAST_NATIVE_ROOT.resolve(strict=True)
+        config = json.loads((root / 'native-runtime.json').read_bytes())
+        manifest = PROJECT_ROOT / 'runtime-manifests/context-ir-native-v1.json'
+        checksum = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        peer = config.get('peer_comfy_origin')
+        if (config.get('profile_id') != 'local-h3ir-qwen4b-v3'
+                or config.get('listen', '127.0.0.1') != '127.0.0.1' or config.get('port', 8788) != 8788
+                or config.get('comfy_origin') != VAST_CONTEXT_WORKER or peer not in (None, VAST_COMFY)
+                or Path(config.get('runtime_root', '')).resolve() != root
+                or config.get('source_manifest_sha256') != checksum
+                or status['source_baseline']['manifest_sha256'] != checksum):
+            return False
+        with (root / 'cache/qwen/gpu-inference.lock').open('a+b') as lease:
+            fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            runtime, _ = await _read_status(client, VAST_CONTEXT + CONTEXT_RUNTIME)
+            if (not context_runtime_baseline_stale(runtime)
+                    or runtime['source_baseline']['manifest_sha256'] != checksum
+                    or runtime.get('busy') is not False or runtime.get('active_prompts') != []):
+                return False
+            for origin in (VAST_CONTEXT_WORKER, peer):
+                if origin is not None:
+                    queue, _ = await _read_status(client, origin + '/queue')
+                    if not _queue_idle(queue):
+                        return False
+            health, refused = await _read_status(client, VAST_QWEN.removesuffix('/v1') + '/health')
+            if not refused:
+                process = await asyncio.to_thread(_supervisor, 'pid', 'ai-video-context')
+                if (process.returncode or not health or health.get('busy') is not False
+                        or health.get('loaded') is not False or health.get('inference_phase') != 'idle'
+                        or (runtime.get('qwen_health') or {}).get('pid') != health.get('pid')
+                        or not any(check.get('kind') == 'qwen_owned_process' and check.get('ok') is True
+                                   for check in runtime.get('checks', []) if isinstance(check, dict))):
+                    return False
+                pid, qwen_pid = int(process.stdout.strip()), health.get('pid')
+                if type(qwen_pid) is not int or pid <= 1 or os.getpgid(qwen_pid) != pid:
+                    return False
+            restart = asyncio.create_task(asyncio.to_thread(_supervisor, 'restart', 'ai-video-context'))
+            try:
+                result = await asyncio.shield(restart)
+            except asyncio.CancelledError:
+                # Keep the lease until Supervisor finishes its managed restart.
+                await restart
+                raise
+        if result.returncode:
+            return False
+        deadline = asyncio.get_running_loop().time() + 30
+        while asyncio.get_running_loop().time() < deadline:
+            runtime, _ = await _read_status(client, VAST_CONTEXT + CONTEXT_RUNTIME)
+            if (runtime and runtime.get('ready') is True and runtime.get('memory_policy') == 'runtime_owned'
+                    and (runtime.get('source_baseline') or {}).get('ok') is True
+                    and runtime['source_baseline'].get('manifest_sha256') == checksum):
+                return True
+            await asyncio.sleep(0.5)
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        pass
+    return False
+
+
 async def _recover_vast(app, services):
     if (sys.platform != 'linux' or app.state.settings.container_mode
             or os.getenv('VIDEO_FACTORY_VAST_GPU_COORDINATION') != '1' or not SUPERVISOR_CONFIG.is_file()):
@@ -99,12 +175,15 @@ async def _recover_vast(app, services):
         queue, launched = await _start_if_stopped(client, 'ai-video-context-comfy', VAST_CONTEXT_WORKER + '/queue')
         if launched:
             started.add(VAST_CONTEXT)
-        if not queue or any(not isinstance(queue.get(key), list) or queue[key]
-                            for key in ('queue_running', 'queue_pending')):
+        if not _queue_idle(queue):
             return started
         status, launched = await _start_if_stopped(client, 'ai-video-context', VAST_CONTEXT + CONTEXT_RUNTIME)
         if launched:
             started.update({VAST_CONTEXT, VAST_QWEN})
+        if context_runtime_baseline_stale(status):
+            if await _refresh_stale_vast_runtime(client, status):
+                started.update({VAST_CONTEXT, VAST_QWEN})
+            return started
         if (status and status.get('service') == 'video-factory-native-context-runtime-v1'
                 and status.get('busy') is False and status.get('qwen_health') is None):
             try:

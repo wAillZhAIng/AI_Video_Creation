@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
@@ -126,9 +126,24 @@ class GenerationRequest(StrictModel):
     model_id: str | None = None
 
 
+class RevisionReferenceSelection(StrictModel):
+    image_id: str = Field(min_length=1, max_length=64)
+    target_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+
 class RevisionRequest(GenerationRequest):
-    instruction: str = Field(min_length=1)
+    instruction: str = ''
     use_project_video_service: bool = False
+    reference_images: list[RevisionReferenceSelection] = Field(default_factory=list, max_length=9)
+    reference_preview_sha256: str | None = Field(default=None, pattern=r'^[0-9a-f]{64}$')
+
+    @model_validator(mode='after')
+    def require_revision_input(self):
+        if not self.instruction and not self.reference_images:
+            raise ValueError('请填写修改要求，或为本次修订添加图片')
+        if len({row.image_id for row in self.reference_images}) != len(self.reference_images):
+            raise ValueError('同一张修订图片只能添加一次')
+        return self
 
 
 class ReviewRequest(StrictModel):

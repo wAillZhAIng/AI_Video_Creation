@@ -17,6 +17,7 @@ from app.services.revision_constraints import (
     apply_revision_overrides, extract_revision_constraints, revision_constraints_text,
 )
 from app.services.revision_cinematography import apply_cinematography_override
+from app.services.revision_references import replaced_targets, resolve_revision_images
 from app.services.screenplay import shot_bundle
 
 
@@ -92,7 +93,8 @@ def _screenplay_prop_references(session, shot, detail, scene, production, entiti
 
 
 def collect_context_inputs(session, settings, shot, *, prompt_override=None, instruction=None,
-                           image_ids=None, motion_values=None, audio_policy=None):
+                           image_ids=None, motion_values=None, audio_policy=None,
+                           revision_reference_source=None):
     """Gather inputs once at the app boundary. The ComfyUI node writes Context-IR."""
     from app.api.routes import script_for_shot
     bundle = shot_bundle(session, shot.id)
@@ -100,19 +102,24 @@ def collect_context_inputs(session, settings, shot, *, prompt_override=None, ins
     script = script_for_shot(session, shot)
     if (scene and scene.project_id != shot.project_id) or (script and script.project_id != shot.project_id):
         raise AppError(409, 'context_project_scope', '剧本或场景不属于本项目，未使用其他项目素材')
+    extra = (resolve_revision_images(session, settings, shot, revision_reference_source['video_id'],
+                                     revision_reference_source['selections']) if revision_reference_source else [])
+    replaced_actors = replaced_targets(extra, 'identity')
+    replaced_products = replaced_targets(extra, 'product')
     preflight = shot_preflight(session, settings, shot, require_visual=False, context_inputs=True,
-                               explicit_visual_ids=image_ids, explicit_motion=motion_values)
+                               explicit_visual_ids=image_ids, explicit_motion=motion_values, revision_references=extra)
     blockers = [finding for finding in preflight['findings'] if finding['severity'] == 'blocker']
     if blockers:
         raise AppError(409, 'context_input_invalid', '；'.join(finding['message'] for finding in blockers), {'findings': blockers})
 
     participants = bundle['participants']
-    actors, references = actor_references(session, settings, [p for p in participants if p.get('reference_asset_ids_json')])
+    actors, references = actor_references(session, settings, [p for p in participants if p.get('reference_asset_ids_json')
+                                                               and p['character_id'] not in replaced_actors])
     actor_names = {p['id']: p['name'] for p in participants}
     from app.services.character_reference import saved_reference_snapshot
     wardrobe_sources = []
     for participant in participants:
-        if participant.get('reference_asset_ids_json'):
+        if participant.get('reference_asset_ids_json') or participant['character_id'] in replaced_actors:
             continue  # Explicit per-shot identity pictures outrank project bindings.
         saved, _ = saved_reference_snapshot(session,settings,shot.project_id,participant['character_id'])
         for ref in saved:
@@ -122,8 +129,9 @@ def collect_context_inputs(session, settings, shot, *, prompt_override=None, ins
             if wardrobe:
                 wardrobe_sources.append((len(references),participant['name']))
     products = shot_product_snapshot(session, shot)
-    library_refs = shot_references(session, settings, shot, include_image_notes=True)
-    prop_refs = _screenplay_prop_references(session, shot, detail, scene, production, entities, products, library_refs)
+    library_refs = shot_references(session, settings, shot, include_image_notes=True, exclude_product_ids=replaced_products)
+    prop_refs = [ref for ref in _screenplay_prop_references(session, shot, detail, scene, production, entities, products, library_refs)
+                 if ref['product_id'] not in replaced_products]
     references.extend(prop_refs or [
         {**source, 'asset_id': source['id'], 'asset_type': 'product_image', 'role': 'product'} for source in library_refs
     ])
@@ -132,6 +140,9 @@ def collect_context_inputs(session, settings, shot, *, prompt_override=None, ins
         role = 'scene' if visual.kind == 'scene_reference' else 'composition'
         references.append({'asset_id': visual.id, 'asset_type': visual.kind, 'role': role,
                            'relative_path': visual.relative_path, 'sha256': visual.sha256, 'production_visual_id': visual.id})
+    if {ref['sha256'] for ref in extra}.intersection(ref['sha256'] for ref in references):
+        raise AppError(422, 'revision_reference_duplicate', '修订图片与本镜已有参考重复。请选择对应应用对象或移除重复图片')
+    references.extend(extra)
     if len(references) > 9:
         raise AppError(422, 'context_reference_limit', '人物、商品、场景和临时图片最多合计 9 张')
     for index, ref in enumerate(references, 1):
@@ -200,6 +211,8 @@ def collect_context_inputs(session, settings, shot, *, prompt_override=None, ins
         facts = {key: identity[key] for key in ('fixed_identity', 'description', 'default_clothing', 'profile') if key in identity}
         performance = {k: v for k, v in (p.get('performance_json') or {}).items() if k != 'reference_audio_asset_id'}
         entry = {'名称': p['name'], '人物描述': facts, '表演': performance}
+        if p['character_id'] in replaced_actors:
+            entry['人物描述'] = {'参考': '本次审片指定的角色图片决定此角色外观'}
         wardrobe = wardrobe_states.get(p['character_id'], {})
         if wardrobe and wardrobe.get('entity_id') not in wardrobe_entities:
             notes = {key: value for key, value in wardrobe.items()
@@ -261,6 +274,7 @@ def collect_context_inputs(session, settings, shot, *, prompt_override=None, ins
         'explicit_visual_ids': image_ids, 'explicit_motion': motion_values, 'audio_policy': audio_policy,
         'silent': audio_policy == 'skip', 'spoken_language': spoken_language,
         'references': _without_paths(references), 'motion_references': _without_paths(motion),
+        **({'revision_reference_source': revision_reference_source} if revision_reference_source else {}),
         'screenplay_snapshot': {**bundle, 'resolved_audio_events': audio_events,
                                 'reference_manifest': reference_manifest(actors, references, stage='video'),
                                 'cinematic': {'versions': preflight['versions'], 'preflight': preflight}},
@@ -286,8 +300,15 @@ def restore_context_inputs(session, settings, shot, snapshot):
     script = script_for_shot(session, shot)
     if data.get('script_revision_id') != (script.id if script else None):
         raise AppError(409, 'context_input_snapshot_stale', '镜头所属剧本已变化，未使用原任务以外的剧本')
+    source = data.get('revision_reference_source')
+    extra = resolve_revision_images(session, settings, shot, source['video_id'], source['selections']) if source else []
+    frozen_extra = [{key: value for key, value in ref.items() if key not in {'picture_index', 'constraint_target_keys'}}
+                    for ref in data['references'] if ref.get('source') == 'video_revision_reference']
+    if _without_paths(extra) != frozen_extra:
+        raise AppError(409, 'revision_reference_changed', '本次修订图片或应用对象已变化，请重新预览')
     preflight = shot_preflight(session, settings, shot, require_visual=False, context_inputs=True,
-                               explicit_visual_ids=data['explicit_visual_ids'], explicit_motion=data['explicit_motion'])
+                               explicit_visual_ids=data['explicit_visual_ids'], explicit_motion=data['explicit_motion'],
+                               revision_references=extra)
     blockers = [finding for finding in preflight['findings'] if finding['severity'] == 'blocker']
     if blockers:
         raise AppError(409, 'context_input_snapshot_stale', '原参考的权限、状态或来源已变化，未派发', {'findings': blockers})
@@ -298,11 +319,12 @@ def restore_context_inputs(session, settings, shot, snapshot):
                     if ref.get('source') == 'screenplay_prop_reference']
     if frozen_props:
         detail, scene, _, production, entities = production_context(session, shot)
+        replaced_products = replaced_targets(extra, 'product')
         current_props = _screenplay_prop_references(
             session, shot, detail, scene, production, entities,
-            shot_product_snapshot(session, shot), shot_references(session, settings, shot),
+            shot_product_snapshot(session, shot), shot_references(session, settings, shot, exclude_product_ids=replaced_products),
         )
-        if current_props != frozen_props:
+        if [ref for ref in current_props if ref['product_id'] not in replaced_products] != frozen_props:
             raise AppError(409, 'context_input_snapshot_stale', '剧本道具图片的来源或批准状态已变化，未派发原任务')
     for ref in data['references']:
         if ref.get('source') != 'project_character_reference':

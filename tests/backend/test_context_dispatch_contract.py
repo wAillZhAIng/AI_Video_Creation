@@ -6,6 +6,7 @@ no output video is created, and these tests are not inference evidence.
 import asyncio
 from copy import deepcopy
 import hashlib
+from io import BytesIO
 import json
 from types import SimpleNamespace
 
@@ -13,11 +14,12 @@ import httpx
 from PIL import Image
 import pytest
 from sqlalchemy import select
+from starlette.datastructures import UploadFile
 from starlette.requests import Request
 
 from app import models as m
 from app.api.diagnostics import revision_preview
-from app.api.routes import retry_job, revise_video
+from app.api.routes import retry_job, revise_video, upload_video_revision_image, video_revision_reference_targets
 from app.core.db import Base, build_engine, build_session_factory
 from app.core.errors import AppError
 from app.schemas import RevisionRequest
@@ -220,6 +222,62 @@ def test_revision_and_failed_retry_dispatch_the_preview_cup_constraint_and_exact
     assert case.source.status == 'generated'
     assert case.prop.spec_json['dimensions'] == '高12.5cm，宽15cm'
     assert case.db.scalar(select(m.ShotDetail).where(m.ShotDetail.shot_id==case.shot.id)).photography_json['shot_size']=='微距超级特写（Macro Shot）'
+
+
+def test_image_only_review_freezes_scoped_attachments_in_preview_and_actual_request(dispatch_case, settings, monkeypatch):
+    case = dispatch_case
+    selections = []
+    for kind, color in [('character', 'blue'), ('product', 'red')]:
+        image = BytesIO()
+        Image.new('RGB', (48, 48), color).save(image, 'PNG')
+        upload = UploadFile(BytesIO(image.getvalue()), filename=f'{kind}.png')
+        row = asyncio.run(upload_video_revision_image(case.video.id, case.request, upload, kind, case.db))
+        selections.append({'image_id': row['id'], 'target_id': case.product.id if kind == 'product' else None})
+    targets = video_revision_reference_targets(case.video.id, case.db)
+    assert any(row['id'] == case.product.id for row in targets['product'])
+    payload = RevisionRequest(reference_images=selections, use_project_video_service=True)
+    preview = revision_preview(case.video.id, payload, case.request, case.db)
+    assert preview['asset_ids'] == [row['image_id'] for row in selections]
+    assert [image['kind'] for image in preview['revision_images']] == ['character', 'product']
+    assert preview['revision_images'][1]['target_name'] == case.product.name
+    assert 'Use <Picture 1> as the appearance reference for the character' in preview['prompt']
+    assert 'Use <Picture 2> as the appearance reference for the prop or product' in preview['prompt']
+    assert all(image['media_url'].startswith('/api/media/revision_references/') for image in preview['revision_images'])
+
+    other = m.VideoRevision(project_id=case.project.id, shot_id=case.shot.id, generation_job_id=case.source.id,
+                            relative_path='other.mp4', revision=2, review_status='pending')
+    case.db.add(other)
+    case.db.commit()
+    with pytest.raises(AppError) as wrong_scope:
+        revision_preview(other.id, payload, case.request, case.db)
+    assert wrong_scope.value.code == 'revision_reference_scope'
+    with pytest.raises(AppError) as missing_confirmation:
+        asyncio.run(revise_video(case.request, case.video.id, payload, case.db))
+    assert missing_confirmation.value.code == 'revision_reference_preview_changed'
+
+    dispatched = []
+
+    async def capture(self, request):
+        dispatched.append(request)
+        raise AppError(422, 'fixture_no_sampling', 'Captured actual provider request')
+
+    monkeypatch.setattr(provider.ContextIRH3Provider, 'submit', capture)
+    confirmed = payload.model_copy(update={'reference_preview_sha256': preview['reference_preview_sha256']})
+    with pytest.raises(AppError) as rejected:
+        asyncio.run(revise_video(case.request, case.video.id, confirmed, case.db))
+    assert rejected.value.code == 'fixture_no_sampling'
+    request, = dispatched
+    assert [ref['asset_id'] for ref in request.reference_assets] == preview['asset_ids']
+    assert all(ref['sha256'] and ref['absolute_path'] for ref in request.reference_assets)
+    assert request.parameters['context_inputs']['revision_reference_source']['selections'] == selections
+    tray, declarations, _, _ = provider.prepare_context_compilation(
+        request.prompt, request.negative_prompt, request.reference_assets,
+        request.motion_references, request.parameters['context_inputs'])
+    assert [slot['label'] for slot in tray] == ['picture1', 'picture2']
+    assert declarations['reference_groups'] == 'character character-1: picture1\nproduct product-2: picture2'
+    binding = case.db.scalar(select(m.ShotProductBinding).where(m.ShotProductBinding.shot_id == case.shot.id))
+    assert binding.image_ids_json == [ref['id'] for ref in case.references]
+    assert case.source.status == 'generated'
 
 
 def test_reference_scale_use_policy_only_changes_the_explicitly_revised_product_group():

@@ -31,6 +31,27 @@ def image_data(path,max_side=768):
     data=out.getvalue()
     return {'type':'image_url','image_url':{'url':'data:image/jpeg;base64,'+base64.b64encode(data).decode('ascii')}},sha(data)
 
+def inspect_image_upload(data, extension):
+    limits = LIMITS['image']
+    if extension not in limits['formats']:
+        raise AppError(415, 'screenplay_asset_format', '支持 PNG、JPEG 和 WebP 图片')
+    if not data or len(data) > limits['max_bytes']:
+        raise AppError(413, 'screenplay_asset_size', '图片为空或超过 10 MiB')
+    try:
+        with Image.open(BytesIO(data)) as picture:
+            if picture.format not in {'PNG','JPEG','WEBP'} or picture.width * picture.height > limits['max_pixels'] or min(picture.size) < 32:
+                raise ValueError('Image signature/dimensions invalid')
+            expected = {'PNG':{'.png'}, 'JPEG':{'.jpg','.jpeg'}, 'WEBP':{'.webp'}}[picture.format]
+            if extension not in expected:
+                raise ValueError('Image extension and actual format differ')
+            metadata = {'bytes':len(data), 'width':picture.width, 'height':picture.height, 'format':picture.format}
+            picture.verify()
+        with Image.open(BytesIO(data)) as picture:
+            picture.load()
+    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
+        raise AppError(422, 'screenplay_image_decode', '图片签名、尺寸或内容无效') from exc
+    return metadata
+
 def upload_asset(session,settings,input_mode,filename,data,source_note='',*,commit=True):
     if input_mode not in {'image','video'}:raise AppError(422,'screenplay_asset_mode','只有图片和视频模式需要上传素材')
     limits=LIMITS[input_mode];extension=Path(filename).suffix.lower()
@@ -38,16 +59,7 @@ def upload_asset(session,settings,input_mode,filename,data,source_note='',*,comm
     if not data or len(data)>limits['max_bytes']:raise AppError(413,'screenplay_asset_size','素材为空或超过当前模式大小限制')
     metadata={'bytes':len(data),'source_note':source_note}
     if input_mode=='image':
-        try:
-            with Image.open(BytesIO(data)) as picture:
-                if picture.format not in {'PNG','JPEG','WEBP'} or picture.width*picture.height>limits['max_pixels'] or min(picture.size)<32:
-                    raise ValueError('Image signature/dimensions invalid')
-                expected={'PNG':{'.png'},'JPEG':{'.jpg','.jpeg'},'WEBP':{'.webp'}}[picture.format]
-                if extension not in expected:raise ValueError('Image extension and actual format differ')
-                metadata.update(width=picture.width,height=picture.height,format=picture.format);picture.verify()
-            with Image.open(BytesIO(data)) as picture:picture.load()
-        except (OSError,ValueError,UnidentifiedImageError,Image.DecompressionBombError) as exc:
-            raise AppError(422,'screenplay_image_decode','图片签名、尺寸或内容无效') from exc
+        metadata.update(inspect_image_upload(data, extension))
     asset=ScreenplayInputAsset(id=new_id('spinput'),input_mode=input_mode,filename=filename,relative_path='',sha256=sha(data),metadata_json=metadata,source_note=source_note)
     asset.relative_path=f'screenplay_sources/{asset.id}/original{extension}'
     path=safe_media_path(settings.media_root,asset.relative_path);path.parent.mkdir(parents=True,exist_ok=True)

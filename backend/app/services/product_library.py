@@ -236,9 +236,10 @@ def bind_created_project(session,job,result):
             state={k:v for k,v in value.items() if k not in {'keyframe_image_ids','video_image_ids','reference_selection_confirmed'}}
             session.add(ShotProductBinding(project_id=job.project_id,shot_id=shot_id,product_id=identifier,image_ids_json=[i['id'] for i in product['images']],state_json=state))
 
-def shot_references(session,settings,shot,*,stage='video',include_image_notes=False):
+def shot_references(session,settings,shot,*,stage='video',include_image_notes=False,exclude_product_ids=()):
     result=[]
     for binding in session.scalars(select(ShotProductBinding).where(ShotProductBinding.shot_id==shot.id).order_by(ShotProductBinding.product_id)):
+        if binding.product_id in exclude_product_ids:continue
         chosen=set(binding.state_json.get('keyframe_image_ids',binding.image_ids_json) if stage=='keyframe' else binding.image_ids_json)
         if not chosen:continue
         project=session.scalar(select(ProjectProductBinding).where(ProjectProductBinding.project_id==shot.project_id,ProjectProductBinding.product_id==binding.product_id))

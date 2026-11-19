@@ -143,7 +143,14 @@ def reference_layout(images, motion, *, prop_states=None):
                     'illustrations and lettering, which are features of the surface carrying them. Appearance follows '
                     'the individually bound references where present.')
         tray.append({'kind': 'picture', 'label': label, 'role': tray_role, 'note': note})
-        directions.append(f'Use <Picture {index}> for its declared purpose.')
+        if ref.get('source') == 'video_revision_reference':
+            target = ' '.join(str(ref.get('target_name') or '').split())
+            kind = 'character' if role == 'identity' else 'prop or product'
+            directions.append(f'Use <Picture {index}> as the appearance reference for the {kind}'
+                              + (f' named {target}. It supersedes earlier visual descriptions of that subject.' if target
+                                 else ' selected for this review revision. Preserve the described action and camera.'))
+        else:
+            directions.append(f'Use <Picture {index}> for its declared purpose.')
     for index, ref in enumerate(motion, 1):
         label = f'video{index}'
         actor = str(ref.get('target_character_id') or '')
@@ -281,6 +288,8 @@ def frozen_production_contract(images,declarations,context,prompt):
         product_name=refs[0].get('product_name') or 'the product in the first reference'
         matching=[s for s in specs if s.get('名称')==product_name]
         if not matching and len(grouped)==len(specs)==1:matching=specs
+        if any(ref.get('source') == 'video_revision_reference' for ref in refs):
+            matching = []  # The review attachment supplies the current product appearance.
         identity_specs=[{'name':s.get('名称'),'identity':{k:v for k,v in (s.get('内容') or {}).items()
                          if k in {'color','material','immutable_features','appearance','shape','markings','packaging'}}}
                         for s in matching]
@@ -403,6 +412,22 @@ async def has_work(client, origin, *, allow_refused=False):
     return bool(queue['queue_running'] or queue['queue_pending'])
 
 
+def context_runtime_baseline_stale(runtime):
+    if (not isinstance(runtime, dict) or runtime.get('schema_version') != 1
+            or runtime.get('service') != 'video-factory-native-context-runtime-v1'
+            or runtime.get('profile_id') != 'local-h3ir-qwen4b-v3'
+            or runtime.get('watcher_running') is not True or runtime.get('ready') is not False):
+        return False
+    baseline = runtime.get('source_baseline')
+    installation = runtime.get('installation_check')
+    if (not isinstance(baseline, dict) or baseline.get('ok') is not False
+            or not isinstance(installation, dict) or installation.get('ready') is not True):
+        return False
+    current, checked = baseline.get('manifest_sha256'), installation.get('manifest_sha256')
+    return current != checked and all(isinstance(value, str) and re.fullmatch(r'[a-f0-9]{64}', value)
+                                      for value in (current, checked))
+
+
 async def require_context_qwen(client, origin, *, runtime_required=False):
     """Use the same local identity and idle/release contract as the native guard."""
     host = urlsplit(origin).hostname
@@ -415,6 +440,9 @@ async def require_context_qwen(client, origin, *, runtime_required=False):
         vision = response.json()
         if runtime_required:
             runtime = vision
+            if context_runtime_baseline_stale(runtime):
+                raise AppError(503, 'context_ir_runtime_stale',
+                               'Context-IR 调度服务在线，安装校验已过期。请在推理队列空闲后使用「一键修复」刷新校验')
             if (not isinstance(runtime, dict) or runtime.get('schema_version') != 1
                     or runtime.get('service') != 'video-factory-native-context-runtime-v1'
                     or runtime.get('profile_id') != 'local-h3ir-qwen4b-v3'
