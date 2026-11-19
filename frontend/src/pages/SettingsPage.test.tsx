@@ -42,8 +42,20 @@ it('opens service profiles and quality directly without diagnostic navigation or
   expect(screen.getByLabelText('默认输出规格')).toHaveValue('720p');
   expect(screen.queryByRole('navigation',{name:'设置分区'})).not.toBeInTheDocument();
   expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
+  expect(screen.queryByRole('link',{name:'任务模型策略'})).not.toBeInTheDocument();
   for(const label of ['运行诊断','模型对比实验','质量模式与实际验证证据','hidden-server-version','hidden-plan-json'])expect(screen.queryByText(label)).not.toBeInTheDocument();
   expect(mocked.mock.calls.every(([url])=>['/api/settings/ai-services','/api/settings/ai-service-options','/api/quality/capabilities','/api/quality/profiles/system/default'].includes(url))).toBe(true);
+});
+
+it('offers background music and its verified local model in the service editor',async()=>{
+  const user=userEvent.setup();mount();await screen.findByRole('heading',{name:'服务档案'});
+  await user.selectOptions(screen.getByLabelText('筛选服务用途'),'background_music');
+  await user.click(screen.getByRole('button',{name:'添加服务'}));
+  const dialog=within(screen.getByRole('dialog',{name:'配置 AI 服务'}));
+  expect(dialog.getByLabelText('服务用途')).toHaveValue('background_music');
+  expect(dialog.getByLabelText('默认模型')).toHaveValue('ace_step_1.5_turbo_aio.safetensors');
+  expect(dialog.getByLabelText('背景音乐音量（dB）')).toHaveValue(-17);
+  expect(dialog.queryByLabelText('API Key')).not.toBeInTheDocument();
 });
 
 it('adds the selected service module from the flat all-services view',async()=>{

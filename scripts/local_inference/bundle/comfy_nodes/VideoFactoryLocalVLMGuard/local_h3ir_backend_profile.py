@@ -33,7 +33,7 @@ from .media_bindings import ground_writer_messages, repair_media_bindings, writt
 
 
 VERSION='local-h3ir-qwen4b-v3'
-POLICY_REVISION='structural-unicode-v8'
+POLICY_REVISION='descriptive-retention-v9'
 MODEL='Qwen/Qwen3-VL-4B-Instruct'
 MAX_OUTPUT=4096
 CARD_OUTPUT=3072
@@ -58,6 +58,15 @@ RENDER_IR_SHA256='a71e800d15624be4624b7cea1d5507ffcb22e7e218f9a6be37410cab8303da
 ASSESS_SHA256='5d1218f03aa822deb9aee055ce858d5049af67ae1da6f1dea7a4200155a14a53'
 _CAMERA_REPAIR='restored the frozen camera sentence in the numbered shot'
 _VERBATIM_SPANS=re.compile(r'<d>.*?</d>|"[^"]*"|“([^"”]*)”',re.S)
+_DESCRIPTIVE_RETENTION = frozenset({
+    'scene', 'scene state', 'setting', 'location', 'background', 'lighting', 'lens', 'camera',
+    'camera movement', '场景', '场景状态', '背景', '灯光', '机位', '运镜',
+})
+_DESCRIPTIVE_ROW = re.compile(
+    r'[ \t]*(?:[-*][ \t]+)?(?P<label><[^<>\r\n]+>|[\w -]{1,32})[ \t]*'
+    r'(?:\(appears in \[Shot 1\]\)[ \t]*)?[:：][ \t]*(?P<text>\S[^\r\n]*)',
+    re.I,
+)
 _REFERENCE_FINDING_RULES=frozenset(('F2-duplicate-definition','F3-required-reference',
     'F4-conflicting-groups','F5-declared-group-binding','F6-declared-binding-projection',
     'F7-locked-onscreen-text'))
@@ -86,6 +95,51 @@ def _normalize_structural_text(text, table):
         offset = match.end()
     parts.append(text[offset:].translate(table))
     return ''.join(parts)
+
+
+def _relocate_descriptive_retention(text):
+    """Keep non-subject descriptions in the existing single-shot prose."""
+    if not isinstance(text, str):
+        return text, []
+    headings = list(re.finditer(r'(?m)^(retention_analysis|detailed_description|overall_soundscape):[ \t]*\r?$', text))
+    if [entry[1] for entry in headings] != ['retention_analysis', 'detailed_description', 'overall_soundscape']:
+        return text, []
+    retention, detail, sound = headings
+    prose = text[detail.end():sound.start()]
+    if re.findall(r'\[Shot \d+\]', prose) != ['[Shot 1]']:
+        return text, []
+    rows, moved = [], []
+    for line in text[retention.end():detail.start()].splitlines(keepends=True):
+        row = _DESCRIPTIVE_ROW.fullmatch(line.rstrip('\r\n'))
+        label = re.sub(r'[-_\s]+', ' ', row['label'].strip('<> ').casefold()) if row else ''
+        if label not in _DESCRIPTIVE_RETENTION:
+            rows.append(line)
+            continue
+        sentence = re.sub(r'^fully_preserved\s+[-–—]\s+', '', row['text'], flags=re.I).strip()
+        if not sentence or any(character in sentence for character in '<>[]'):
+            rows.append(line)
+            continue
+        moved.append({'label': label, 'text': sentence})
+    if not moved or not any(line.strip() for line in rows):
+        return text, []
+    end = sound.start() - (len(prose) - len(prose.rstrip()))
+    suffix = ' '.join(dict.fromkeys(item['text'] for item in moved if item['text'] not in prose))
+    before_sound = text[detail.start():end] + (' ' + suffix if suffix else '') + text[end:sound.start()]
+    return text[:retention.end()] + ''.join(rows) + before_sound + text[sound.start():], moved
+
+
+def _format_descriptive_retention(text, scope):
+    formatted, moved = _relocate_descriptive_retention(text)
+    if moved:
+        number = scope.get('descriptive_retention_passes', 0) + 1
+        scope['descriptive_retention_passes'] = number
+        write_json(scope['directory']/f'descriptive-retention-{number:03d}.json', {
+            'source_request_number': scope.get('requests'),
+            'moved': moved,
+            'before_sha256': hashlib.sha256(text.encode()).hexdigest(),
+            'after_sha256': hashlib.sha256(formatted.encode()).hexdigest(),
+        })
+    return formatted
 
 
 def _install_structural_render_compatibility():
@@ -663,11 +717,13 @@ def _install_revision_validation():
 
         @functools.wraps(original_compose)
         def compose_written(backend,brief,subjects,cards,target,labels,**kwargs):
-            if _ACTIVE.get() is None:
+            scope=_ACTIVE.get()
+            if scope is None:
                 return original_compose(backend,brief,subjects,cards,target,labels,**kwargs)
             token=_COMPOSE_MEDIA.set(labels)
             try:
-                return original_compose(backend,brief,subjects,cards,target,labels,**kwargs)
+                text=original_compose(backend,brief,subjects,cards,target,labels,**kwargs)
+                return _format_descriptive_retention(text,scope) if brief.shots==1 else text
             finally:
                 _COMPOSE_MEDIA.reset(token)
 
@@ -683,6 +739,11 @@ def _install_revision_validation():
         def repair_written(*args,**kwargs):
             result=original_repair(*args,**kwargs)
             scope=_ACTIVE.get() or {}
+            if scope:
+                formatted=_format_descriptive_retention(result.text,scope)
+                if formatted!=result.text:
+                    result.text=formatted
+                    result.repairs.append('moved descriptive retention rows into their numbered shot')
             sentence=(scope.get('reference_contract') or {}).get('camera_sentence')
             if sentence:
                 repaired=_restore_camera_motion(result.text,sentence)

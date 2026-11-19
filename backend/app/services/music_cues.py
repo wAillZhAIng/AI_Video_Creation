@@ -11,13 +11,19 @@ from app.models import AudioEvent, ShotDetail, StoryboardShot
 from app.services.word_duration import _INTERVAL_SEPARATOR, _seconds, _timecode
 
 
-MUSIC_FIELDS = {'音乐', '背景音乐', '配乐', 'bgm', 'music', 'background music'}
+MUSIC_FIELDS = {'音乐', '背景音乐', '配乐', '背景配乐', 'bgm', 'music', 'background music', 'score'}
 MIXED_MUSIC_FIELDS = {'音乐与音效', '背景音乐与音效', '背景音乐及音效', '配乐与音效'}
 _SECTION = MUSIC_FIELDS | {
     '背景音乐要求', '背景音乐设计', '配乐要求', '配乐方案', '配乐设计', '音乐要求',
     '音乐设计', 'background music requirements', 'music cues', 'soundtrack',
 }
 _STYLE_FIELDS = _SECTION | {'音乐风格', '混音要求', '配乐风格', 'music style', 'mixing notes'}
+_SHOT_COLUMNS = {'分镜区间', '镜头区间', '分镜', '镜头', 'shot range', 'shots'}
+_TIME_COLUMNS = {'时段', '时间段', '起止时间', '时间码', '时间区间', '时间', 'time range', 'timecode', 'time'}
+_START_COLUMNS = {'开始时间', '起始时间', 'start time'}
+_END_COLUMNS = {'结束时间', 'end time'}
+_SCORE_COLUMNS = MUSIC_FIELDS | {'音乐风格', '配乐说明', 'music style', 'music cue'}
+_MIX_COLUMNS = {'混音', '混音要求', 'mix', 'mixing notes'}
 _SHOTS = re.compile(
     r'^(?:第\s*|(?:shots?|分镜|镜头)\s*#?\s*)(\d+)\s*(?:镜(?:头)?\s*)?'
     r'(?:[-–—~至到]\s*(?:(?:第|shots?|分镜|镜头)\s*)?(\d+)\s*(?:镜(?:头)?)?)?$', re.I,
@@ -40,12 +46,51 @@ def time_bounds(value):
     return float(start), float(end)
 
 
+def _score_table(block):
+    """Recognize standalone score tables without treating rows as new shots."""
+    allowed = _SCORE_COLUMNS | _SHOT_COLUMNS | _TIME_COLUMNS | _START_COLUMNS | _END_COLUMNS | _MIX_COLUMNS | {'', '序号'}
+    for index, row in enumerate(block['rows']):
+        headers = [unicodedata.normalize('NFKC', cell).strip().casefold() for cell in row]
+        columns = set(headers)
+        if columns <= allowed and columns & _SCORE_COLUMNS and (
+                columns & (_SHOT_COLUMNS | _TIME_COLUMNS) or columns & _START_COLUMNS and columns & _END_COLUMNS):
+            break
+        if sum(bool(cell) for cell in headers) > 1:
+            return None
+    else:
+        return None
+    items = []
+    for index, row in enumerate(block['rows'][index+1:], index+1):
+        data = {key: text.strip() for key, text in zip(headers, row) if text.strip()}
+        if not data:
+            continue
+        script_text = '\n'.join(text for key, text in data.items() if key in _SCORE_COLUMNS | _MIX_COLUMNS)
+        shot_scope = next((text for key, text in data.items() if key in _SHOT_COLUMNS), '')
+        time_scope = next((text for key, text in data.items() if key in _TIME_COLUMNS), '')
+        start = next((text for key, text in data.items() if key in _START_COLUMNS), '')
+        end = next((text for key, text in data.items() if key in _END_COLUMNS), '')
+        if not time_scope and start and end:
+            time_scope = start + '–' + end
+        shot_scope = unicodedata.normalize('NFKC', shot_scope)
+        match = _SHOTS.fullmatch(shot_scope) or _SHOTS.fullmatch('shot ' + shot_scope)
+        bounds = time_bounds(time_scope)
+        if not script_text or (not match and not bounds):
+            return None
+        scope = {'shot_range': [int(match[1]), int(match[2] or match[1])]} if match else {'time_range': list(bounds)}
+        items.append({'description': script_text, 'source': [f"{block['id']}:row:{index}"], **scope})
+    return items or None
+
+
 def word_music_sections(blocks):
     """Extract score sections before the Word parser tries to identify shots."""
     retained, directives = [], []
     in_section = False
     for block in blocks:
         if block['kind'] != 'paragraph':
+            cues = _score_table(block) if block['kind'] == 'table' else None
+            if cues:
+                directives.extend(cues)
+                continue
             retained.append(block)
             in_section = False
             continue
@@ -200,7 +245,7 @@ def script_music_plan(session, project_id, clips, transitions):
             if base['silence']:
                 continue
             sections = [cue['description'] for cue in active if cue['local'] and cue is not base]
-            key = id(base)
+            key = (tuple(base['source']), base['start'], base['end'], base['description'], base['volume'])
             if key not in track_ids:
                 track_ids[key] = len(tracks)
                 tracks.append({

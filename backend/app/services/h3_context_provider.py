@@ -260,10 +260,12 @@ def context_compiler_intent(prompt, negative_prompt, directions, *, silent=False
                      'without adding any clauses: The target video uses a photographic live-action style. '
                      'On the next line write [Shot 1] and the scene, lighting, camera, and action prose. '
                      'Do not put the shot marker before the style sentence. Keep sound only under its own headings.')
-        parts.append('In retention_analysis use one line per defined native entity. Start each line with its actual angle-bracket '
-                     'tag, followed by the retention marker and its reason. Describe location, lighting, lens and camera in the '
-                     'shot prose, and sound in its sound fields. Do not add plain-key entries like location, lighting, lens, '
-                     'ambience or music to retention_analysis.')
+        parts.append('In retention_analysis, write exactly one line for each native subject defined by the brief, using '
+                     'its exact existing subject tag. For example: <Subject 1> (appears in [Shot 1]): fully_preserved - '
+                     'its visible identity is retained. Describe setting continuity, background, lighting, lens and camera '
+                     'in the shot prose, and sound in its sound fields. Any media-level retention entries must use existing '
+                     'Picture, Video or Audio tags from the original brief. Scene State, Setting, Background and Camera are '
+                     'descriptive concepts and have no angle-bracket tags.')
     if silent:
         parts.append('Set the non_diegetic_music field to exactly N/A, with no additional words.')
     parts.append('Write the actual camera action inside the numbered shot as prose. Use an exact camera term such as '

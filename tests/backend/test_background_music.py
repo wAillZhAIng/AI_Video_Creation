@@ -1,8 +1,10 @@
 import array
+import asyncio
 import hashlib
 import math
 import shutil
 import subprocess
+from dataclasses import replace
 from io import BytesIO
 
 import pytest
@@ -12,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.db import Base, build_engine
 from app.models import AudioEvent, Project, ScriptRevision, StoryboardShot
 from app.services.assembly import command_for, probe
+from app.services import background_music
 from app.services.background_music import clip_music_plan
 from app.services.cinematic_import import build_ir
 from app.services.music_cues import script_music_plan
@@ -39,6 +42,56 @@ def test_music_word_section_is_independent_of_shot_and_effect_parsing():
     assert [event['kind'] for event in saved['shots'][0]['audio_events']] == ['music', 'sfx']
     assert saved['shots'][0]['audio_events'][1]['description'] == '保留车内气流声'
     assert all(item['source'] for item in music)
+
+
+def test_standalone_music_table_does_not_create_additional_shots():
+    doc = Document()
+    doc.add_paragraph('场景 1 夜景')
+    doc.add_paragraph('分镜时间轴')
+    doc.add_paragraph('00:00–00:03')
+    doc.add_paragraph('画面：环境夜景')
+    doc.add_paragraph('00:03–00:06')
+    doc.add_paragraph('画面：杯身特写')
+    table = doc.add_table(rows=3, cols=3)
+    for row, values in zip(table.rows, (
+        ('开始时间', '结束时间', '背景音乐'),
+        ('00:00', '00:03', '低音合成器'),
+        ('00:03', '00:06', '电钢琴'),
+    )):
+        for cell, value in zip(row.cells, values):
+            cell.text = value
+    handle = BytesIO()
+    doc.save(handle)
+    saved = build_ir(read_blocks(handle.getvalue(), 1_000_000), parse_blocks)
+    assert len(saved['shots']) == 2
+    assert [(d['time_range'], d['description']) for d in saved['project']['background_music']] == [
+        ([0, 3], '低音合成器'), ([3, 6], '电钢琴'),
+    ]
+
+
+def test_background_music_checks_configured_context_queue_instead_of_legacy_port(settings, monkeypatch):
+    app_settings = replace(settings, comfyui_base_url='http://127.0.0.1:18188',
+                           h3_context_comfyui_url='http://127.0.0.1:8188')
+    engine = build_engine(settings.database_url)
+    Base.metadata.create_all(engine)
+    from app.models import AIService
+
+    with Session(engine) as session:
+        session.add(AIService(module='video_generation', provider='comfyui', name='Context-IR',
+                              base_url='http://127.0.0.1:8788', settings_json={'h3_context_ir': True}))
+        session.flush()
+        peers = background_music._configured_gpu_peers(session, app_settings)
+    origins = []
+
+    async def queue(_settings, selected, route):
+        assert route == '/queue'
+        origins.append(selected['base_url'])
+        return {'queue_running': [], 'queue_pending': []}
+
+    monkeypatch.setattr(background_music, '_json', queue)
+    assert asyncio.run(background_music._idle(
+        app_settings, {'base_url': 'http://127.0.0.1:18188', 'gpu_peer_origins': peers}))
+    assert origins == ['http://127.0.0.1:18188', 'http://127.0.0.1:8788']
 
 
 def test_arrangement_keeps_one_track_and_only_changes_explicit_ranges(settings):
@@ -77,6 +130,14 @@ def test_arrangement_keeps_one_track_and_only_changes_explicit_ranges(settings):
         trimmed = script_music_plan(session, 'project', clips, [{'duration': 0}] * 3)
         assert trimmed[0]['placements'][0]['tempo'] == 1
         assert trimmed[0]['placements'][1]['offset'] == 2
+        current = session.query(ScriptRevision).one()
+        current.parsed_json = {**current.parsed_json, 'project': {'background_music': []}}
+        for clip in clips:
+            identifier = clip['shot_id']
+            session.add(AudioEvent(shot_id=identifier, kind='music', description='器乐 '+identifier))
+        session.flush()
+        per_shot = script_music_plan(session, 'project', clips, [{'duration': 0}] * 3)
+        assert [cue['description'] for cue in per_shot] == ['器乐 s1', '器乐 s2', '器乐 s3', '器乐 s4']
 
 
 def test_ffmpeg_places_each_real_audio_input_without_replacing_original_sound(settings):

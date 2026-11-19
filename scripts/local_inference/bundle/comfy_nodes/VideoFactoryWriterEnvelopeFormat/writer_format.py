@@ -20,7 +20,7 @@ MODEL = "Qwen/Qwen3-VL-4B-Instruct"
 PINS = {
     "h3ir.prose": "4ad714c522e907e2990cc8f9f2bf68b82aaf31668bc98167a0ab5d4375746876",
     "h3ir.compile": "f96d893ff2b895c524329f11c10bed8999a5436d6c09ce64d95590819195772b",
-    "v3_profile": "2a96d9d6847ca31a006406171ac488c87c14dee1e78f339ff11cedd998fd8932",
+    "v3_profile": "26c18441693dc47fa30c0cf593b659d1945c60fc621ba1842f52d677c770ea3e",
 }
 SECTIONS = ("subject_definitions", "summary", "retention_analysis", "detailed_description",
             "overall_soundscape", "non_diegetic_music")

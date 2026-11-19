@@ -221,6 +221,31 @@ class NativeReferenceCorrectionTests(unittest.TestCase):
         multiple='detailed_description:\n[Shot 1] One scene.\n[Shot 2] Another scene.'
         self.assertEqual(profile._restore_camera_motion(multiple,sentence),multiple)
 
+    def test_scene_descriptions_use_the_shot_prose_and_preserve_subjects_and_dialogue(self):
+        scene='The curved screen and cream leather interior stay in the background.'
+        extra=f'<Scene State> (appears in [Shot 1]): fully_preserved - {scene}'
+        self.missing=self.corrected.replace('\ndetailed_description:', f'\n{extra}\n\ndetailed_description:',1)
+        context=compiler._written_context(self.brief,Mode.REF2VA,self.plan,{},300,None)
+        self.assertIn('R1-malformed-entry',{f.rule for f in compiler.validate(self.missing,context)})
+
+        doc,calls=self.compile([])
+
+        self.assertEqual(doc.source,'written',doc.provenance)
+        self.assertEqual(calls,[])
+        self.assertNotIn('<Scene State>',doc.prompt)
+        detail=doc.prompt.split('detailed_description:',1)[1].split('overall_soundscape:',1)[0]
+        self.assertIn(scene,detail)
+        self.assertIn('<d>[English]Look at this tree.</d>',doc.prompt)
+        self.assertIn('"Tiny tree"',doc.prompt)
+        self.assertEqual(profile._relocate_descriptive_retention(doc.prompt),(doc.prompt,[]))
+        self.assertTrue(list(self.directory.glob('descriptive-retention-*.json')))
+
+    def test_descriptive_retention_keeps_unknown_entity_tags_for_native_validation(self):
+        bad=self.corrected.replace('\ndetailed_description:', '\n<Subject 99>: fully_preserved - unknown.\n\ndetailed_description:',1)
+        self.assertEqual(profile._relocate_descriptive_retention(bad),(bad,[]))
+        multiple=bad.replace('overall_soundscape:', '[Shot 2] Another view.\n\noverall_soundscape:',1)
+        self.assertEqual(profile._relocate_descriptive_retention(multiple),(multiple,[]))
+
     def test_native_loop_removes_missing_motion_and_voice_attribution(self):
         original='the plush Christmas tree from <Picture 1>'
         with_phantoms=(original+' and whose walking motion comes from <Video 1>'

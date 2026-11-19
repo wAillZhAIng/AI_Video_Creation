@@ -112,7 +112,8 @@ def test_context_keeps_explicit_camera_terms_in_the_shot_without_overriding_new_
     assert 'this exact camera sentence: The camera shakes slightly and pushes in.' in intent
     assert 'exact subject tag from that definition in the visible action or placement' in intent
     assert 'use the literal <Subject 1> at the first mention of the pictured product' in intent
-    assert 'Do not add plain-key entries like location, lighting, lens' in intent
+    assert 'Picture, Video or Audio tags from the original brief.' in intent
+    assert 'Scene State, Setting, Background and Camera are descriptive concepts' in intent
     _, _, multi_product = reference_layout([{'role': 'product', 'product_id': name} for name in ('one', 'two')], [])
     assert all('Keep <Subject 1>' not in direction for direction in multi_product)
     assert 'this exact camera sentence' not in context_compiler_intent(

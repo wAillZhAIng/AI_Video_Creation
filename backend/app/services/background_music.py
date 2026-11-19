@@ -141,22 +141,39 @@ def _write_json(path, value):
 
 
 async def _idle(settings, snapshot):
-    origins = [snapshot['base_url']]
-    peer = settings.h3_context_comfyui_url
-    if peer and is_loopback_service(peer) and peer.rstrip('/') != origins[0].rstrip('/'):
-        origins.append(peer)
+    own = snapshot['base_url'].rstrip('/')
+    origins = dict.fromkeys([own, *snapshot.get('gpu_peer_origins', [])])
     for origin in origins:
         try:
             queue = await _json(settings, {**snapshot, 'base_url': origin}, '/queue')
         except httpx.ConnectError as exc:
-            if origin != origins[0] and _connection_refused(exc):
+            if origin != own and _connection_refused(exc):
                 continue
             raise
+        except httpx.HTTPStatusError as exc:
+            raise AppError(502, 'music_queue_check_failed',
+                           f'无法核对已配置的本机 GPU 队列（HTTP {exc.response.status_code}）') from exc
         if not all(isinstance(queue.get(key), list) for key in ('queue_running', 'queue_pending')):
             raise AppError(502, 'music_queue_unknown', '无法确认本机 GPU 队列状态')
         if queue['queue_running'] or queue['queue_pending']:
             return False
     return True
+
+
+def _configured_gpu_peers(session, settings):
+    """Read actual enabled Compute origins, independent of legacy port defaults."""
+    services = session.scalars(select(AIService).where(
+        AIService.enabled.is_(True), AIService.module == 'video_generation', AIService.provider == 'comfyui'))
+    candidates = [settings.comfyui_base_url]
+    candidates.extend(row.base_url for row in services if row.settings_json.get('h3_context_ir') is True)
+    peers = []
+    for origin in dict.fromkeys(candidates):
+        try:
+            validate_endpoint(origin)
+        except AppError:
+            continue
+        peers.append(origin.rstrip('/'))
+    return peers
 
 
 async def _await_audio(settings, service, intent, duration):
@@ -279,6 +296,7 @@ async def prepare_render(settings, session_factory, identifier, snapshot):
             current = session.get(AIService, service['service_id'])
             if not current or not current.enabled or current.revision != service['service_revision']:
                 raise AppError(409, 'music_service_changed', '背景音乐服务配置已变更，请重新提交合成')
+            service = {**service, 'gpu_peer_origins': _configured_gpu_peers(session, settings)}
         sounds = []
         for cue in snapshot['background_music']:
             with session_factory() as session:
