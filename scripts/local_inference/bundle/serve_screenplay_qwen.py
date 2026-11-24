@@ -2,6 +2,7 @@
 from __future__ import annotations
 import base64
 import gc
+import functools
 import hashlib
 from io import BytesIO
 import json
@@ -21,12 +22,16 @@ MODEL=Path(os.environ['VF_QWEN_MODEL']).resolve()
 MODEL_ID='Qwen/Qwen3-VL-2B-Instruct'
 PROFILE='screenplay-qwen2b'
 SERVICE_ID='video-factory-screenplay-qwen-v1'
-MAX_CONTEXT_TOKENS=10000
-MAX_PROMPT_TOKENS=6500
-MAX_INPUT_CHARACTERS=100000
-MAX_IMAGE_EDGE=768
-MIN_VISION_PIXELS=64*32*32
-MAX_VISION_PIXELS=128*32*32
+# ``None`` means the checkpoint's own advertised context window.  Wrappers may
+# narrow this only when a smaller value is an explicit physical model limit.
+MAX_CONTEXT_TOKENS=None
+MAX_PROMPT_TOKENS=None
+# Text is admitted according to the model's real token context after the
+# chat template is rendered. A character-count ceiling is neither a reliable
+# token estimate nor an appropriate workflow policy.
+# Image sizing is delegated to the model's saved processor configuration and
+# the actual combined prompt/context calculation.  There is no service-side
+# edge, count, byte, or character policy ceiling.
 VRAM_PREFLIGHT=False
 SAFE_TEXT_SDPA=False
 # Enabled only by the fixed H3-IR wrapper, never by the screenplay/JSON paths.
@@ -46,14 +51,25 @@ os.environ.update({'HF_HUB_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1','HF_HUB_DISAB
 sys.dont_write_bytecode=True
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# Pillow's default decompression-bomb threshold is a static pixel policy.  The
+# adapter instead reads headers without decoding, then applies the dynamic
+# host/cgroup-memory preflight below before the model processor can allocate
+# image buffers.
+Image.MAX_IMAGE_PIXELS=None
 
 app=FastAPI(title='VideoFactory fixed local screenplay model')
 lock=threading.Lock()
+# Decode one request's inline image payloads at a time.  This is separate from
+# the GPU lease: it prevents two HTTP workers from allocating large decoded
+# image buffers simultaneously before either can reach the inference lock.
+input_decode_lock=threading.Lock()
 weight_verified=False
 weights_receipt=None
 grammar_tokenizer_data=None
+grammar_control_fragments={}
 loaded=False
 inference_phase='idle'
 gpu_release_status='not_used'
@@ -64,13 +80,17 @@ class ChatTemplateOptions(BaseModel):
     model_config=ConfigDict(extra='forbid')
     enable_thinking:bool=Field(default=False,strict=True)
 
-StopText=Annotated[str,Field(strict=True,min_length=1,max_length=256)]
+StopText=Annotated[str,Field(strict=True,min_length=1)]
 
 class ChatRequest(BaseModel):
     model_config=ConfigDict(extra='forbid')
     model:str
-    messages:list[dict]=Field(min_length=1,max_length=20)
-    max_tokens:int|None=Field(default=None,ge=1,le=8192)
+    trace_id:str|None=None
+    messages:list[dict]=Field(min_length=1)
+    # ``None`` asks the adapter to use all remaining physical context/VRAM;
+    # callers may request a smaller budget but there is no service-side
+    # arbitrary maximum below the model's own context window.
+    max_tokens:int|None=Field(default=None,ge=1)
     temperature:float=Field(default=0.2,ge=0,le=2)
     stream:bool=False
     response_format:dict|None=None
@@ -80,14 +100,14 @@ class ChatRequest(BaseModel):
 
     @field_validator('stop')
     @classmethod
-    def bounded_stop_sequences(cls,value):
-        if isinstance(value,list) and not 1<=len(value)<=4:
-            raise ValueError('Use one to four nonempty stop sequences')
+    def nonempty_stop_sequences(cls,value):
+        if isinstance(value,list) and not value:
+            raise ValueError('Use at least one nonempty stop sequence')
         return value
 
 class TranscriptionRequest(BaseModel):
     model_config=ConfigDict(extra='forbid')
-    audio_base64:str=Field(min_length=1,max_length=4_000_000)
+    audio_base64:str=Field(min_length=1)
 
 ASR_MODEL=ROOT/'optional-models/Whisper-base/base.pt'
 ASR_SHA='ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e'
@@ -98,8 +118,8 @@ def transcribe(body:TranscriptionRequest):
     try:
         raw=base64.b64decode(body.audio_base64,validate=True)
         with wave.open(BytesIO(raw),'rb') as audio:
-            if audio.getnchannels()!=1 or audio.getsampwidth()!=2 or audio.getframerate()!=16000 or not 0<audio.getnframes()<=16000*60:
-                raise ValueError('Bounded mono 16kHz PCM16 source audio required')
+            if audio.getnchannels()!=1 or audio.getsampwidth()!=2 or audio.getframerate()!=16000 or audio.getnframes() <= 0:
+                raise ValueError('Mono 16kHz PCM16 source audio required')
             pcm=audio.readframes(audio.getnframes())
         if not ASR_MODEL.is_file() or digest(ASR_MODEL)!=ASR_SHA:raise ValueError('Verified local Whisper-base is unavailable')
         import numpy as np
@@ -130,7 +150,7 @@ def health():
             'script_sha256':SCRIPT_SHA,'source_components':SOURCE_COMPONENTS,'pid':os.getpid(),
             'loaded':loaded,'busy':lock.locked() or retained_gpu_lease is not None or loaded,'offline':True,
             'inference_phase':inference_phase,'gpu_release_status':gpu_release_status,
-            'gpu_memory':cuda_memory_snapshot(),'last_gpu_cleanup':last_gpu_cleanup,'max_model_len':MAX_CONTEXT_TOKENS,
+            'gpu_memory':cuda_memory_snapshot(),'last_gpu_cleanup':last_gpu_cleanup,'max_model_len':model_context_limit(),
             'prose_repetition_policy':{'enabled':H3IR_PROSE_REPEAT_GUARD,'policy':'h3ir-output-repetition-v1',
                 'scope':'generated_tokens_only','output_repetition_penalty':PROSE_OUTPUT_REPETITION_PENALTY,
                 'eos_logits_exempt':True,'min_period_tokens':PROSE_REPEAT_MIN_PERIOD,
@@ -140,7 +160,7 @@ def health():
 @app.get('/v1/models')
 def models():
     return {'object':'list','data':[{'id':MODEL_ID,'object':'model','owned_by':'local',
-       'max_model_len':MAX_CONTEXT_TOKENS,'max_output_tokens':8192,
+       'max_model_len':model_context_limit(),'output_budget':'dynamic_remaining_context_and_vram',
        'input_modalities':['text','image'],'video_adapter':'timestamped extracted frames; no audio transcription'}]}
 
 def digest(path):
@@ -157,6 +177,27 @@ def _fixed_model_file(name):
     if path.parent!=directory or not path.is_file():
         raise ValueError('Model file is missing or escapes the fixed model directory: '+name)
     return path
+
+
+def _model_text_config():
+    config=json.loads(_fixed_model_file('config.json').read_text(encoding='utf-8-sig')).get('text_config')
+    if not isinstance(config,dict):
+        raise ValueError('Fixed local model config has no text_config')
+    return config
+
+
+def model_context_limit(config=None):
+    """Use the checkpoint context unless a wrapper declares a physical limit."""
+    config=_model_text_config() if config is None else config
+    advertised=config.get('max_position_embeddings')
+    if type(advertised) is not int or advertised <= 1:
+        raise ValueError('Fixed local model has no usable max_position_embeddings')
+    configured=MAX_CONTEXT_TOKENS
+    if configured is None:
+        return advertised
+    if type(configured) is not int or configured <= 1:
+        raise ValueError('Configured local context limit is invalid')
+    return min(configured,advertised)
 
 def verify_model_weights():
     """Verify fixed on-disk weights; manifest.directory is informational only."""
@@ -239,13 +280,11 @@ def output_token_budget(torch,prompt_tokens,requested_output_tokens):
     """Select the remaining context and VRAM capacity when no output limit is requested."""
     automatic=requested_output_tokens is None
     check_vram=automatic or VRAM_PREFLIGHT
-    context_limit=MAX_CONTEXT_TOKENS
-    if check_vram:
-        config=json.loads(_fixed_model_file('config.json').read_text(encoding='utf-8-sig'))['text_config']
-        context_limit=min(context_limit,config.get('max_position_embeddings',context_limit))
+    config=_model_text_config()
+    context_limit=model_context_limit(config)
     available_context=context_limit-prompt_tokens
     output_tokens=available_context if automatic else requested_output_tokens
-    if prompt_tokens>MAX_PROMPT_TOKENS or not 0<output_tokens<=available_context:
+    if not 0<output_tokens<=available_context:
         raise ValueError(f'Input/output exceeds the local {context_limit}-token context budget; reduce or split the request')
     if not check_vram:return output_tokens,None
     head_dim=config.get('head_dim') or config['hidden_size']//config['num_attention_heads']
@@ -353,30 +392,233 @@ def cleanup_gpu(torch,baseline):
     return {'released':bool(released),'baseline':baseline,'after':current,'error':cleanup_error,
             'scope':'own live Torch allocation plus conservative global-free comparison; not peak memory'}
 
+def _read_memory_value(path):
+    try:
+        raw=Path(path).read_text(encoding='ascii').strip()
+    except OSError:
+        return None
+    if raw.casefold()=='max':return None
+    try:
+        value=int(raw)
+    except ValueError:
+        return None
+    return value if value>=0 else None
+
+
+def cgroup_available_memory():
+    """Return actual cgroup headroom when the current host exposes it."""
+    candidates=(
+        ('/sys/fs/cgroup/memory.max','/sys/fs/cgroup/memory.current'),
+        ('/sys/fs/cgroup/memory/memory.limit_in_bytes','/sys/fs/cgroup/memory/memory.usage_in_bytes'),
+    )
+    values=[]
+    for limit_path,current_path in candidates:
+        limit,current=_read_memory_value(limit_path),_read_memory_value(current_path)
+        if limit is not None and current is not None:
+            # An over-limit cgroup has zero usable headroom, not an unknown
+            # limit.  Reporting zero lets the dynamic preflight produce the
+            # real physical-memory diagnostic before another allocation.
+            values.append(max(0,limit-current))
+    return min(values) if values else None
+
+
+def available_host_memory():
+    """Measure available RAM, respecting both host and container accounting."""
+    import psutil
+    process=psutil.Process()
+    host_available=int(psutil.virtual_memory().available)
+    cgroup_available=cgroup_available_memory()
+    usable=min(value for value in (host_available,cgroup_available) if value is not None)
+    return {'host_available_bytes':host_available,'cgroup_available_bytes':cgroup_available,
+            'available_bytes':usable,'process_rss_bytes':int(process.memory_info().rss)}
+
+
+def checkpoint_max_pixels(image_processor):
+    """Use only a value saved by this checkpoint's native image processor."""
+    try:
+        saved=image_processor.to_dict()
+    except Exception:
+        return None
+    value=saved.get('max_pixels') if isinstance(saved,dict) else None
+    return value if type(value) is int and value>0 and getattr(image_processor,'max_pixels',value)==value else None
+
+
+def header_decode_bytes(image):
+    """Estimate the source frame allocation from its real PIL header mode."""
+    mode=str(image.mode or '')
+    bits_per_channel=32 if mode in {'I','F'} else 16 if mode.startswith('I;16') else 8
+    channels=max(1,len(image.getbands() or ()))
+    return int(image.width)*int(image.height)*channels*((bits_per_channel+7)//8)
+
+
+def preflight_images_for_processor(images,image_records,image_processor):
+    """Apply checkpoint-native JPEG drafting and dynamic RAM admission only.
+
+    There is deliberately no image count, byte, edge, or service pixel ceiling:
+    the estimate is derived from each real header and the memory available at
+    this exact moment.  Non-JPEG sources remain untouched because Pillow has no
+    equivalent safe native draft path for them.
+    """
+    native_max_pixels=checkpoint_max_pixels(image_processor)
+    for image,record in zip(images,image_records):
+        original_dimensions=[int(image.width),int(image.height)]
+        drafted=False
+        if (native_max_pixels is not None and (image.format or '').upper()=='JPEG'
+                and image.width*image.height>native_max_pixels):
+            scale=(native_max_pixels/(image.width*image.height))**0.5
+            target=(max(1,int(image.width*scale)),max(1,int(image.height*scale)))
+            try:
+                image.draft('RGB',target)
+                drafted=True
+            except (OSError,ValueError):
+                # The original remains valid and is protected by the same
+                # dynamic preflight below.  Do not silently discard it.
+                drafted=False
+        record['header_dimensions']=original_dimensions
+        record['effective_header_dimensions']=[int(image.width),int(image.height)]
+        record['native_jpeg_draft_applied']=drafted
+
+    # Each image can coexist as a decoded RGB frame, an EXIF-orientation copy,
+    # a processor float working array and an overlapping conversion buffer.
+    # This is an allocation estimate, not a static image limit; it scales with
+    # the exact inputs.
+    estimated_bytes=0
+    for image in images:
+        pixels=int(image.width)*int(image.height)
+        decoded_rgb=pixels*3
+        orientation_rgb=pixels*3
+        processor_float_rgb=pixels*3*4
+        estimated_bytes+=(header_decode_bytes(image)+decoded_rgb+orientation_rgb
+                          +processor_float_rgb+max(decoded_rgb,orientation_rgb,processor_float_rgb))
+    availability=available_host_memory()
+    receipt={'estimated_additional_decoder_processor_bytes':estimated_bytes,
+             'checkpoint_native_max_pixels':native_max_pixels,
+             **availability}
+    if estimated_bytes>availability['available_bytes']:
+        raise ValueError('Physical host memory preflight has insufficient memory for native image decoding: '
+                         f'estimated_additional_bytes={estimated_bytes}, actual_available_bytes={availability["available_bytes"]}')
+    return receipt
+
+
+def apply_exif_orientation(images,messages,image_records):
+    """Orient frames after RAM admission and keep message/image identities aligned."""
+    replacements={}
+    for index,image in enumerate(images):
+        try:orientation=image.getexif().get(0x0112)
+        except Exception:orientation=None
+        try:
+            # Modern Pillow can retain the same Image object, avoiding a stale
+            # reference in the chat message parts.
+            oriented=ImageOps.exif_transpose(image,in_place=True)
+            oriented=image if oriented is None else oriented
+        except TypeError:
+            # Older supported Pillow releases return a new object instead.
+            oriented=ImageOps.exif_transpose(image)
+        if oriented is not image:
+            images[index]=oriented
+            replacements[id(image)]=oriented
+            try:image.close()
+            except Exception:pass
+        image_records[index]['exif_orientation']=orientation
+        image_records[index]['exif_orientation_applied']=orientation in {2,3,4,5,6,7,8}
+    if replacements:
+        for message in messages:
+            content=message.get('content')
+            if not isinstance(content,list):continue
+            for part in content:
+                original=part.get('image') if isinstance(part,dict) and part.get('type')=='image' else None
+                if id(original) in replacements:part['image']=replacements[id(original)]
+
+
+def preflight_encoded_image_decode(encoded_characters):
+    """Reserve only the RAM implied by this actual inline Base64 payload.
+
+    The request body already owns the encoded string.  Decoding it can briefly
+    require a byte buffer plus the BytesIO backing store, so measure that
+    dynamic allocation against current host/cgroup headroom rather than using a
+    fixed file-size policy.  Strict payload validation remains with
+    ``b64decode(..., validate=True)`` below.
+    """
+    # A valid Base64 quartet yields at most three bytes.  Rounding up is a
+    # conservative allocation estimate for malformed input before the strict
+    # decoder supplies its normal format error.
+    decoded_upper_bound=((encoded_characters+3)//4)*3
+    # Slicing the request's URL creates one encoded-string copy and the strict
+    # decoder may make an ASCII byte copy before allocating the decoded bytes
+    # and BytesIO backing store.  Count those real transient allocations while
+    # keeping the admission decision entirely dynamic.
+    estimated_additional_bytes=encoded_characters*2+decoded_upper_bound*2
+    availability=available_host_memory()
+    receipt={'encoded_characters':encoded_characters,
+             'estimated_additional_decode_bytes':estimated_additional_bytes,
+             **availability}
+    if estimated_additional_bytes>availability['available_bytes']:
+        raise ValueError('Physical host memory preflight has insufficient memory for uploaded image decoding: '
+                         f'estimated_additional_bytes={estimated_additional_bytes}, actual_available_bytes={availability["available_bytes"]}')
+    return receipt
+
+
+def close_prepared_images(images=(),image_sources=()):
+    """Release lazy Pillow images and their backing buffers on every exit path."""
+    for image in images or ():
+        try:image.close()
+        except Exception:pass
+    for source in image_sources or ():
+        try:source.close()
+        except Exception:pass
+
+
 def prepare(messages):
-    converted=[];images=[];chars=0
-    for message in messages:
-        if set(message)-{'role','content'} or message.get('role') not in {'system','user','assistant'}:raise ValueError('Unsupported chat message fields')
-        content=message.get('content')
-        if isinstance(content,str):chars+=len(content);converted.append({'role':message['role'],'content':content});continue
-        if not isinstance(content,list):raise ValueError('Content must be text or typed text/image parts')
-        parts=[]
-        for part in content:
-            if part.get('type')=='text' and isinstance(part.get('text'),str):
-                chars+=len(part['text']);parts.append({'type':'text','text':part['text']})
-            elif part.get('type')=='image_url':
-                url=part.get('image_url',{}).get('url','')
-                if not isinstance(url,str) or not url.startswith(('data:image/png;base64,','data:image/jpeg;base64,','data:image/webp;base64,')):raise ValueError('Only uploaded inline image bytes are accepted; URLs and filesystem paths are forbidden')
-                raw=base64.b64decode(url.split(',',1)[1],validate=True)
-                if len(raw)>6*1024**2 or len(images)>=8:raise ValueError('At most eight images, each at most 6 MiB')
-                with Image.open(BytesIO(raw)) as original:
-                    if original.width*original.height>40_000_000:raise ValueError('Image dimensions are too large')
-                    original.load();image=original.convert('RGB');image.thumbnail((MAX_IMAGE_EDGE,MAX_IMAGE_EDGE))
-                images.append(image);parts.append({'type':'image','image':image})
-            else:raise ValueError('Unsupported multimodal content part')
-        converted.append({'role':message['role'],'content':parts})
-    if chars>MAX_INPUT_CHARACTERS:raise ValueError('Text exceeds local context limit')
-    return converted,images
+    converted=[];images=[];image_sources=[];image_records=[];chars=0
+    try:
+        # Do not decode two potentially large Base64 payload sets in parallel.
+        # This is admission serialization only; it introduces no size/count or
+        # wall-clock policy limit.
+        with input_decode_lock:
+            for message in messages:
+                if set(message)-{'role','content'} or message.get('role') not in {'system','user','assistant'}:raise ValueError('Unsupported chat message fields')
+                content=message.get('content')
+                if isinstance(content,str):chars+=len(content);converted.append({'role':message['role'],'content':content});continue
+                if not isinstance(content,list):raise ValueError('Content must be text or typed text/image parts')
+                parts=[]
+                for part in content:
+                    if part.get('type')=='text' and isinstance(part.get('text'),str):
+                        chars+=len(part['text']);parts.append({'type':'text','text':part['text']})
+                    elif part.get('type')=='image_url':
+                        url=part.get('image_url',{}).get('url','')
+                        if not isinstance(url,str) or not url.startswith(('data:image/png;base64,','data:image/jpeg;base64,','data:image/webp;base64,')):raise ValueError('Only uploaded inline image bytes are accepted; URLs and filesystem paths are forbidden')
+                        delimiter=url.find(',')
+                        decode_preflight=preflight_encoded_image_decode(len(url)-delimiter-1)
+                        payload=url[delimiter+1:]
+                        raw=base64.b64decode(payload,validate=True)
+                        raw_sha256=hashlib.sha256(raw).hexdigest()
+                        raw_bytes=len(raw)
+                        # Header parsing establishes that this is an image without
+                        # eagerly decompressing or converting a potentially huge
+                        # compressed source.  Keep the source buffer alive until the
+                        # Qwen processor performs its native, model-aligned resize and
+                        # token accounting below.
+                        source=BytesIO(raw)
+                        del raw
+                        try:image=Image.open(source)
+                        except BaseException:
+                            source.close()
+                            raise
+                        # Register each resource before any later metadata work can
+                        # fail, so the outer cleanup covers every partial image.
+                        image_sources.append(source);images.append(image)
+                        image_records.append({'image_ordinal':len(image_records)+1,
+                            'sha256':raw_sha256,'bytes':raw_bytes,
+                            'encoded_decode_memory_preflight':decode_preflight,
+                            'format':image.format,'mode':image.mode,
+                            'header_dimensions':[int(image.width),int(image.height)]})
+                        parts.append({'type':'image','image':image})
+                    else:raise ValueError('Unsupported multimodal content part')
+                converted.append({'role':message['role'],'content':parts})
+        return converted,images,image_sources,image_records
+    except BaseException:
+        close_prepared_images(images,image_sources)
+        raise
 
 def request_controls(body):
     # This fixed checkpoint is Instruct, not its Thinking sibling. A template
@@ -515,11 +757,20 @@ def generation_finish_reason(ended,matched_stop,generated_tokens,max_tokens,guar
 
 def trim_stop_output(result,raw_result,stops):
     matches=[(raw_result.find(stop),index,stop) for index,stop in enumerate(stops) if stop in raw_result]
-    if not matches:return result,None
-    _,_,matched=min(matches)
-    # Special stop tokens may already have been removed by skip_special_tokens.
-    visible=[result.find(stop) for stop in stops if stop in result]
-    return result[:min(visible)] if visible else result,matched
+    if matches:
+        _,_,matched=min(matches)
+        # Special stop tokens may already have been removed by skip_special_tokens.
+        visible=[result.find(stop) for stop in stops if stop in result]
+        return result[:min(visible)] if visible else result,matched
+    # Transformers can correctly stop a literal OCR response at a
+    # prompt/generation boundary (the prompt supplies the preceding newline),
+    # while the decoded generated suffix contains only ``[unclear]``. That is
+    # a complete, truthful OCR result, not a timeout. Preserve the literal
+    # value and record it as a semantic stop; no output-size fallback is used.
+    if (raw_result.strip()=='[unclear]'
+            and any(stop.strip()=='[unclear]' for stop in stops)):
+        return result,'[unclear]'
+    return result,None
 
 def _strict_json_loads(text):
     def unique_object(pairs):
@@ -592,28 +843,80 @@ def prepare_response_format(body):
             'schema_sha256':hashlib.sha256(encoded).hexdigest(),'backend':'lm-format-enforcer',
             'post_validation':False,'semantic_correctness_guaranteed':False}}
 
+def _install_json_literal_grammar():
+    """Encode fixed JSON strings as literals, including their escape sequences.
+
+    lm-format-enforcer 0.11.3's StringParsingState feeds raw const/enum values
+    to its character parser. A quote within a fixed dialogue then demands an
+    invalid unescaped quote, and rejects the valid JSON backslash. Use the
+    library's literal parser for only those fixed values. The schema and
+    decoded values stay unchanged; original strict post-validation still runs.
+    No vendor files, ordinary free strings or object keys are modified.
+    """
+    import lmformatenforcer.jsonschemaparser as module
+    from lmformatenforcer import StringParser,UnionParser,SequenceParser,RegexParser
+    original=module.get_parser
+    if getattr(original,'_factory_escaped_json_literals',False):return
+    @functools.wraps(original)
+    def fixed_literals(root,value_schema):
+        extras=value_schema.extras or {}
+        values=([extras['const']] if isinstance(extras.get('const'),str)
+                else value_schema.enum if value_schema.type=='string' else None)
+        if values and all(isinstance(value,str) for value in values):
+            # JSON permits whitespace before a value, but not within a fixed
+            # literal. Keep the two states separate, including leading spaces
+            # that are part of the caller's actual string value.
+            parsers=[SequenceParser([RegexParser('[ \\t\\r\\n]*',root.config),
+                        StringParser(json.dumps(value,ensure_ascii=False))]) for value in values]
+            return parsers[0] if len(parsers)==1 else UnionParser(parsers)
+        return original(root,value_schema)
+    fixed_literals._factory_escaped_json_literals=True
+    module.get_parser=fixed_literals
+
+
 def _build_grammar_prefix(tokenizer,schema):
-    global grammar_tokenizer_data
+    global grammar_tokenizer_data,grammar_control_fragments
     try:
-        from lmformatenforcer import JsonSchemaParser
+        from lmformatenforcer import CharacterLevelParserConfig, JsonSchemaParser
         from lmformatenforcer.integrations.transformers import (build_token_enforcer_tokenizer_data,
                                                                build_transformers_prefix_allowed_tokens_fn)
     except ImportError as error:
         raise HTTPException(503,'Guided JSON backend is unavailable; no unguarded fallback') from error
+    _install_json_literal_grammar()
     if grammar_tokenizer_data is None:
         grammar_tokenizer_data=build_token_enforcer_tokenizer_data(tokenizer)
-    return build_transformers_prefix_allowed_tokens_fn(grammar_tokenizer_data,JsonSchemaParser(schema))
+        grammar_control_fragments={token:fragment for token,fragment,_ in grammar_tokenizer_data.regular_tokens
+                                  if re.search(r'[\x00-\x1f]',fragment)}
+    # JsonSchemaParser captures the alphabet for required nonempty strings at
+    # construction. Setting it later leaves that branch restricted to ASCII.
+    parser_config=CharacterLevelParserConfig(alphabet=grammar_tokenizer_data.tokenizer_alphabet)
+    prefix=build_transformers_prefix_allowed_tokens_fn(grammar_tokenizer_data,JsonSchemaParser(schema,parser_config))
+    return prefix,grammar_control_fragments
+
+
+def _json_lexical_state(text,in_string=False,escaped=False):
+    for character in text:
+        if ord(character)<32 and (in_string or character not in '\t\n\r'):
+            return None
+        if escaped:
+            escaped=False
+        elif in_string and character=='\\':
+            escaped=True
+        elif character=='"':
+            in_string=not in_string
+    return in_string,escaped
 
 def guided_generation_controls(prepared,processor,model,prompt_tokens):
     if prepared is None:return {},None
     tokenizer=getattr(processor,'tokenizer',None)
     if tokenizer is None:raise ValueError('Guided JSON requires the actual model tokenizer')
-    grammar_prefix=_build_grammar_prefix(tokenizer,prepared['schema'])
+    grammar_prefix,control_fragments=_build_grammar_prefix(tokenizer,prepared['schema'])
     eos=model.generation_config.eos_token_id
     eos_ids=set(eos if isinstance(eos,list) else [eos])
     eos_ids={value for value in eos_ids if type(value) is int and value>=0}
     if not eos_ids:raise ValueError('Cannot verify real model EOS for guided JSON')
-    stats={'prefix_calls':0,'prompt_tokens_excluded':prompt_tokens}
+    stats={'prefix_calls':0,'prompt_tokens_excluded':prompt_tokens,'strict_json_control_character_filter':True,
+           'escaped_fixed_string_grammar':'json-literal-v1','original_schema_post_validation':True}
     def prefix(batch_id,sent):
         stats['prefix_calls']+=1
         generated=sent[prompt_tokens:]
@@ -625,7 +928,14 @@ def guided_generation_controls(prepared,processor,model,prompt_tokens):
                 complete=isinstance(instance,dict) and prepared['validator'].is_valid(instance)
             except (ValueError,TypeError):complete=False
             if complete:return sorted(eos_ids)
-        allowed=[token for token in grammar_prefix(batch_id,generated) if token not in eos_ids]
+        state=_json_lexical_state(text)
+        if state is None:
+            raise ValueError('Guided JSON prefix contains an invalid unescaped control character')
+        # The free-text fast path of lm-format-enforcer can admit a token
+        # containing a literal newline inside a string. Mask those tokens
+        # before sampling while retaining JSON whitespace outside strings.
+        allowed=[token for token in grammar_prefix(batch_id,generated) if token not in eos_ids
+                 and (token not in control_fragments or _json_lexical_state(control_fragments[token],*state) is not None)]
         if not allowed:raise ValueError('Guided JSON parser has no valid continuation before a complete instance; no EOS fallback')
         return allowed
     return {'prefix_allowed_tokens_fn':prefix},stats
@@ -641,18 +951,51 @@ def validate_guided_output(result,prepared,stats,ended,finish,completion_tokens)
     except Exception as error:raise ValueError('Guided JSON post-validation failed: '+str(error)[:500]) from error
     return {**prepared['receipt'],**stats,'post_validation':True,'completion_tokens':completion_tokens}
 
+def schema_conditioned_messages(messages, prepared):
+    """Make the API output contract visible to a plain Transformers model.
+
+    A token mask enforces JSON syntax, but does not teach the model what unseen
+    field names, enums or array lengths mean. Keep the schema in the prompt as
+    well as in the decoder. Preserve all caller text and actual image parts.
+    """
+    if prepared is None:
+        return messages
+    result = [dict(message) for message in messages]
+    instruction = ('\n\nReturn ONE JSON data object matching the following output contract. '
+                   'Return actual observed values, not the schema itself. Do not fill optional '
+                   'array capacity with repeated or guessed entries.\n'
+                   + json.dumps(prepared['schema'], ensure_ascii=False, separators=(',', ':')))
+    for message in reversed(result):
+        if message['role'] == 'user':
+            content = message['content']
+            message['content'] = (content + instruction if isinstance(content, str)
+                                  else [*content, {'type': 'text', 'text': instruction}])
+            prepared['receipt']['schema_visible_to_model'] = True
+            prepared['receipt']['schema_prompt_characters'] = len(instruction)
+            return result
+    raise ValueError('Structured output requires a user message for the visible output contract')
+
+
 def infer(body):
     global weight_verified,weights_receipt,loaded,inference_phase,gpu_release_status,retained_gpu_lease,last_gpu_cleanup
     if body.model!=MODEL_ID or body.stream:raise ValueError('Fixed local model and nonstreaming requests only')
     seed=request_controls(body)
     prepared_format=prepare_response_format(body)
-    messages,images=prepare(body.messages)
-    if retained_gpu_lease is not None or gpu_release_status=='unconfirmed':
-        raise HTTPException(503,'Previous GPU cleanup is unconfirmed; restart this local profile before another inference')
-    import torch
-    from transformers import Qwen3VLForConditionalGeneration,AutoProcessor
-    if not torch.cuda.is_available():raise RuntimeError('CUDA unavailable; no silent CPU or cloud fallback')
-    if not lock.acquire(blocking=False):raise HTTPException(409,'Local model is busy; no duplicate inference started')
+    messages=None;images=[];image_sources=[];image_records=[]
+    try:
+        messages,images,image_sources,image_records=prepare(body.messages)
+        messages=schema_conditioned_messages(messages,prepared_format)
+        if retained_gpu_lease is not None or gpu_release_status=='unconfirmed':
+            raise HTTPException(503,'Previous GPU cleanup is unconfirmed; restart this local profile before another inference')
+        import torch
+        from transformers import Qwen3VLForConditionalGeneration,AutoProcessor
+        if not torch.cuda.is_available():raise RuntimeError('CUDA unavailable; no silent CPU or cloud fallback')
+        if not lock.acquire(blocking=False):raise HTTPException(409,'Local model is busy; no duplicate inference started')
+    except BaseException:
+        # ``prepare`` already cleans a partial result.  This also covers every
+        # post-prepare rejection before the GPU-owned try/finally below.
+        close_prepared_images(images,image_sources)
+        raise
     model=processor=inputs=outputs=generated=None;lease=None;started=time.monotonic()
     generation_kwargs=prose_kwargs=repeat_guard=None
     failure=None;response=None;baseline={'state':'not_initialized','allocated_bytes':0,'reserved_bytes':0}
@@ -665,15 +1008,26 @@ def infer(body):
         torch.set_num_threads(4);torch.manual_seed(seed);torch.cuda.manual_seed_all(seed)
         torch.cuda.reset_peak_memory_stats()
         baseline=cuda_memory_snapshot()
-        processor=AutoProcessor.from_pretrained(str(MODEL),local_files_only=True,min_pixels=MIN_VISION_PIXELS,max_pixels=MAX_VISION_PIXELS)
+        # Do not override the checkpoint's saved image processor with fixed
+        # service values.  It controls native visual resizing/tokenization;
+        # the resulting *combined* prompt is then checked against actual
+        # model context and VRAM below without dropping any image.
+        processor=AutoProcessor.from_pretrained(str(MODEL),local_files_only=True)
+        image_processor=getattr(processor,'image_processor',None)
+        if image_processor is None:
+            raise ValueError('Fixed local checkpoint has no image processor for native image budgeting')
+        image_memory_receipt=preflight_images_for_processor(images,image_records,image_processor)
+        # Orientation is a real decode/transform allocation, so it follows the
+        # dynamic RAM admission above and precedes Qwen's native processor.
+        apply_exif_orientation(images,messages,image_records)
         template_kwargs,thinking_receipt=template_controls(body,processor)
         prompt=processor.apply_chat_template(messages,tokenize=False,add_generation_prompt=True,**template_kwargs)
-        inputs=processor(text=[prompt],images=images or None,padding=True,return_tensors='pt',
-            images_kwargs={'min_pixels':MIN_VISION_PIXELS,'max_pixels':MAX_VISION_PIXELS})
+        inputs=processor(text=[prompt],images=images or None,padding=True,return_tensors='pt')
         prompt_tokens=int(inputs['input_ids'].shape[-1])
         output_tokens,memory_receipt=output_token_budget(torch,prompt_tokens,body.max_tokens)
         grids=inputs.get('image_grid_thw')
         image_grids=grids.tolist() if grids is not None else []
+        native_image_budget={key:getattr(image_processor,key,None) for key in ('min_pixels','max_pixels')}
         inference_phase='loading_model'
         model=Qwen3VLForConditionalGeneration.from_pretrained(str(MODEL),local_files_only=True,
               dtype=torch.bfloat16,device_map={'':'cuda:0'},attn_implementation='sdpa')
@@ -689,7 +1043,10 @@ def infer(body):
         generation_kwargs.update(prose_kwargs)
         inference_phase='generating'
         with torch.inference_mode():
-            outputs=model.generate(**inputs,max_new_tokens=output_tokens,max_time=480,**generation_kwargs)
+            # Do not impose a service wall-clock cutoff. EOS, explicit
+            # semantic stops, repetition protection, and the model's actual
+            # context/VRAM capacity are the only generation boundaries.
+            outputs=model.generate(**inputs,max_new_tokens=output_tokens,**generation_kwargs)
         generated=outputs[:,prompt_tokens:]
         result=processor.batch_decode(generated,skip_special_tokens=True,clean_up_tokenization_spaces=False)[0]
         raw_result=processor.batch_decode(generated,skip_special_tokens=False,clean_up_tokenization_spaces=False)[0] if stops else result
@@ -705,16 +1062,19 @@ def infer(body):
           'usage':{'prompt_tokens':prompt_tokens,'completion_tokens':int(generated.shape[-1]),'total_tokens':int(outputs.shape[-1])},
           'factory_receipt':{'model_id':MODEL_ID,'model_directory':str(MODEL),'input_image_count':len(images),
             'profile':PROFILE,'weights_verification':weights_receipt,'source_components':SOURCE_COMPONENTS,
-            'image_sha256':[hashlib.sha256(image.tobytes()).hexdigest() for image in images],
-            'image_grid_thw':image_grids,'min_pixels':MIN_VISION_PIXELS,'max_pixels':MAX_VISION_PIXELS,
-            'max_image_edge':MAX_IMAGE_EDGE,'prepared_image_dimensions':[[image.width,image.height] for image in images],
-            'max_output_tokens':output_tokens,'generation_time_limit_seconds':480,'finish_reason':finish,
+             'image_sha256':[record['sha256'] for record in image_records],
+             'source_images':image_records,
+            'image_grid_thw':image_grids,'native_image_processor_budget':native_image_budget,
+             'image_memory_preflight':image_memory_receipt,
+            'manual_image_edge_cap':None,'prepared_image_dimensions':[[image.width,image.height] for image in images],
+            'max_output_tokens':output_tokens,'generation_time_limit_seconds':None,
+            'generation_stop_policy':'model_eos_semantic_stop_or_physical_context_vram','finish_reason':finish,
             'seed':seed,'seed_source':'request' if body.seed is not None else 'fixed_default',
             'chat_template_control':thinking_receipt,'stop_sequences':stops,'matched_stop':matched_stop,
             'decoding':'sampling' if sampling_kwargs['do_sample'] else 'greedy',
             'sampling_parameters':sampling_kwargs,'requested_temperature':body.temperature,
             'prose_repetition_control':prose_receipt,
-            'context_budget':{'max_model_len':MAX_CONTEXT_TOKENS,'max_prompt_tokens':MAX_PROMPT_TOKENS,
+            'context_budget':{'max_model_len':model_context_limit(),'max_prompt_tokens':None,
                               'actual_prompt_tokens':prompt_tokens,'requested_output_tokens':body.max_tokens,
                               'effective_output_tokens':output_tokens},
             'vram_preflight':memory_receipt,'gpu_slot':'exclusive_local_qwen','attention_control':attention_receipt,
@@ -729,7 +1089,13 @@ def infer(body):
         # Leave the original except block first: suppress_context alone would
         # still retain error.__context__ and its model.generate frame/weights.
         inference_phase='cleaning_gpu'
-        model=processor=inputs=outputs=generated=None
+        for image in images or ():
+            try:image.close()
+            except Exception:pass
+        for source in image_sources or ():
+            try:source.close()
+            except Exception:pass
+        model=processor=inputs=outputs=generated=messages=images=image_sources=None
         generation_kwargs=prose_kwargs=repeat_guard=None
         last_gpu_cleanup=cleanup_gpu(torch,baseline)
         loaded=not last_gpu_cleanup['released']
@@ -743,7 +1109,8 @@ def infer(body):
         finally:lock.release()
     if failure is not None:
         status,detail,headers=failure
-        if isinstance(detail,dict):detail={**detail,'gpu_cleanup':last_gpu_cleanup}
+        if isinstance(detail,dict):detail={**detail,'gpu_cleanup':last_gpu_cleanup,
+                                           'source_images':image_records,'image_count':len(image_records)}
         elif not last_gpu_cleanup['released']:detail=str(detail)+'; GPU release unconfirmed, local profile restart required'
         raise HTTPException(status,detail,headers=headers) from None
     if not last_gpu_cleanup['released']:
@@ -753,12 +1120,43 @@ def infer(body):
 
 @app.post('/v1/chat/completions')
 def chat(body:ChatRequest):
-    try:return infer(body)
+    import psutil
+    trace_id = body.trace_id or uuid.uuid4().hex
+    sources = []
+    process = psutil.Process()
+    stop = threading.Event()
+    cpu_start = process.cpu_times()
+    resources = {'peak_rss_bytes': process.memory_info().rss, 'sampling_interval_seconds': 0.1}
+
+    def observe():
+        while not stop.wait(0.1):
+            resources['peak_rss_bytes'] = max(resources['peak_rss_bytes'], process.memory_info().rss)
+
+    monitor = threading.Thread(target=observe, daemon=True)
+    monitor.start()
+    try:
+        response = infer(body)
+        sources = response['factory_receipt'].get('source_images', [])
+        response['factory_receipt'].update(trace_id=trace_id, source_images=sources,
+            image_count=len(sources), resource_usage=resources,
+            preprocessing=('header-only inspection, dynamic host/cgroup RAM preflight, '
+                           'checkpoint-native JPEG draft when saved processor metadata permits, '
+                           'native Qwen processor resize/token budgeting'))
+        return response
     except Exception as error:
         failure=exception_http_details(error)
         discard_exception_frames(error)
+    finally:
+        stop.set()
+        monitor.join(timeout=1)
+        cpu_end = process.cpu_times()
+        resources['cpu_seconds'] = cpu_end.user + cpu_end.system - cpu_start.user - cpu_start.system
     # Raise outside except so the HTTP error cannot retain the original model.
     status,detail,headers=failure
+    if isinstance(detail, dict):
+        sources=detail.get('source_images',sources)
+        detail = {**detail, 'trace_id': trace_id, 'stage': 'local_qwen_chat', 'image_count': len(sources),
+                  'source_images': sources, 'resource_usage': resources}
     raise HTTPException(status,detail,headers=headers) from None
 
 if __name__=='__main__':

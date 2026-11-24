@@ -52,6 +52,10 @@ RUNTIME_PINS={
  'Lib/site-packages/torch/utils/_contextlib.py':'c4b52075af6b23784336b88d1c608c1ba22bcece245f03d20e8ff12b8bb774c9',
  'Lib/site-packages/torch/autograd/grad_mode.py':'35f0a6be03336e2e78db5fcbaf574b2122ba2f4496c83036c29203ccc0687416',
 }
+LINUX_RUNTIME_PINS={
+ 'torch/utils/_contextlib.py':'f22c21a037c4b26a431112138fa66a5108c5e9cfe4c9169e732c1d15ea7a8406',
+ 'torch/autograd/grad_mode.py':'ac56e9849d2e8b996e9e8fb923e28d35f564b44063eaa5e88c46d47555209804',
+}
 
 
 class SamplingAuditFailure(RuntimeError):pass
@@ -85,11 +89,18 @@ def verify_core(root):
 
 
 def verify_runtime(root):
-    for relative,expected in RUNTIME_PINS.items():
+    pins=runtime_pins()
+    for relative,expected in pins.items():
         path=Path(root)/relative
         if not path.is_file() or file_hash(path)!=expected:
             raise SamplingAuditFailure('Pinned native sampler decorator source changed: '+relative)
-    return dict(RUNTIME_PINS)
+    return dict(pins)
+
+
+def runtime_pins():
+    if sys.platform=='win32':return RUNTIME_PINS
+    if sys.platform=='linux':return LINUX_RUNTIME_PINS
+    raise SamplingAuditFailure('No pinned native sampler decorator sources for this platform')
 
 
 def code_payload(code):
@@ -158,8 +169,9 @@ def _verified_no_grad_sampler(function,module,name,defaults):
     import torch
     import torch.utils._contextlib as contexts
     import torch.autograd.grad_mode as grad_mode
-    context_pin=RUNTIME_PINS['Lib/site-packages/torch/utils/_contextlib.py']
-    grad_pin=RUNTIME_PINS['Lib/site-packages/torch/autograd/grad_mode.py']
+    pins={key.split('torch/',1)[1]:digest for key,digest in runtime_pins().items()}
+    context_pin=pins['utils/_contextlib.py']
+    grad_pin=pins['autograd/grad_mode.py']
     _verified_source_function(function,contexts,'context_decorator.<locals>.decorate_context',context_pin)
     if (function.__defaults__ is not None or function.__kwdefaults__ is not None
             or function.__code__.co_freevars!=('ctx_factory','func') or len(function.__closure__ or ())!=2):
@@ -200,7 +212,7 @@ def verified_sampler(sampler,name):
     return {'sampler_name':name,'callable':'comfy.k_diffusion.sampling.sample_'+name,
         'native_callable_identity_verified':True,'native_callable_globals_verified':True,
         'raw_callable_code_sha256':digest,'implementation_source_sha256':CORE_PINS['comfy/k_diffusion/sampling.py'],
-        'decorator_source_sha256':dict(RUNTIME_PINS),'extra_options':{},'inpaint_options':{}}
+        'decorator_source_sha256':dict(runtime_pins()),'extra_options':{},'inpaint_options':{}}
 
 
 def smd_sigmas_valid(values):

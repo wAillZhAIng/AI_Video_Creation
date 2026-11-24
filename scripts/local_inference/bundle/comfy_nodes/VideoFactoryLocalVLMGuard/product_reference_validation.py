@@ -15,12 +15,8 @@ from urllib.parse import urlsplit
 import uuid
 
 
-PROTOCOL = 'product-reference-identity-4'
+PROTOCOL = 'product-reference-identity-6'
 MODEL = 'Qwen/Qwen3-VL-4B-Instruct'
-MAX_FILE_BYTES = 64 * 1024 * 1024
-MAX_OUTPUT = 4096
-MAX_IMAGES_PER_CALL = 8
-MAX_CALLS = 2
 
 
 class ProductReferenceConflict(RuntimeError):
@@ -60,13 +56,10 @@ def _schema(groups):
              'required': ['reason', 'target_subject_indices', 'independent_person_indices',
                           'conflicting_variant_indices', 'target_visible', 'same_sku_as_anchor'],
              'properties': {
-                 'reason': {'type': 'string', 'minLength': 1, 'maxLength': 160},
-                 'target_subject_indices': {'type': 'array', 'maxItems': 1,
-                                            'items': {'type': 'integer'}},
-                 'independent_person_indices': {'type': 'array', 'maxItems': 8,
-                                               'items': {'type': 'integer'}},
-                 'conflicting_variant_indices': {'type': 'array', 'maxItems': 8,
-                                                'items': {'type': 'integer'}},
+                 'reason': {'type': 'string', 'minLength': 1},
+                 'target_subject_indices': {'type': 'array', 'items': {'type': 'integer'}},
+                 'independent_person_indices': {'type': 'array', 'items': {'type': 'integer'}},
+                 'conflicting_variant_indices': {'type': 'array', 'items': {'type': 'integer'}},
                  'target_visible': {'type': 'boolean'},
                  'same_sku_as_anchor': {'type': 'string', 'enum': ['same', 'different', 'uncertain']}}}
     named_groups = {}
@@ -155,15 +148,15 @@ def _validate_reply(reply, groups, observations):
             if row['same_sku_as_anchor'] != 'same' or row['target_visible'] is not True:
                 _blocked(label + ' ' + str(row.get('reason') or '不是唯一、清楚的同款商品'))
             reason = row['reason']
-            if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 160:
+            if not isinstance(reason, str) or not reason.strip():
                 _blocked(label + ' 未提供有效的视觉依据')
             target = row['target_subject_indices']
             persons = row['independent_person_indices']
             variants = row['conflicting_variant_indices']
             subjects = observations[label]['card']['subjects']
             if (not isinstance(target, list) or len(target) != 1
-                    or not isinstance(persons, list) or len(persons) > 8
-                    or not isinstance(variants, list) or len(variants) > 8
+                    or not isinstance(persons, list)
+                    or not isinstance(variants, list)
                     or any(type(x) is not int or not 0 <= x < len(subjects) for x in target + persons + variants)
                     or len(set(persons)) != len(persons) or len(set(variants)) != len(variants)
                     or set(target).intersection(persons) or set(variants).intersection(target + persons)):
@@ -192,33 +185,64 @@ def _validate_reply(reply, groups, observations):
             'independent_person_indices_by_native': people, 'group_results': results}
 
 
-def _request_batches(groups):
-    """Keep complete groups together, except a nine-view group repeats its anchor.
+def _initial_batches(groups):
+    """Start with every product picture and let the real model budget decide.
 
-    The workflow permits nine pictures while the verified local service permits
-    eight per request. With at most nine distinct product pictures, this packing
-    needs at most two bounded calls and never drops a picture or changes an anchor.
+    There is intentionally no image-count or call-count policy here.  If the
+    local Qwen service reports an actual context/VRAM capacity failure, callers
+    split this request deterministically without omitting a picture or changing
+    a product group's anchor.
     """
-    batches, current, count = [], [], 0
-    for group in groups:
-        members = group['appearance_native']
-        if len(members) > MAX_IMAGES_PER_CALL:
-            if current:
-                batches.append(current)
-                current, count = [], 0
-            batches.append([{**group, 'appearance_native': list(members[:MAX_IMAGES_PER_CALL])}])
-            batches.append([{**group, 'appearance_native': [members[0], *members[MAX_IMAGES_PER_CALL:]]}])
-        elif count + len(members) > MAX_IMAGES_PER_CALL:
-            batches.append(current)
-            current, count = [group], len(members)
-        else:
-            current.append(group)
-            count += len(members)
-    if current:
-        batches.append(current)
-    if not 1 <= len(batches) <= MAX_CALLS:
-        _blocked('商品参考图无法在两次有界本地检查内完整比较')
-    return batches
+    return [list(groups)]
+
+
+def _split_for_physical_capacity(batch):
+    """Return smaller evidence-preserving batches, or ``[]`` if indivisible.
+
+    A group with several views keeps its declared first image as the anchor in
+    every descendant batch.  Two-view comparisons are the minimum evidence for
+    an identity decision and therefore cannot be split into unrelated calls.
+    """
+    if not isinstance(batch, list) or not batch:
+        return []
+    if len(batch) > 1:
+        total = sum(len(group['appearance_native']) for group in batch)
+        target = max(1, total // 2)
+        left, right, used = [], [], 0
+        for group in batch:
+            members = group['appearance_native']
+            if not left or used + len(members) <= target:
+                left.append(group)
+                used += len(members)
+            else:
+                right.append(group)
+        return [part for part in (left, right) if part]
+    group = batch[0]
+    members = list(group['appearance_native'])
+    if len(members) <= 2:
+        return []
+    anchor, rest = members[0], members[1:]
+    midpoint = max(1, len(rest) // 2)
+    first = [anchor, *rest[:midpoint]]
+    second = [anchor, *rest[midpoint:]]
+    return [[{**group, 'appearance_native': first}],
+            [{**group, 'appearance_native': second}]]
+
+
+def _is_physical_capacity_error(error):
+    """Only retry with smaller batches after an explicit model-resource error."""
+    detail = (type(error).__name__ + ': ' + str(error)).casefold()
+    markers = ('context window', 'context budget', 'max position', 'token budget',
+               'prompt token', 'too many image', 'image token', 'vram',
+               'cuda out of memory', 'out of memory', 'insufficient memory')
+    # This validator always requests ``max_tokens=None``.  Consequently a
+    # LocalProfile ``TruncatedResponse: response hit max_tokens (...)`` is not
+    # a caller-selected output cap: it means the current multi-image request
+    # consumed the remaining physical context budget.  Split only that exact
+    # signal, never unrelated model-format or validation failures.
+    dynamic_output_boundary = ('truncatedresponse' in detail
+                               and 'response hit max_tokens' in detail)
+    return dynamic_output_boundary or any(marker in detail for marker in markers)
 
 
 def _merge_batch_replies(batch_records, batches, groups, observations):
@@ -262,7 +286,7 @@ def _merge_batch_replies(batch_records, batches, groups, observations):
 
 
 def verify_product_references(backend, refs, cards, contract, cache_root, seed=None, *, receipt_root=None):
-    """Verify product groups in at most two actual-image calls before H3 loading.
+    """Verify every product picture before H3 loading.
 
     ``refs`` are the actual upstream Brief AssetRefs in their native order;
     ``cards`` are indexed by their exact file SHA256. ``target_description`` on
@@ -290,14 +314,14 @@ def verify_product_references(backend, refs, cards, contract, cache_root, seed=N
             _blocked('声明的商品组或图片编号无效')
         names.add(name)
         labels += members
-    if len(labels) > 9 or len(set(labels)) != len(labels):
-        _blocked('商品图超过9张或同一图片跨商品身份绑定')
+    if len(set(labels)) != len(labels):
+        _blocked('同一图片不能跨商品身份绑定')
     observations, paths = {}, {}
     for label in labels:
         ref = native[label]
         path = Path(ref.path) if getattr(ref, 'path', None) else None
-        if path is None or not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
-            _blocked(label + ' 的真实图片文件不可用或过大')
+        if path is None or not path.is_file():
+            _blocked(label + ' 的真实图片文件不可用')
         sha = hashlib.sha256()
         with path.open('rb') as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b''):
@@ -307,14 +331,14 @@ def verify_product_references(backend, refs, cards, contract, cache_root, seed=N
         card = cards.get(ref.sha256)
         card = asdict(card) if is_dataclass(card) else card
         if (not isinstance(card, dict) or not isinstance(card.get('subjects'), list)
-                or not 1 <= len(card['subjects']) <= 8):
+                or not card['subjects']):
             _blocked(label + ' 没有可明确对应的真实图像分析主体')
         observations[label] = {'sha256': ref.sha256, 'note': getattr(ref, 'note', None), 'card': card}
         paths[label] = path
     group_inputs = [{'group': g['group'], 'appearance_native': g['appearance_native'],
                      'target_description': g.get('target_description') or g.get('product_name') or g['group']}
                     for g in groups]
-    batches = _request_batches(group_inputs)
+    batches = _initial_batches(group_inputs)
     key_data = {'protocol': PROTOCOL, 'model': MODEL, 'groups': group_inputs, 'observations': observations}
     key = _digest(key_data)
     cache_path = Path(cache_root)/f'{key}.json'
@@ -328,7 +352,9 @@ def verify_product_references(backend, refs, cards, contract, cache_root, seed=N
             if (cached.get('protocol') == PROTOCOL and cached.get('cache_key') == key
                     and cached.get('status') == 'PASS' and cached.get('input_sha256') == _digest(key_data)
                     and cached.get('reply_sha256') == _digest(cached.get('reply'))):
-                combined = _merge_batch_replies(cached.get('batches'), batches, group_inputs, observations)
+                cached_batches = [item.get('groups') for item in cached.get('batches', [])
+                                  if isinstance(item, dict) and isinstance(item.get('groups'), list)]
+                combined = _merge_batch_replies(cached.get('batches'), cached_batches, group_inputs, observations)
                 if combined != cached.get('reply'):
                     _blocked('缓存的合并回复与原始批次回复不一致')
                 _validate_reply(cached.get('reply'), groups, observations)
@@ -340,15 +366,17 @@ def verify_product_references(backend, refs, cards, contract, cache_root, seed=N
     record = {'protocol': PROTOCOL, 'status': 'BLOCKED', 'model': MODEL, 'cache_key': key,
               'input_sha256': _digest(key_data), 'cache_hit': cache_hit,
               'evidence_source': 'local_vlm_cross_image', 'human_approved': False,
-              'input_labels': labels, 'groups': group_inputs, 'batch_count': len(batches),
-              'max_images_per_call': MAX_IMAGES_PER_CALL, 'max_calls': MAX_CALLS,
-              'actual_call_count': 0, 'batches': batch_records,
+               'input_labels': labels, 'groups': group_inputs, 'batch_count': len(batch_records),
+               'batching_policy': 'adaptive_actual_context_vram', 'adaptive_splits': [],
+               'actual_call_count': 0, 'batches': batch_records,
               'target_match_source': 'derived_from_per_picture_checks',
               'original_observations': observations}
     try:
         if reply is None:
             from h3ir.backend import user_message
-            for batch_index, batch in enumerate(batches, 1):
+            pending_batches = list(batches)
+            while pending_batches:
+                batch = pending_batches.pop(0)
                 batch_labels = [label for group in batch for label in group['appearance_native']]
                 batch_observations = {label: {'candidate_subjects': [
                     {'index': index, 'descriptor': subject.get('descriptor'),
@@ -361,7 +389,7 @@ def verify_product_references(backend, refs, cards, contract, cache_root, seed=N
                     'Existing image observations, indexed subjects are ZERO-based:\n' +
                     json.dumps(batch_observations, ensure_ascii=False) + '\n'
                     'Return the exact required named group and picture objects; every picture key must have its own answer. '
-                    'Within each picture object first write reason as 8-16 words about ONLY that image\'s visible product, '
+                    'Within each picture object first write a factual reason about ONLY that image\'s visible product, '
                     'then its subject indices and target visibility, and finally same_sku_as_anchor. '
                     'Do not discuss several images in one reason or write a long narrative. '
                     'Do not add a global group verdict. The first picture is that group\'s anchor; '
@@ -387,26 +415,50 @@ def verify_product_references(backend, refs, cards, contract, cache_root, seed=N
                     'Distinct designs and color variants '
                     'must not be merged merely because they share a brand or product family. Caller scale overrides '
                     'are handled separately: printed dimensions alone do not reject an otherwise matching identity. '
+                    'Earlier card captions are fallible observations, not identity facts. Compare the actual attached pixels. '
+                    'Never reject matching visible geometry, material and pattern because a caption guessed a brand. '
+                    'Use a printed brand as a difference only when its differing literal characters are clearly legible '
+                    'in both actual photographs. Missing, cropped or unreadable lettering alone is not a different design. '
                     'Give short factual visual reasons. Do not guess missing detail.')
-                batch_record = {'index': batch_index, 'input_labels': batch_labels, 'groups': batch,
+                attempt = record['actual_call_count'] + 1
+                batch_record = {'index': attempt, 'input_labels': batch_labels, 'groups': batch,
                                 'status': 'BLOCKED'}
-                batch_records.append(batch_record)
                 record['actual_call_count'] += 1
-                raw_reply = backend.json_call([
-                    {'role': 'system', 'content': 'You verify visual product reference identity. Observe images; return only the required JSON.'},
-                    user_message(text, [paths[label] for label in batch_labels])],
-                    _schema(batch), required=('groups',),
-                    max_tokens=MAX_OUTPUT, temperature=0.2, thinking=False, seed=seed, retries=0)
+                try:
+                    raw_reply = backend.json_call([
+                        {'role': 'system', 'content': 'You verify visual product reference identity. Observe images; return only the required JSON.'},
+                        user_message(text, [paths[label] for label in batch_labels])],
+                        _schema(batch), required=('groups',),
+                        # Let the local profile use the remaining physical
+                        # context/VRAM; this validator has no independent output
+                        # ceiling.
+                        max_tokens=None, temperature=0.2, thinking=False, seed=seed, retries=0)
+                except Exception as error:
+                    replacements = _split_for_physical_capacity(batch) if _is_physical_capacity_error(error) else []
+                    if not replacements:
+                        raise
+                    record['adaptive_splits'].append({
+                        'attempt': attempt, 'input_labels': batch_labels,
+                        'reason': 'local_qwen_reported_actual_context_or_vram_capacity',
+                        'error_type': type(error).__name__, 'error': str(error),
+                        'replacement_batches': [[label for group in item for label in group['appearance_native']]
+                                                for item in replacements],
+                    })
+                    pending_batches = replacements + pending_batches
+                    continue
                 batch_record.update(raw_reply=raw_reply, raw_reply_sha256=_digest(raw_reply))
                 if receipt_root:
-                    _write(Path(receipt_root)/f'product-reference-identity.batch-{batch_index:03}.json', batch_record)
+                    _write(Path(receipt_root)/f'product-reference-identity.batch-{attempt:03}.json', batch_record)
                 batch_reply = _normalise_reply(raw_reply, batch)
                 batch_record.update(reply=batch_reply, reply_sha256=_digest(batch_reply))
                 _validate_reply(batch_reply, batch, observations)
                 batch_record['status'] = 'PASS'
+                batch_records.append(batch_record)
                 if receipt_root:
-                    _write(Path(receipt_root)/f'product-reference-identity.batch-{batch_index:03}.json', batch_record)
-            reply = _merge_batch_replies(batch_records, batches, group_inputs, observations)
+                    _write(Path(receipt_root)/f'product-reference-identity.batch-{attempt:03}.json', batch_record)
+            completed_batches = [item['groups'] for item in batch_records]
+            reply = _merge_batch_replies(batch_records, completed_batches, group_inputs, observations)
+        record['batch_count'] = len(batch_records)
         record.update(reply=reply, reply_sha256=_digest(reply))
         approved = _validate_reply(reply, groups, observations)
         record.update(status='PASS', **approved)

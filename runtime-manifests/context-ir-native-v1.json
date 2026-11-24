@@ -3,7 +3,7 @@
   "profile_id": "local-h3ir-qwen4b-v3",
   "platform_status": {
     "windows_nvidia": "source-pinned production workflow previously exercised; portable supervisor requires independent acceptance",
-    "linux_nvidia": "BLOCKED_UNVERIFIED_RUNTIME",
+    "linux_nvidia": "Pinned Linux x86-64 CUDA cgroup v2 runtime; verify actual generation on the deployment",
     "mac_metal": "UNSUPPORTED"
   },
   "comfy_repository": "https://github.com/Comfy-Org/ComfyUI",
@@ -83,14 +83,16 @@
     {
       "name": "VideoFactoryLocalVLMGuard",
       "files": {
-        "compile_node.py": "a89f2a3102cfba420c65e95a5c3da3022f0c16ad31a8f73fbb32c14aa4217ebe",
+        "compile_node.py": "ff216217ea6eb40742a3dd508960e7c7f615c94f382e620fa0b47ca4f4b717ec",
         "guard.py": "e3a31b15b9dd518d5935515a7859133f602cbcb76b6e7cab74fb08b49240546c",
-        "local_h3ir_backend_profile.py": "26c18441693dc47fa30c0cf593b659d1945c60fc621ba1842f52d677c770ea3e",
+        "local_h3ir_backend_profile.py": "777fb919365cac944830e425d97bf7e8f51bfbaa7f8a548a40405feabb3f2c32",
         "media_bindings.py": "b5745146bee423787863511effd563a212409d25ec69277022cd9720d324b85c",
         "__init__.py": "c370a05a4818652bb47e77563953fafac0253cb32c0a96e6760349045f9ac24c",
         "revision_constraints.py": "eee6fa10dc17279f398c135184b913a23e8f31a8db946b27dd9ab73c0f550b92",
-        "product_reference_validation.py": "443b70743c276caa012a22fdec4de85acee457b53cb4cbd3b55cb5f39c9f7179",
-        "revision_semantics.py": "297ae1ac885927a5a605b0175cb6a5cfe4b9ef15eeafdfc00aece322439e11a0"
+        "product_reference_validation.py": "41931aa95aa44c7786617fa4305ea440a6180bbaae44fa4f23552435b8f5ae3c",
+        "revision_semantics.py": "297ae1ac885927a5a605b0175cb6a5cfe4b9ef15eeafdfc00aece322439e11a0",
+        "reference_analysis.py": "2129c673f80ca28a4aa5c2ecd6d88873e437f1d5ef9bb045c8c208899c4070e3",
+        "reference_fusion.py": "fa1bfc5d807470ec8d5db70a4893323fcacfad5c33e99843a18cc1c78dcbfa37"
       }
     },
     {
@@ -105,14 +107,14 @@
     {
       "name": "VideoFactorySamplingAudit",
       "files": {
-        "smd_audit.py": "77ddc2854bcb7e0625843722911f1d930588ed5e605b669097f3305253329c85",
+        "smd_audit.py": "204abc102d381753bf51a01a72058bd6bce8e1953e36897fb919e2fdc23de097",
         "__init__.py": "230031baf9f4fa255ff2e7a839188a51b20325ff03fe77f5cf79dfd5d3101946"
       }
     },
     {
       "name": "VideoFactoryWriterEnvelopeFormat",
       "files": {
-        "writer_format.py": "583f45c0f3773f454bc0e49393d1b93ef00066fe9f50ce5dd69ed659402ae146",
+        "writer_format.py": "17a23ffd642eb7255649eaa42263205cc3d78c845dfd4df7f4d1157956235869",
         "__init__.py": "2457c40ecde2c9130e778e56c69061d1c52fd2909311a0513442b14e98a96fd9"
       }
     }
@@ -426,5 +428,50 @@
       3,
       10
     ]
+  },
+  "linux_nvidia": {
+    "cuda_build": "13.0",
+    "compute_capability_major": 12,
+    "python_versions": {
+      "comfy_python": [
+        3,
+        12
+      ],
+      "qwen_python": [
+        3,
+        12
+      ]
+    },
+    "comfy_packages": {
+      "torch": "2.10.0+cu130",
+      "torchvision": "0.25.0+cu130",
+      "torchaudio": "2.10.0+cu130",
+      "open-h3-ir": "0.4.1",
+      "transformers": "5.19.0",
+      "safetensors": "0.8.0",
+      "av": "19.0.1",
+      "psutil": "7.2.2"
+    },
+    "qwen_packages": {
+      "torch": "2.10.0+cu130",
+      "torchvision": "0.25.0+cu130",
+      "transformers": "4.57.6",
+      "accelerate": "1.12.0",
+      "safetensors": "0.6.2",
+      "fastapi": "0.116.2",
+      "uvicorn": "0.35.0",
+      "psutil": "7.2.2",
+      "numpy": "2.2.6",
+      "pillow": "11.3.0",
+      "jsonschema": "4.26.0",
+      "lm-format-enforcer": "0.11.3",
+      "pydantic": "2.14.1",
+      "tokenizers": "0.22.2",
+      "huggingface-hub": "0.36.2"
+    },
+    "torch_source_pins": {
+      "torch/utils/_contextlib.py": "f22c21a037c4b26a431112138fa66a5108c5e9cfe4c9169e732c1d15ea7a8406",
+      "torch/autograd/grad_mode.py": "ac56e9849d2e8b996e9e8fb923e28d35f564b44063eaa5e88c46d47555209804"
+    }
   }
 }

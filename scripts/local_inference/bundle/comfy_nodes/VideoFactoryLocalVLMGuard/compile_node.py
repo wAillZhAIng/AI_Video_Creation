@@ -86,6 +86,38 @@ def reference_contract(upstream,media,groups='',required='',motion='',production
                   revision_constraints=policy.get('revision_constraints') or {},
                   constraint_target_groups=targets,
                   scene_requirements=policy.get('scene_requirements') or [])
+    references = policy.get('references')
+    if references is not None:
+        if (policy.get('reference_schema_version') != 'context-references-v1'
+                or not isinstance(references, list)
+                or len(references) != counts['Picture']):
+            raise ValueError('Reference provenance list does not match the actual image attachments')
+        ids = set()
+        for entry in references:
+            if (not isinstance(entry, dict) or not isinstance(entry.get('image_id'), str)
+                    or not entry['image_id'] or entry['image_id'] in ids
+                    or not re.fullmatch(r'[0-9a-f]{64}', str(entry.get('sha256', '')))
+                    or entry.get('native_label') not in aliases.values()):
+                raise ValueError('Reference image ID, SHA256 or native attachment binding is invalid')
+            ids.add(entry['image_id'])
+        if len({entry['native_label'] for entry in references}) != counts['Picture']:
+            raise ValueError('Reference provenance covers a native image slot more than once')
+        result.update(references=references, reference_schema_version=policy['reference_schema_version'])
+    if policy.get('trace_id'):
+        result['trace_id'] = str(policy['trace_id'])
+    if 'locked_dialogue' in policy:
+        dialogue=policy['locked_dialogue']
+        if (not isinstance(dialogue,list) or any(not isinstance(row,dict) or not isinstance(row.get('text'),str)
+                or not row['text'].strip() or row.get('language') not in {
+                    'English','Spanish','Portuguese','French','German','Italian','Russian','Arabic','Chinese','Japanese','Korean'}
+                for row in dialogue)):
+            raise ValueError('Frozen native dialogue requires exact text and a supported spoken language')
+        result['locked_dialogue']=dialogue
+    if 'locked_production_constraints' in policy:
+        constraints=policy['locked_production_constraints']
+        if not isinstance(constraints,list) or any(not isinstance(value,str) or not value.strip() for value in constraints):
+            raise ValueError('Frozen native production constraints must retain non-empty source text')
+        result['locked_production_constraints']=constraints
     requirements=result['scene_requirements']
     constraint_keys={item.get('target_key') for item in result['revision_constraints'].get('items',[])
                      if isinstance(item,dict) and isinstance(item.get('target_key'),str)}
@@ -97,8 +129,8 @@ def reference_contract(upstream,media,groups='',required='',motion='',production
     camera_sentence=policy.get('camera_sentence')
     if camera_sentence is not None:
         if not isinstance(camera_sentence,str) or not re.fullmatch(
-                r'The camera (?:shakes slightly|(?:shakes slightly and )?pushes in(?: at slow speed)?'
-                r'|pulls out(?: at slow speed)?)\.',camera_sentence):
+                r'The camera (?:holds static|shakes slightly|(?:shakes slightly and )?pushes in(?: at slow speed)?'
+                r'|pulls out(?: at slow speed)?|tracks with the action)\.',camera_sentence):
             raise ValueError('Unsupported frozen camera movement')
         result['camera_sentence']=camera_sentence
     return result

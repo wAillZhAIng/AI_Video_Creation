@@ -7,6 +7,7 @@ import json
 import os
 import errno
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import sys
@@ -48,7 +49,7 @@ def local_url(origin):
         raise ValueError('The native supervisor upstream must be a credential-free loopback HTTP origin')
     return origin.rstrip('/')
 
-def request_json(origin, route, body=None, timeout=5):
+def request_json(origin, route, body=None, timeout=5, *, allow_empty=False):
     local_url(origin)
     if not route.startswith('/') or route.startswith('//'):
         raise ValueError('Expected a local API route')
@@ -56,7 +57,13 @@ def request_json(origin, route, body=None, timeout=5):
     raw = None if body is None else json.dumps(body,ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request(origin+route,data=raw,headers={'Content-Type':'application/json'})
     with opener.open(req, timeout=timeout) as response:
+        if allow_empty:
+            raw = response.read(4096)
+            return json.loads(raw) if raw else {}
         return json.load(response)
+
+def config_sha256(config):
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
 
 def queue_idle(queue):
     if not isinstance(queue,dict) or any(not isinstance(queue.get(k),list) for k in ('queue_running','queue_pending')):
@@ -75,6 +82,12 @@ def config_at(path):
     if config.get('schema_version') != 1 or config.get('profile_id') != PROFILE:
         raise ValueError('Unsupported native configuration schema/profile')
     local_url(config['comfy_origin'])
+    peer = config.get('peer_comfy_origin')
+    entry = config.get('peer_comfy_entry')
+    if peer or entry:
+        if (sys.platform!='linux' or not peer or not entry or not Path(entry).is_absolute()
+                or local_url(peer)==local_url(config['comfy_origin'])):
+            raise ValueError('A Linux Comfy peer requires a distinct loopback origin and absolute main.py path')
     for key in ('comfy_root','model_root','runtime_root','comfy_python','qwen_python','qwen_model'):
         if not Path(config[key]).is_absolute():
             raise ValueError('Configuration paths must be absolute: '+key)
@@ -106,15 +119,20 @@ def initialize(args):
     qwen=qwen_dirs[0].resolve() if len(qwen_dirs)==1 else args.model_root.resolve()/'Qwen3-VL-4B-Instruct'
     config = {'schema_version':1,'profile_id':PROFILE,'comfy_root':str(args.comfy_root.resolve()),
               'model_root':str(args.model_root.resolve()),'runtime_root':str(root),
-              'comfy_python':str(args.comfy_python.resolve()),'qwen_python':str(args.qwen_python.resolve()),
+              # Resolving a POSIX venv symlink selects the base interpreter.
+              'comfy_python':str(args.comfy_python.absolute()),'qwen_python':str(args.qwen_python.absolute()),
               'qwen_model':str(qwen),
-              'model_paths':paths,'comfy_origin':'http://127.0.0.1:8188','listen':'127.0.0.1','port':8788,
+              'model_paths':paths,'comfy_origin':args.comfy_origin,'listen':'127.0.0.1','port':8788,
               'allowed_clients':['127.0.0.1','::1'],
               'input_root':str(root/'input'),'output_root':str(root/'output'),
-              'ffmpeg_path':shutil.which('ffmpeg') or str(args.comfy_root.resolve()/'ffmpeg.exe'),
-              'ffprobe_path':shutil.which('ffprobe') or str(args.comfy_root.resolve()/'ffprobe.exe'),
+              'ffmpeg_path':shutil.which('ffmpeg'),
+              'ffprobe_path':shutil.which('ffprobe'),
               'source_manifest_sha256':sha(MANIFEST),'discovery_warnings':warnings}
-    for name in ('input','output','logs','jobs','tmp','cache/qwen','cache/huggingface','cache/torch','cache/cuda'):
+    if sys.platform=='win32':
+        for name in ('ffmpeg','ffprobe'):
+            if not config[name+'_path']:
+                config[name+'_path']=str(args.comfy_root.resolve()/(name+'.exe'))
+    for name in ('input','output','logs','jobs','tmp','user','cache/qwen','cache/huggingface','cache/torch','cache/cuda'):
         (root/name).mkdir(parents=True,exist_ok=True)
     write(output,config)
     print(str(output))
@@ -131,7 +149,7 @@ def probe_sampler_sources(python,pins):
     code="import importlib.metadata as m,json,pathlib,hashlib; root=pathlib.Path(m.distribution('torch').locate_file('torch')); files=['utils/_contextlib.py','autograd/grad_mode.py']; print(json.dumps({p:hashlib.sha256((root/p).read_bytes()).hexdigest() for p in files}))"
     result=subprocess.run([str(python),'-B','-c',code],capture_output=True,text=True,encoding='utf-8',timeout=30)
     if result.returncode:raise ValueError('Cannot verify native sampler decorator source: '+result.stderr[-1000:])
-    expected={key.split('site-packages/torch/',1)[1]:value for key,value in pins.items()}
+    expected={key.split('torch/',1)[1]:value for key,value in pins.items()}
     actual=json.loads(result.stdout)
     return {'kind':'native_sampler_decorator_source','ok':actual==expected,'actual':actual,'expected':expected}
 
@@ -229,6 +247,47 @@ def inspect_sources(config):
     except Exception as error:checks.append({'kind':'compiler_source','ok':False,'error':str(error)})
     return checks
 
+def linux_source_revisions(config, manifest):
+    core = Path(config['comfy_root'])
+    for root, revision in (
+        (core, manifest['comfy_revision']),
+        (core/'custom_nodes/ComfyUI-OpenH3-IR', manifest['openh3_revision']),
+    ):
+        record = {'kind':'linux_git_source','path':str(root),'expected':revision,'ok':False}
+        try:
+            command = ['git','-C',str(root)]
+            actual = subprocess.run([*command,'rev-parse','HEAD'], check=True, capture_output=True,
+                                    text=True, timeout=15).stdout.strip()
+            clean = subprocess.run([*command,'diff','--no-ext-diff','--quiet','HEAD','--'],
+                                   timeout=15).returncode == 0
+            record.update(ok=actual==revision and clean, actual=actual, tracked_files_clean=clean)
+        except (OSError, subprocess.SubprocessError) as error:
+            record['error'] = str(error)
+        yield record
+
+def linux_checks(config, manifest):
+    from native_linux import memory_admitted, memory_budget
+
+    result = [{'kind':'linux_manifest','ok':config.get('source_manifest_sha256')==sha(MANIFEST),
+               'expected':sha(MANIFEST)}]
+    try:
+        budget = memory_budget()
+        result.append({'kind':'linux_memory_budget','ok':memory_admitted(budget),'metrics':budget})
+    except (OSError, ValueError) as error:
+        result.append({'kind':'linux_memory_budget','ok':False,'error':str(error)})
+    inventory = {'kind':'linux_cuda_inventory','ok':False}
+    try:
+        command = ['nvidia-smi','--query-gpu=uuid','--format=csv,noheader']
+        uuids = subprocess.run(command, check=True, capture_output=True, text=True, timeout=10).stdout.splitlines()
+        inventory.update(ok=len(uuids)==1 and uuids[0].startswith('GPU-'),uuids=uuids)
+    except (OSError, subprocess.SubprocessError) as error:
+        inventory['error'] = str(error)
+    result.append(inventory)
+    return result + list(linux_source_revisions(config, manifest))
+
+def custom_node_whitelist(manifest):
+    return ['ComfyUI-OpenH3-IR', *(pack['name'] for pack in manifest['project_nodes'])]
+
 def inspect_models(config, hash_models=False):
     manifest=load(MANIFEST);cache_path=Path(config['runtime_root'])/'verified-models.json'
     cache=load(cache_path) if cache_path.is_file() else {}
@@ -274,24 +333,34 @@ def inspect_media_tool(config,name):
 
 def check(config, hash_models=False):
     manifest=load(MANIFEST)
-    checks=[{'kind':'platform','ok':sys.platform=='win32','actual':sys.platform,
-             'required':'win32; NVIDIA CUDA. Linux source/runtime acceptance is not completed; Metal is unsupported'}]
+    linux = sys.platform=='linux' and platform.machine()=='x86_64'
+    baseline = manifest['linux_nvidia'] if linux else manifest
+    checks=[{'kind':'platform','ok':sys.platform=='win32' or linux,'actual':sys.platform,
+             'required':'Windows or Linux x86-64 with NVIDIA CUDA'}]
+    if linux:
+        checks += linux_checks(config, manifest)
     for name in ('ffmpeg','ffprobe'):checks.append(inspect_media_tool(config,name))
     checks+=inspect_sources(config)+inspect_models(config,hash_models)
-    for key,expected in [('comfy_python',manifest['comfy_packages']),('qwen_python',manifest['qwen_packages'])]:
+    for key,expected in [('comfy_python',baseline['comfy_packages']),('qwen_python',baseline['qwen_packages'])]:
         try:
             actual=probe_python(config[key],expected)
-            expected_python=manifest['python_versions'][key]
+            expected_python=baseline['python_versions'][key]
             ok=actual['python']==expected_python and all(actual['packages'].get(k)==v for k,v in expected.items())
             checks.append({'kind':key,'ok':ok,'actual':actual,'expected_python':expected_python,'expected_packages':expected})
         except Exception as error:checks.append({'kind':key,'ok':False,'error':str(error)})
         try:
             hardware=probe_hardware(config[key])
-            checks.append({'kind':key+'_hardware','ok':hardware['ok'],'actual':hardware})
+            eligible = hardware['ok']
+            if linux and eligible:
+                devices = hardware['devices']
+                eligible = (hardware.get('torch_cuda_build')==baseline['cuda_build'] and len(devices)==1
+                            and devices[0]['compute_capability']['major']==baseline['compute_capability_major'])
+            checks.append({'kind':key+'_hardware','ok':eligible,'actual':hardware})
         except Exception as error:checks.append({'kind':key+'_hardware','ok':False,'error':str(error)})
-    try:checks.append(probe_sampler_sources(config['comfy_python'],manifest['torch_source_pins']))
+    try:checks.append(probe_sampler_sources(config['comfy_python'],baseline['torch_source_pins']))
     except Exception as error:checks.append({'kind':'native_sampler_decorator_source','ok':False,'error':str(error)})
     result={'schema_version':1,'profile_id':PROFILE,'ready':all(c['ok'] for c in checks),'checks':checks,
+            'manifest_sha256':sha(MANIFEST),
             'weights_downloaded':False,'generation_tested':False}
     write(Path(config['runtime_root'])/'installation-check.json',result)
     return result
@@ -353,14 +422,14 @@ def environment(config):
     env.update({'VF_RUNTIME_ROOT':str(root),'VF_QWEN_MODEL':config['qwen_model'],
                 'HF_HUB_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1','HF_DATASETS_OFFLINE':'1',
                 'HF_HUB_DISABLE_TELEMETRY':'1','PYTHONDONTWRITEBYTECODE':'1','PYTHONIOENCODING':'utf-8',
-                'H3IR_GUIDED_DECODING':'1','H3IR_LLM_THINKING':'0','H3IR_LLM_MAX_TOKENS':'4096',
+                'H3IR_GUIDED_DECODING':'1','H3IR_LLM_THINKING':'0',
                 'H3IR_STATE_DIR':str(root/'cache/h3ir'),'H3IR_LLM_KEY':'not-needed',
                 'HF_HOME':str(root/'cache/huggingface'),'TORCH_HOME':str(root/'cache/torch')})
     tool_dirs=[str(Path(config[name+'_path']).resolve().parent) for name in ('ffmpeg','ffprobe') if config.get(name+'_path')]
     if tool_dirs:env['PATH']=os.pathsep.join(dict.fromkeys(tool_dirs))+os.pathsep+env.get('PATH','')
     return env
 
-def start_comfy(config):
+def start_comfy(config, *, foreground=False):
     result=check(config)
     if not result['ready']:raise ValueError('Native installation checks failed; see installation-check.json')
     try:
@@ -370,15 +439,36 @@ def start_comfy(config):
         if not connection_refused(error):
             raise ValueError('Comfy availability is unknown; no duplicate service started: '+str(error)) from error
     root=Path(config['runtime_root']);core=Path(config['comfy_root'])
+    (root/'user').mkdir(exist_ok=True)
     port=urlsplit(config['comfy_origin']).port
     args=[config['comfy_python'],'-X','utf8','-B',str(core/'main.py'),'--listen','127.0.0.1','--port',str(port),
           '--disable-auto-launch','--disable-async-offload','--disable-pinned-memory','--disable-comfy-compiler','--cache-none',
           '--input-directory',config['input_root'],'--output-directory',config['output_root'],
           '--user-directory',str(root/'user'),'--extra-model-paths-config',str(root/'extra-model-paths.yaml')]
+    linux = sys.platform=='linux'
+    if linux:
+        manifest = load(MANIFEST)
+        args += ['--disable-all-custom-nodes','--whitelist-custom-nodes',*custom_node_whitelist(manifest)]
+        import psutil
+
+        def save_owner(pid):
+            write(root/'comfy-owned-process.json',{'pid':pid,'args':args,
+                'created':psutil.Process(pid).create_time(),'executable':str(Path(config['comfy_python']).resolve()),
+                'config_sha256':config_sha256(config)})
+
+        if foreground:
+            save_owner(os.getpid())
+            os.chdir(core)
+            os.execve(args[0],args,environment(config))
+    elif foreground:
+        raise ValueError('Foreground Comfy launch requires Linux')
     with (root/'logs/comfy.stdout.log').open('ab') as stdout,(root/'logs/comfy.stderr.log').open('ab') as stderr:
         process=subprocess.Popen(args,cwd=core,env=environment(config),stdout=stdout,stderr=stderr,
                                  creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-    write(root/'comfy-owned-process.json',{'pid':process.pid,'args':args})
+    if linux:
+        save_owner(process.pid)
+    else:
+        write(root/'comfy-owned-process.json',{'pid':process.pid,'args':args})
     print(json.dumps({'started_pid':process.pid,'readiness':'NOT_ASSUMED; inspect logs and runtime endpoint','origin':config['comfy_origin']}))
 
 def main():
@@ -387,16 +477,18 @@ def main():
     init=sub.add_parser('init')
     for name in ('comfy-root','model-root','runtime-root','comfy-python','qwen-python'):
         init.add_argument('--'+name,type=Path,required=True)
+    init.add_argument('--comfy-origin',type=local_url,default='http://127.0.0.1:8188')
     for name in ('check','install-nodes','start-comfy','serve'):
         child=sub.add_parser(name);child.add_argument('--config',type=Path,required=True)
         if name=='check':child.add_argument('--hash-models',action='store_true')
+        if name=='start-comfy':child.add_argument('--foreground',action='store_true')
     inspect=sub.add_parser('inspect-sources')
     inspect.add_argument('--comfy-root',type=Path,required=True)
     inspect.add_argument('--comfy-python',type=Path,required=True)
     args=parser.parse_args()
     if args.command=='init':initialize(args);return 0
     if args.command=='inspect-sources':
-        checks=inspect_sources({'comfy_root':str(args.comfy_root.resolve()),'comfy_python':str(args.comfy_python.resolve())})
+        checks=inspect_sources({'comfy_root':str(args.comfy_root.resolve()),'comfy_python':str(args.comfy_python.absolute())})
         print(json.dumps({'source_checks':checks,'source_ready':all(x['ok'] for x in checks),
                           'model_or_generation_acceptance':False},ensure_ascii=False,indent=2))
         return 0 if all(x['ok'] for x in checks) else 2
@@ -404,7 +496,7 @@ def main():
     if args.command=='check':
         result=check(config,args.hash_models);print(json.dumps(result,ensure_ascii=False,indent=2));return 0 if result['ready'] else 2
     if args.command=='install-nodes':install(config);return 0
-    if args.command=='start-comfy':start_comfy(config);return 0
+    if args.command=='start-comfy':start_comfy(config,foreground=args.foreground);return 0
     from native_supervisor import serve
     return serve(config)
 
