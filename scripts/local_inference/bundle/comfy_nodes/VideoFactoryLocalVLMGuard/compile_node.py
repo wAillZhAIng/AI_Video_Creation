@@ -18,7 +18,7 @@ def upstream_main():
     return node
 
 
-def reference_contract(upstream,media,groups='',required='',motion='',production_contract=''):
+def reference_contract(upstream,media,groups='',required='',motion='',production_contract='',reference_provenance=''):
     """Resolve explicit human declarations through the official native ordering.
 
     A group is the caller's statement, never face recognition or a conclusion
@@ -86,6 +86,40 @@ def reference_contract(upstream,media,groups='',required='',motion='',production
                   revision_constraints=policy.get('revision_constraints') or {},
                   constraint_target_groups=targets,
                   scene_requirements=policy.get('scene_requirements') or [])
+    # A dynamic record must exist for every real Picture attachment.  This is
+    # provenance, not a new image slot: the existing workflow continues to own
+    # capacity and attachment order.
+    # New jobs keep provenance outside the immutable production contract.  The
+    # policy fallback intentionally accepts historic snapshots made before this
+    # adapter existed, so old review/retry jobs stay readable.
+    provenance = json.loads(reference_provenance) if reference_provenance else {}
+    if reference_provenance and not isinstance(provenance, dict):
+        raise ValueError('Unsupported reference provenance contract')
+    if not provenance and policy.get('references') is not None:
+        provenance = {
+            'reference_schema_version': policy.get('reference_schema_version'),
+            'references': policy.get('references'),
+            'trace_id': policy.get('trace_id'),
+        }
+    references = provenance.get('references')
+    if references is not None:
+        if (provenance.get('reference_schema_version') != 'context-references-v1'
+                or not isinstance(references, list)
+                or len(references) != counts['Picture']):
+            raise ValueError('Reference provenance list does not match the actual image attachments')
+        ids = set()
+        for entry in references:
+            if (not isinstance(entry, dict) or not isinstance(entry.get('image_id'), str)
+                    or not entry['image_id'] or entry['image_id'] in ids
+                    or not re.fullmatch(r'[0-9a-f]{64}', str(entry.get('sha256', '')))
+                    or entry.get('native_label') not in aliases.values()):
+                raise ValueError('Reference image ID, SHA256 or native attachment binding is invalid')
+            ids.add(entry['image_id'])
+        if len({entry['native_label'] for entry in references}) != counts['Picture']:
+            raise ValueError('Reference provenance covers a native image slot more than once')
+        result.update(references=references, reference_schema_version=provenance['reference_schema_version'])
+    if provenance.get('trace_id'):
+        result['trace_id'] = str(provenance['trace_id'])
     requirements=result['scene_requirements']
     constraint_keys={item.get('target_key') for item in result['revision_constraints'].get('items',[])
                      if isinstance(item,dict) and isinstance(item.get('target_key'),str)}
@@ -113,7 +147,8 @@ class VideoFactoryLocalH3IRCompile:
             ('reference_groups','Optional declared identity groups, one per line: character person-name: front, side or product sku-name: front, side. Use media tray labels; no identity is inferred.'),
             ('required_references','Optional must-use media tray labels separated by commas. The compiled definitions must actually cite them.'),
             ('motion_targets','Optional explicit motion source for a character group, one per line: person-name: clip-label. This is content reference, with no pure-motion isolation guarantee.'),
-            ('production_contract','Frozen product identity and caller revision constraints as JSON. Validated before H3 loading.')):
+            ('production_contract','Frozen product identity and caller revision constraints as JSON. Validated before H3 loading.'),
+            ('reference_provenance','Dynamic reference-image provenance as JSON. It is kept separate from frozen production snapshots.')):
             extra[name]=('STRING',{'default':'','multiline':True,'advanced':True,'tooltip':tip})
         extra['caller_contract_policy']=('STRING',{'default':CALLER_CONTRACT_POLICY,'advanced':True,
             'tooltip':'Required project caller-contract verification policy; cannot disable validation.'})
@@ -128,7 +163,7 @@ class VideoFactoryLocalH3IRCompile:
     @classmethod
     def IS_CHANGED(cls,**kwargs):return float('nan')
 
-    def compile(self,reference_groups='',required_references='',motion_targets='',production_contract='',
+    def compile(self,reference_groups='',required_references='',motion_targets='',production_contract='',reference_provenance='',
                 caller_contract_policy=CALLER_CONTRACT_POLICY,**kwargs):
         import folder_paths
         from pathlib import Path
@@ -146,7 +181,8 @@ class VideoFactoryLocalH3IRCompile:
         compiler_function=execute.__globals__.get('compile_here')
         if not callable(compiler_function):
             raise RuntimeError('The actual Main no longer exposes its audited local compiler')
-        contract=reference_contract(upstream,kwargs.get('media'),reference_groups,required_references,motion_targets,production_contract)
+        contract=reference_contract(upstream,kwargs.get('media'),reference_groups,required_references,motion_targets,
+                                    production_contract,reference_provenance)
         with profile_scope(Path(folder_paths.get_output_directory())/'h3_local_backend_profile_v3',
                            kwargs['setup'],kwargs.get('seed',20261104),
                            compiler_function=compiler_function,main_class=upstream,

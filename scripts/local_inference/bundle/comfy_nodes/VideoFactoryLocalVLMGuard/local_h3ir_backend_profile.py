@@ -33,7 +33,7 @@ from .media_bindings import ground_writer_messages, repair_media_bindings, writt
 
 
 VERSION='local-h3ir-qwen4b-v3'
-POLICY_REVISION='descriptive-retention-v9'
+POLICY_REVISION='multireference-provenance-v1'
 MODEL='Qwen/Qwen3-VL-4B-Instruct'
 MAX_OUTPUT=4096
 CARD_OUTPUT=3072
@@ -56,6 +56,7 @@ REPAIR_BRIEF_SHA256='fa9740d40b41f6e66ae7b13750b457c4284768744c45e1386a534dd4f9b
 FIX_LABELS_SHA256='d0f6d472700a5f64b3e0d02a17c7ec3b5a762ec092cae1748d44fbe9897a0f40'
 RENDER_IR_SHA256='a71e800d15624be4624b7cea1d5507ffcb22e7e218f9a6be37410cab8303da42'
 ASSESS_SHA256='5d1218f03aa822deb9aee055ce858d5049af67ae1da6f1dea7a4200155a14a53'
+BUILD_SUBJECTS_SHA256='003a82491fb1f02a447a1e3625c216b882c0c097e591414c6d5b563559e150ba'
 _CAMERA_REPAIR='restored the frozen camera sentence in the numbered shot'
 _VERBATIM_SPANS=re.compile(r'<d>.*?</d>|"[^"]*"|“([^"”]*)”',re.S)
 _DESCRIPTIVE_RETENTION = frozenset({
@@ -78,6 +79,11 @@ class LocalProfileFailure(RuntimeError):
 
 class LocalProfileBlocked(LocalProfileFailure):
     """The compiler produced a document that cannot be handed to H3."""
+
+
+def _effective_sampling(scope):
+    """Keep image-card analysis deterministic without changing generation seeds."""
+    return 0.2, scope.get('analysis_seed', scope['seed'])
 
 
 def source_hash(function):
@@ -868,6 +874,12 @@ def _install_document_gate(namespace):
                 if not isinstance(body,dict) or body.get('degraded') is not False or body.get('fallback_reason'):
                     raise LocalProfileBlocked('Compiler body contradicts source=written; evidence: '+str(folder))
                 record.update(status='PASS',body_sha256=digest(body))
+                from .reference_analysis import trace
+                contract = scope.get('reference_contract') or {}
+                trace(scope, 'ir_schema_semantic_gate_passed', contract.get('references') or [],
+                      source=source, body_sha256=record['body_sha256'],
+                      direct_h3_reference_count=len(brief.assets), semantic_fallback=False,
+                      visual_constraint_scope='all attached originals remain available to the native workflow')
                 provenance=getattr(doc,'provenance',{}) or {}
                 record.update(creative_text_source='model_written',
                     binding_source=provenance.get('binding_source','model_written'),
@@ -882,7 +894,13 @@ def _install_document_gate(namespace):
                     write_json(binding_path,binding)
                 return body
             except Exception as error:
-                record.update(error_type=type(error).__name__,error=str(error));raise
+                record.update(error_type=type(error).__name__,error=str(error))
+                from .reference_analysis import trace
+                trace(scope, 'ir_schema_semantic_gate_failed',
+                      (scope.get('reference_contract') or {}).get('references') or [],
+                      function='checked_document', error_type=type(error).__name__, error=str(error),
+                      evidence=str(folder))
+                raise
             finally:write_json(folder/'source-gate.json',record)
 
         checked_document._factory_source_gate_version=VERSION
@@ -903,6 +921,7 @@ def install_compiler_gate(compile_here):
         raise LocalProfileFailure('The installed document serializer changed; source gate was not guessed')
     _install_document_gate(namespace)
     _install_analysis_capture()
+    _install_reference_fusion()
     _install_revision_validation()
     _install_structural_render_compatibility()
     return {'compile_here_sha256':COMPILER_CALL_SHA256,'serializer_sha256':SERIALIZER_SHA256,
@@ -910,33 +929,89 @@ def install_compiler_gate(compile_here):
             'required_source':'written','location':'before vendor serializer returns body to Main; before H3 loaders'}
 
 
+def _install_reference_fusion():
+    """Fuse only explicit, visually verified same-product views before planning."""
+    import h3ir.plan as planner
+    with _INSTALL_LOCK:
+        original = planner.build_subjects
+        if getattr(original, '_factory_reference_fusion', None) == POLICY_REVISION:
+            return
+        if source_hash(inspect.unwrap(original)) != BUILD_SUBJECTS_SHA256:
+            raise LocalProfileFailure('The audited native subject planner changed; fusion was not guessed')
+
+        @functools.wraps(original)
+        def fused_subjects(*args, **kwargs):
+            subjects = original(*args, **kwargs)
+            scope = _ACTIVE.get()
+            if scope is None:
+                return subjects
+            from .reference_fusion import fuse_product_subjects
+            fused, receipt = fuse_product_subjects(
+                subjects, scope.get('reference_contract'), scope.get('product_identity_verification'))
+            write_json(scope['directory'] / 'global-reference-fusion.json', receipt)
+            return fused
+
+        fused_subjects._factory_reference_fusion = POLICY_REVISION
+        planner.build_subjects = fused_subjects
+
+
 def _install_analysis_capture():
+    """Analyse every image separately; all original attachments still reach H3."""
     import h3ir.compile as compiler
     with _INSTALL_LOCK:
-        original=compiler.analyse_all
-        if getattr(original,'_factory_card_capture_version',None)!=VERSION:
-            @functools.wraps(original)
-            def captured(*args,**kwargs):
-                cards=original(*args,**kwargs)
-                scope=_ACTIVE.get()
-                if scope is not None:
-                    scope['cards']=cards
-                    write_json(scope['directory']/'analysis-cards.json',
-                               {key:asdict(card) for key,card in cards.items()})
-                    contract=scope.get('reference_contract') or {}
-                    if contract.get('identity_validation_required'):
-                        from .product_reference_validation import verify_product_references,ProductReferenceConflict
-                        bound=inspect.signature(original).bind(*args,**kwargs)
-                        try:
-                            scope['product_identity_verification']=verify_product_references(
-                                bound.arguments['backend'],bound.arguments['refs'],cards,contract,
-                                scope['directory'].parent/'product-identity-cache',scope['seed'],
-                                receipt_root=scope['directory'])
-                        except ProductReferenceConflict as error:
-                            raise LocalProfileBlocked(str(error)) from error
+        original = compiler.analyse_all
+        if getattr(original, '_factory_card_capture_version', None) == VERSION:
+            return
+
+        @functools.wraps(original)
+        def captured(*args, **kwargs):
+            scope = _ACTIVE.get()
+            if scope is None:
+                return original(*args, **kwargs)
+            from .reference_analysis import analyse_references, ANALYSIS_SEED, trace
+            from .product_reference_validation import verify_product_references, ProductReferenceConflict
+            from h3ir.models import AssetKind
+
+            bound = inspect.signature(original).bind(*args, **kwargs)
+            image_count = sum(ref.kind is AssetKind.IMAGE for ref in bound.arguments['refs'])
+            uses_multireference_adapter = image_count > 2
+            try:
+                if uses_multireference_adapter:
+                    # Keep the existing single- and double-image native parser
+                    # exactly as it was; only the formerly failing >2 path is
+                    # routed through bounded per-image analysis.
+                    scope['analysis_seed'] = ANALYSIS_SEED
+                    cards = analyse_references(original, bound, scope)
+                else:
+                    cards = original(*args, **kwargs)
+                    trace(scope, 'native_batch_analysis_preserved',
+                          (scope.get('reference_contract') or {}).get('references') or [],
+                          direct_h3_reference_count=image_count,
+                          parser='existing_native_analyse_all')
+                scope['cards'] = cards
+                write_json(scope['directory'] / 'analysis-cards.json',
+                           {key: asdict(card) for key, card in cards.items()})
+                contract = scope.get('reference_contract') or {}
+                if contract.get('identity_validation_required'):
+                    try:
+                        proof = verify_product_references(
+                            bound.arguments['backend'], bound.arguments['refs'], cards, contract,
+                            scope['directory'].parent / 'product-identity-cache',
+                            ANALYSIS_SEED if uses_multireference_adapter else scope['seed'],
+                            receipt_root=scope['directory'])
+                        scope['product_identity_verification'] = proof
+                        trace(scope, 'product_identity_verification', contract.get('references') or [],
+                              status=proof.get('status'), protocol=proof.get('protocol'))
+                    except ProductReferenceConflict as error:
+                        trace(scope, 'product_identity_verification_failed', contract.get('references') or [],
+                              error_type=type(error).__name__, error=str(error))
+                        raise LocalProfileBlocked(str(error)) from error
                 return cards
-            captured._factory_card_capture_version=VERSION
-            compiler.analyse_all=captured
+            finally:
+                scope.pop('analysis_seed', None)
+
+        captured._factory_card_capture_version = VERSION
+        compiler.analyse_all = captured
 
 
 def install_render_policy(main_class):
@@ -1139,7 +1214,8 @@ def install(backend_class=None):
                    'original_schema':deepcopy(schema),'effective_schema':effective,'schema_changes':changes,
                    'original_messages':deepcopy(messages),'requested_parameters':deepcopy(requested)}
             token=_STAGE.set(stage)
-            effective_kwargs={**kwargs,'retries':0,'temperature':0.2,'thinking':False,'seed':scope['seed']}
+            effective_kwargs={**kwargs,'retries':0,'temperature':0.2,'thinking':False,
+                              'seed':scope.get('analysis_seed',scope['seed'])}
             effective_kwargs['max_tokens']=min(kwargs.get('max_tokens') or self.cfg.max_tokens,CARD_OUTPUT if is_card else MAX_OUTPUT)
             try:
                 value=original_json(self,concise_card_messages(messages) if is_card else messages,effective,**effective_kwargs)
@@ -1158,9 +1234,10 @@ def install(backend_class=None):
             scope=active_for(self)
             if scope is None:return original_chat(self,messages,**kwargs)
             stage=_STAGE.get()
+            temperature,seed=_effective_sampling(scope)
             limit=CARD_OUTPUT if stage and stage['kind']=='asset_card' else MAX_OUTPUT
             effective={**kwargs,'max_tokens':min(kwargs.get('max_tokens') or self.cfg.max_tokens,limit),
-                       'temperature':0.2,'thinking':False,'seed':scope['seed'],'retries':0}
+                       'temperature':temperature,'thinking':False,'seed':seed,'retries':0}
             requested={'max_tokens':kwargs.get('max_tokens') or self.cfg.max_tokens,
                        'temperature':kwargs.get('temperature',0.7),'thinking':kwargs.get('thinking'),
                        'seed':kwargs.get('seed'),'retries':kwargs.get('retries',2),**kwargs}
@@ -1187,9 +1264,10 @@ def install(backend_class=None):
             call=_CALL.get() or {}
             stage=_STAGE.get()
             limit=CARD_OUTPUT if stage and stage['kind']=='asset_card' else MAX_OUTPUT
+            temperature,seed=_effective_sampling(scope)
             effective=deepcopy(body)
             effective.update(max_tokens=min(body.get('max_tokens') or self.cfg.max_tokens,limit),
-                             temperature=0.2,seed=scope['seed'],chat_template_kwargs={'enable_thinking':False})
+                             temperature=temperature,seed=seed,chat_template_kwargs={'enable_thinking':False})
             requested=deepcopy(body)
             requested['messages']=deepcopy(call.get('original_messages',body.get('messages')))
             original_parameters=(stage or {}).get('requested_parameters',call.get('requested_parameters',{}))

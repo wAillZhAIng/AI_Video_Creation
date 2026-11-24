@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import uuid
 
 
-PROTOCOL = 'product-reference-identity-4'
+PROTOCOL = 'product-reference-identity-5'
 MODEL = 'Qwen/Qwen3-VL-4B-Instruct'
 MAX_FILE_BYTES = 64 * 1024 * 1024
 MAX_OUTPUT = 4096
@@ -387,6 +387,10 @@ def verify_product_references(backend, refs, cards, contract, cache_root, seed=N
                     'Distinct designs and color variants '
                     'must not be merged merely because they share a brand or product family. Caller scale overrides '
                     'are handled separately: printed dimensions alone do not reject an otherwise matching identity. '
+                    'Earlier card captions are fallible observations, not identity facts. Compare the actual attached pixels. '
+                    'Never reject matching visible geometry, material and pattern because a caption guessed a brand. '
+                    'Use a printed brand as a difference only when its differing literal characters are clearly legible '
+                    'in both actual photographs. Missing, cropped or unreadable lettering alone is not a different design. '
                     'Give short factual visual reasons. Do not guess missing detail.')
                 batch_record = {'index': batch_index, 'input_labels': batch_labels, 'groups': batch,
                                 'status': 'BLOCKED'}

@@ -131,7 +131,7 @@ def _native_frame_count(seconds):
 
 def build_graph(snapshot, *, tray, intent, duration_seconds, aspect_ratio, seed, width, height,
                 reference_groups, required_references, motion_targets, output_prefix,
-                spoken_language='English', silent=True,production_contract=None):
+                spoken_language='English', silent=True,production_contract=None, reference_provenance=''):
     """Bind frozen job inputs and leave the real compiler in the sampler path."""
     mode = snapshot.get('quality_mode') if isinstance(snapshot, dict) else None
     if not isinstance(mode, str) or mode not in MODES:
@@ -152,6 +152,8 @@ def build_graph(snapshot, *, tray, intent, duration_seconds, aspect_ratio, seed,
         raise AppError(422, 'h3_context_audio', 'Context-IR 的语音语言或音乐设置无效')
     if not all(isinstance(value, str) for value in (reference_groups, required_references, motion_targets)):
         raise AppError(422, 'h3_context_references', 'Context-IR 的参考分组格式无效')
+    if not isinstance(reference_provenance, str):
+        raise AppError(422, 'h3_context_reference_provenance', 'Context-IR 的参考图来源记录格式无效')
     _validate_tray(tray)
     if _uploaded_file(output_prefix).as_posix() != output_prefix:
         raise AppError(422, 'h3_context_output', 'Context-IR 输出需要本次任务的相对路径')
@@ -168,6 +170,8 @@ def build_graph(snapshot, *, tray, intent, duration_seconds, aspect_ratio, seed,
         reference_groups=reference_groups, required_references=required_references,
         motion_targets=motion_targets, caller_contract_policy=CALLER_CONTRACT_POLICY,
     )
+    if reference_provenance:
+        graph['4']['inputs']['reference_provenance'] = reference_provenance
     graph['5']['inputs']['noise_seed'] = seed
     if production_contract is not None:
         if not isinstance(production_contract,dict) or production_contract.get('version')!=1:

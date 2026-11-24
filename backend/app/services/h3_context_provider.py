@@ -23,6 +23,7 @@ from app.core.trusted_service_origins import is_loopback_service, is_trusted_loc
 from app.services.gpu_gate import _connection_refused, gpu_submission
 from app.services.h3_workflow_router import build_graph
 from app.services.revision_semantics import CALLER_CONTRACT_POLICY, extract_scene_requirements
+from app.services.context_references import reference_records, trace_references, REFERENCE_SCHEMA_VERSION
 from app.services.revision_cinematography import explicit_cinematography
 from app.services.motion_references import prepare_motion_reference
 from app.services.providers import ComfyUIH3Provider, JobAccepted, ProviderHealth
@@ -333,6 +334,18 @@ def prepare_context_compilation(prompt,negative_prompt,images,motion,context,*,s
     tray,declarations,directions=reference_layout(images,motion,prop_states=prop_states)
     staging=_frozen_product_staging(images,motion,prop_states)
     contract=frozen_production_contract(images,declarations,context,prompt)
+    # Keep the frozen production contract byte-for-byte compatible with the
+    # historic preview/retry snapshot.  Dynamic per-image provenance travels in
+    # its own optional compiler input, so tracing a newly uploaded file can
+    # never rewrite a previously approved production recipe.
+    if images:
+        declarations = {
+            **declarations,
+            'reference_provenance': json.dumps({
+                'reference_schema_version': REFERENCE_SCHEMA_VERSION,
+                'references': reference_records(images),
+            }, ensure_ascii=False, sort_keys=True),
+        }
     if not motion and not context.get('instruction') and context.get('prompt_override') is None:
         sentence = _frozen_camera_sentence(prompt)
         if sentence:
@@ -501,7 +514,7 @@ async def check_context_qwen(url, profile_settings=None, *, runtime_required=Fal
         await require_context_qwen(client, context_origin(url, profile_settings), runtime_required=runtime_required)
 
 
-def compiler_contract_supported(definition):
+def compiler_contract_supported(definition, *, multi_reference=False):
     inputs=definition.get('input',{}) if isinstance(definition,dict) else {}
     if not isinstance(inputs,dict):return False
     fields=[part for key in ('required','optional') if isinstance(part:=inputs.get(key),dict)]
@@ -512,10 +525,11 @@ def compiler_contract_supported(definition):
             if not policy:return True
             if len(field)>1 and isinstance(field[1],dict) and field[1].get('default')==CALLER_CONTRACT_POLICY:return True
         return False
-    return valid('production_contract') and valid('caller_contract_policy',policy=True)
+    return (valid('production_contract') and valid('caller_contract_policy',policy=True)
+            and (not multi_reference or valid('reference_provenance')))
 
 
-async def require_context_ready(client, origin, *, required_nodes=None, runtime_required=False):
+async def require_context_ready(client, origin, *, required_nodes=None, runtime_required=False, multi_reference=False):
     """Read-only admission check; never upload media or submit a graph here."""
     try:
         busy = await has_work(client, origin)
@@ -542,7 +556,7 @@ async def require_context_ready(client, origin, *, required_nodes=None, runtime_
         raise AppError(409, 'local_gpu_busy', 'ComfyUI 队列尚未空闲；等待原任务结束，视频未提交')
     if 'VideoFactoryLocalH3IRCompile' in required:
         definition=nodes.get('VideoFactoryLocalH3IRCompile')
-        if not compiler_contract_supported(definition):
+        if not compiler_contract_supported(definition, multi_reference=multi_reference):
             raise AppError(409,'context_ir_compiler_update_required',
                 'Context-IR 项目编译节点版本过旧或输入不兼容；请更新项目自有节点，并在 ComfyUI 队列空闲后重启服务。视频未提交')
     await require_context_qwen(client, origin, runtime_required=runtime_required)
@@ -722,6 +736,18 @@ class ContextIRH3Provider(ComfyUIH3Provider):
         draft_graph = build_graph(self.workflow, tray=draft_tray, **args)
         logdir = PROJECT_ROOT / 'logs' / 'jobs' / request.job_id
         logdir.mkdir(parents=True, exist_ok=True)
+        try:
+            reference_provenance = json.loads(args.get('reference_provenance') or json.dumps({
+                'reference_schema_version': REFERENCE_SCHEMA_VERSION, 'references': []}))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AppError(422, 'context_ir_reference_provenance', '参考图来源记录无效；视频未提交') from exc
+        if (not isinstance(reference_provenance, dict)
+                or reference_provenance.get('reference_schema_version') != REFERENCE_SCHEMA_VERSION
+                or not isinstance(reference_provenance.get('references'), list)
+                or len(reference_provenance['references']) != len(request.reference_assets)):
+            raise AppError(422, 'context_ir_reference_provenance', '参考图来源记录无效；视频未提交')
+        reference_provenance['trace_id'] = request.job_id
+        trace_references(logdir, request.job_id, 'backend_inputs_validated', reference_provenance['references'])
         images, motion = [], []
         supervise = sys.platform == 'win32' and origin == 'http://127.0.0.1:8188'
         prompt_started = False
@@ -732,7 +758,8 @@ class ContextIRH3Provider(ComfyUIH3Provider):
                         required_nodes={node['class_type'] for node in draft_graph.values()},
                         runtime_required=self.settings.container_mode or not is_loopback_service(origin)
                         or self.profile_settings.get('h3_context_ir') is True
-                        or self.profile_settings.get('workflow_profile') == 'context_ir')
+                        or self.profile_settings.get('workflow_profile') == 'context_ir',
+                        multi_reference=bool(request.reference_assets))
                 except AppError as exc:
                     if exc.code == 'local_gpu_busy':
                         return None  # No upload or /prompt has been attempted.
@@ -755,8 +782,18 @@ class ContextIRH3Provider(ComfyUIH3Provider):
                             raise AppError(503, 'h3_windows_commit_unverified', '无法读取 Windows 提交内存余量；未提交 H3。')
                         raise AppError(503, 'h3_peer_memory_unverified', '无法确认本项目原生 ComfyUI（8189）的空闲状态或缓存释放；未提交 H3。')
                 for index, ref in enumerate(request.reference_assets, 1):
-                    data, (extension, mime) = await asyncio.to_thread(read_image, self.settings, ref)
-                    uploaded = await upload_verified(client, origin, data, f'picture{index}-{ref["sha256"][:16]}.{extension}', mime, folder)
+                    entry = reference_provenance['references'][index - 1]
+                    try:
+                        data, (extension, mime) = await asyncio.to_thread(read_image, self.settings, ref)
+                        with Image.open(BytesIO(data)) as photo:
+                            entry.update(width=photo.width, height=photo.height, analysis_status='preflight_passed')
+                        uploaded = await upload_verified(client, origin, data, f'picture{index}-{ref["sha256"][:16]}.{extension}', mime, folder)
+                        trace_references(logdir, request.job_id, 'upload_sha256_verified', [entry],
+                                         total_image_count=len(request.reference_assets))
+                    except Exception as error:
+                        trace_references(logdir, request.job_id, 'image_upload_failed', [entry], error=error,
+                                         function='ContextIRH3Provider.submit', image_ordinal=index)
+                        raise
                     tray[index - 1]['file'] = uploaded
                     images.append({'asset_id': ref['asset_id'], 'sha256': ref['sha256'], 'picture_index': index,
                                    'workflow_slot': tray[index - 1]['label'], 'actual_uploaded_image': uploaded})
@@ -767,6 +804,11 @@ class ContextIRH3Provider(ComfyUIH3Provider):
                     slot['file'] = uploaded
                     motion.append({'video_id': ref['video_id'], 'video_index': index, 'source_sha256': ref['source_sha256'],
                                    'processed': processed, 'workflow_slot': slot['label'], 'actual_uploaded_video': uploaded})
+                # The compiler receives the completed preflight information,
+                # while production_contract remains the original immutable
+                # shot snapshot used by preview, retry, review and assembly.
+                if request.reference_assets:
+                    args['reference_provenance'] = json.dumps(reference_provenance, ensure_ascii=False, sort_keys=True)
                 graph = build_graph(self.workflow, tray=tray, **args)
                 digest = graph_digest(graph)
                 record = {'prompt': graph, 'workflow': self.workflow, 'graph_sha256': digest,
