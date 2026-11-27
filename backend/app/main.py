@@ -80,13 +80,19 @@ class FrontendFiles(StaticFiles):
         try:
             response = await super().get_response(path, scope)
             if response.status_code != 404:
+                if normalized in ('', '.', 'index.html') or response.headers.get('content-type', '').startswith('text/html'):
+                    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+                    response.headers['Pragma'] = 'no-cache'
                 return response
         except StarletteHTTPException as exc:
             if exc.status_code != 404:
                 raise
         if normalized.startswith('assets/') and normalized not in {'assets/products','assets/videos','assets/voices'}:
             raise StarletteHTTPException(404)
-        return await super().get_response('index.html', scope)
+        response = await super().get_response('index.html', scope)
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        return response
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

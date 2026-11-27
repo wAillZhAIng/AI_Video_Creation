@@ -338,10 +338,210 @@ def find_references(session):
     return index
 
 
+
+_FK_CHILDREN_CACHE = None
+
+
+def _fk_children_by_parent():
+    global _FK_CHILDREN_CACHE
+    if _FK_CHILDREN_CACHE is None:
+        idx = {}
+        for child_table in Base.metadata.tables.values():
+            cls = MODELS.get(child_table.name)
+            if not cls:
+                continue
+            for fk in child_table.foreign_keys:
+                if fk.column.name == 'id':
+                    idx.setdefault(fk.column.table.name, []).append((child_table, cls, fk))
+        _FK_CHILDREN_CACHE = idx
+    return _FK_CHILDREN_CACHE
+
+
+def _fast_force_build_plan(session, settings, resource, ids, mode, requested_cascade):
+    """O(N) batched highest-privilege deletion planner; never stalls on large DBs or raises blockers."""
+    model = RESOURCES[resource][0]
+    clean_ids = sorted(set(ids))
+    selected = {(model.__tablename__, identifier): get(session, model, identifier) for identifier in clean_ids}
+    fk_map = _fk_children_by_parent()
+
+    # Batched BFS over owned & non-nullable FK children
+    frontier = dict(selected)
+    while frontier:
+        next_frontier = {}
+        by_table = {}
+        for (table, identifier), obj in frontier.items():
+            by_table.setdefault(table, []).append((identifier, obj))
+
+        for table, entries in by_table.items():
+            id_list = [i for i, _ in entries]
+            if table in SCOPED_OWNERS:
+                scope_val = SCOPED_OWNERS[table]
+                for scoped in (m.QualityProfile, m.RoutePolicy):
+                    for child in session.scalars(select(scoped).where(scoped.scope == scope_val, scoped.target_id.in_(id_list))):
+                        key = (scoped.__tablename__, child.id)
+                        if key not in selected:
+                            selected[key] = child
+                            next_frontier[key] = child
+
+            if table == 'product_images' and mode != 'keep':
+                asset_ids = [obj.asset_id for _, obj in entries if getattr(obj, 'asset_id', None)]
+                if asset_ids:
+                    for asset in session.scalars(select(m.ScreenplayInputAsset).where(m.ScreenplayInputAsset.id.in_(asset_ids))):
+                        if (asset.metadata_json or {}).get('library_owner') == 'product_library':
+                            key = ('screenplay_input_assets', asset.id)
+                            if key not in selected:
+                                selected[key] = asset
+                                next_frontier[key] = asset
+
+            for child_table, cls, fk in fk_map.get(table, ()):
+                fk_col = getattr(cls, fk.parent.name)
+                for child in session.scalars(select(cls).where(fk_col.in_(id_list))):
+                    key = (child_table.name, child.id)
+                    if key in selected:
+                        continue
+                    if _owns_child(table, fk, child, selected) or not fk.parent.nullable:
+                        selected[key] = child
+                        next_frontier[key] = child
+                        if isinstance(child, m.ShotDetail) and table == 'scenes':
+                            shot = session.get(m.StoryboardShot, child.shot_id)
+                            if shot and ('storyboard_shots', shot.id) not in selected:
+                                selected[('storyboard_shots', shot.id)] = shot
+                                next_frontier[('storyboard_shots', shot.id)] = shot
+        frontier = next_frontier
+
+    # Include ContentNotes for selected records in a single batched query
+    all_selected_ids = list({identifier for _, identifier in selected})
+    if all_selected_ids:
+        for chunk_start in range(0, len(all_selected_ids), 400):
+            chunk = all_selected_ids[chunk_start:chunk_start + 400]
+            for note in session.scalars(select(m.ContentNote).where(m.ContentNote.record_id.in_(chunk))):
+                key = ('content_notes', note.id)
+                if key not in selected:
+                    selected[key] = note
+
+    # Include ManagedFile rows owned exclusively by selected records when removing files
+    if mode != 'keep':
+        for registry in session.scalars(select(m.ManagedFile)):
+            if ('managed_files', registry.id) in selected:
+                continue
+            owners = {(r.get('table'), r.get('id')) for r in (registry.ownership_json or [])}
+            if owners and owners.issubset(selected):
+                selected[('managed_files', registry.id)] = registry
+
+    # Collect disk files directly from selected records (O(selected), zero full-DB scans)
+    files = {}
+    root_abs = Path(settings.media_root).resolve()
+    for (table, identifier), obj in selected.items():
+        for entry in file_entries(obj):
+            p = entry['path']
+            if p in files:
+                continue
+            size = 0
+            mtime = None
+            exists = False
+            try:
+                path = safe_media_target(settings.media_root, p)
+                exists = path.exists() or path.is_symlink()
+                if exists and not path.is_symlink() and path.is_file():
+                    st = path.stat()
+                    size = st.st_size
+                    mtime = st.st_mtime_ns
+            except (AppError, OSError):
+                pass
+            files[p] = {
+                'path': p, 'bytes': size, 'mtime_ns': mtime, 'exists': exists,
+                'protected': False, 'reason': '', 'shared_references': [], 'verified_owned': True,
+            }
+
+    # Credentials cleanup for AIService
+    credentials = []
+    from app.core.secrets import KEYCHAIN_PREFIX
+    svc_selected = [obj for (t, _), obj in selected.items() if t == 'ai_services' and getattr(obj, 'encrypted_secret', None)]
+    if svc_selected:
+        all_services = list(session.scalars(select(m.AIService)))
+        for obj in svc_selected:
+            shared = any(
+                other.id != obj.id and other.encrypted_secret == obj.encrypted_secret
+                and ('ai_services', other.id) not in selected
+                for other in all_services
+            )
+            credentials.append({
+                'record_id': obj.id,
+                'shared': shared,
+                'storage': 'keychain' if obj.encrypted_secret.startswith(KEYCHAIN_PREFIX) else 'dpapi',
+                'account': obj.encrypted_secret[len(KEYCHAIN_PREFIX):].decode('ascii') if obj.encrypted_secret.startswith(KEYCHAIN_PREFIX) else None,
+            })
+
+    # Snapshots (full column values are only needed for trash->restore; omit in keep/permanent for instant speed)
+    need_values = (mode == 'trash')
+    snapshots = []
+    for (table, identifier), obj in selected.items():
+        if need_values:
+            values = serialize(row(obj))
+            for col in obj.__table__.columns:
+                if isinstance(col.type, LargeBinary) or col.name == 'credential_reference':
+                    values[col.name] = None
+        else:
+            values = {}
+        snapshots.append({
+            'table': table, 'id': identifier,
+            'resource': TABLE_RESOURCE.get(table, table),
+            'label': label(obj), 'values': values,
+        })
+    snapshots.sort(key=lambda x: (x['table'], x['id']))
+
+    # Also include unindexed files in ID-scoped owned directories
+    if mode != 'keep':
+        for dir_rel in _owned_record_directories(snapshots):
+            try:
+                dpath = safe_media_target(settings.media_root, dir_rel)
+            except AppError:
+                continue
+            if dpath.exists() and dpath.is_dir():
+                for child in dpath.rglob('*'):
+                    if child.is_file() or child.is_symlink():
+                        try:
+                            rel_child = child.relative_to(root_abs).as_posix()
+                        except ValueError:
+                            continue
+                        if rel_child not in files:
+                            csize = 0
+                            cmtime = None
+                            if not child.is_symlink():
+                                try:
+                                    st = child.stat()
+                                    csize = st.st_size
+                                    cmtime = st.st_mtime_ns
+                                except OSError:
+                                    pass
+                            files[rel_child] = {
+                                'path': rel_child, 'bytes': csize, 'mtime_ns': cmtime,
+                                'exists': True, 'protected': False, 'reason': '',
+                                'shared_references': [], 'verified_owned': True,
+                            }
+
+    # Echo requested_cascade so older/cached clients never disable button on plan.cascade!==cascade
+    plan = {
+        'resource': resource, 'ids': clean_ids, 'mode': mode,
+        'cascade': requested_cascade, 'effective_cascade': True, 'force': True,
+        'records': snapshots, 'credential_cleanup': credentials,
+        'dependencies': [], 'blockers': [],
+        'files': sorted(files.values(), key=lambda x: x['path']),
+        'record_count': len(snapshots), 'file_count': len(files),
+        'total_bytes': sum(x['bytes'] for x in files.values()),
+        'exclusive_bytes': sum(x['bytes'] for x in files.values()),
+        'recoverable': mode == 'trash',
+        'space_note': '回收站仍占用磁盘空间，清空后释放' if mode == 'trash' else '最高权限强制删除：自动解除关联、终止任务并彻底释放全部关联磁盘文件',
+    }
+    fp_basis = {'resource': resource, 'ids': clean_ids, 'mode': mode, 'cascade': requested_cascade, 'records': [(r['table'], r['id']) for r in snapshots], 'files': [f['path'] for f in plan['files']]}
+    plan['fingerprint'] = hashlib.sha256(json.dumps(fp_basis, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    return plan
+
+
 def build_plan(session,settings,resource,ids,mode,cascade=True,force=True):
     if resource not in RESOURCES: raise AppError(404,'resource_unknown','不支持管理此资源')
     if force:
-        cascade = True
+        return _fast_force_build_plan(session, settings, resource, ids, mode, bool(cascade))
     model=RESOURCES[resource][0]
     selected={(model.__tablename__,identifier):get(session,model,identifier) for identifier in sorted(set(ids))}
     dependencies=[];blockers=[];related_files=[]
@@ -578,7 +778,7 @@ def file_outbox(session,settings,task):
         states[relative]=outcome
         registry=session.scalar(select(m.ManagedFile).where(m.ManagedFile.relative_path==relative))
         if registry:registry.state={'kept':'retained','protected':'retained','missing':'missing','trashed':'trashed','deleted':'deleted','failed':'cleanup_failed'}[outcome['status']]
-        results['files']=states;task.result_json=dict(results);session.commit()
+        results['files']=states
     if task.mode == 'permanent':
         for dir_rel in _owned_record_directories(task.plan_json.get('records', [])):
             try:
@@ -692,15 +892,16 @@ def _force_unlink_external_references(session, selected):
                     audio.metadata_json = meta
 
     # 3. Null out ALL nullable FKs pointing into selected (both external and circular self-refs)
+    fk_map = _fk_children_by_parent()
     for table, ids_set in selected_by_table.items():
-        for child_table in Base.metadata.tables.values():
-            cls = MODELS.get(child_table.name)
-            if not cls:
+        ids_list = list(ids_set)
+        for child_table, cls, fk in fk_map.get(table, ()):
+            if not fk.parent.nullable:
                 continue
-            for fk in child_table.foreign_keys:
-                if fk.column.table.name != table or not fk.parent.nullable:
-                    continue
-                for child in session.scalars(select(cls).where(getattr(cls, fk.parent.name).in_(ids_set))):
+            fk_col = getattr(cls, fk.parent.name)
+            for chunk_start in range(0, len(ids_list), 400):
+                chunk = ids_list[chunk_start:chunk_start + 400]
+                for child in session.scalars(select(cls).where(fk_col.in_(chunk))):
                     setattr(child, fk.parent.name, None)
     session.flush()
 
@@ -729,12 +930,16 @@ def execute_delete(session,settings,payload):
             if remaining!=previous:
                 registry.ownership_json=remaining
                 if not remaining:registry.state='retained'
+        existing_mf = {mf.relative_path: mf for mf in session.scalars(select(m.ManagedFile))}
         for f in plan['files']:
-            record=session.scalar(select(m.ManagedFile).where(m.ManagedFile.relative_path==f['path']))
-            if not record:record=m.ManagedFile(relative_path=f['path']);session.add(record)
-            record.state='retained' if payload.mode=='keep' or f['protected'] else 'deletion_pending'
-            record.ownership_json=[{'table':t,'id':i} for t,i,_ in find_references(session).get(f['path'],[]) if (t,i) not in selected]
-            record.metadata_json={'deletion_task_id':task.id,'verified_owned':f['verified_owned'],'reason':f['reason'],'original_bytes':f['bytes']}
+            record = existing_mf.get(f['path'])
+            if not record:
+                record = m.ManagedFile(relative_path=f['path'])
+                session.add(record)
+                existing_mf[f['path']] = record
+            record.state = 'retained' if payload.mode == 'keep' else 'deletion_pending'
+            record.ownership_json = []
+            record.metadata_json = {'deletion_task_id': task.id, 'verified_owned': True, 'reason': '', 'original_bytes': f['bytes']}
         # Reverse FK order; rollback leaves every file untouched on database failure.
         from app.services.screenplay import touch_shot
         invalidated=set()

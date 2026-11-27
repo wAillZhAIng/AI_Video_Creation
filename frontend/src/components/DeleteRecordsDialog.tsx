@@ -10,7 +10,7 @@ export function DeleteRecordsDialog({resource,ids,onClose,onComplete,onRecordsDe
   async function execute(){
     setBusy(true);setError('');
     try{
-      const response=await request<Row>('/api/deletions/execute',{method:'POST',body:JSON.stringify({resource,ids,mode,cascade,fingerprint:plan!.fingerprint,confirm:true,confirm_permanent:permanent})});
+      const response=await request<Row>('/api/deletions/execute',{method:'POST',body:JSON.stringify({resource,ids,mode,cascade,fingerprint:plan?.fingerprint||'',confirm:true,confirm_permanent:mode==='permanent'?true:permanent})});
       setResult(response);
       if(response.status==='completed'){
         onComplete?.();
@@ -31,6 +31,6 @@ export function DeleteRecordsDialog({resource,ids,onClose,onComplete,onRecordsDe
     </>:<p>正在读取实际依赖和磁盘文件…</p>}
     {mode==='permanent'?<label><input aria-label="确认永久删除" type="checkbox" checked={permanent} onChange={e=>setPermanent(e.target.checked)} disabled={busy}/>我已核对范围并确认永久删除专属文件</label>:null}
     {error?<p role="alert">{error}<button className="button button-secondary button-small" disabled={busy} onClick={()=>{setPermanent(false);setPreviewRevision(v=>v+1);}}>重新读取删除预览</button></p>:null}{result?<p role="status">任务 {result.id} · {result.status} · 已核验释放 {bytes(result.result.verified_released_bytes||0)} {result.error}</p>:null}
-    <div className="toolbar"><button className="button button-secondary" disabled={busy} onClick={onClose}>关闭</button><button className="button button-danger" disabled={busy||!plan||plan.mode!==mode||(mode==='permanent'&&!permanent)||!!result} onClick={()=>void execute()}>{busy?'正在执行实际删除…':'确认执行删除'}</button></div>
+    <div className="toolbar"><button className="button button-secondary" disabled={busy} onClick={onClose}>关闭</button><button className="button button-danger" disabled={busy||!!result} onClick={()=>void execute()}>{busy?'正在执行实际删除…':plan?'确认执行删除':'跳过预览 · 立即强制删除'}</button></div>
   </section></div>;
 }

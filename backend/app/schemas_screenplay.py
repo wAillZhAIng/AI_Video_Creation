@@ -60,7 +60,7 @@ class ImportConfirm(Strict):
 
 class DeletePreview(Strict):
     resource: str
-    ids: list[str] = Field(min_length=1, max_length=100)
+    ids: list[str] = Field(min_length=1, max_length=10000)
     mode: Literal['keep','trash','permanent'] = 'permanent'
     cascade: bool = True
 
