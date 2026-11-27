@@ -128,8 +128,9 @@ def references(identifier: str, session: Session = Depends(get_db)):
 
 
 @router.delete('/{identifier}')
-def archive(identifier: str, revision: int = Query(ge=1), session: Session = Depends(get_db)):
-    return service.archive_video(session, identifier, revision)
+def archive(identifier: str, request: Request, revision: int | None = Query(default=None, ge=1),
+            mode: str = Query(default='permanent'), session: Session = Depends(get_db)):
+    return service.archive_video(session, identifier, revision, settings=request.app.state.settings, mode=mode)
 
 
 @router.get('/{identifier}/analyses')

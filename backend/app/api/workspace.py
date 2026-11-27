@@ -19,7 +19,7 @@ from app.services.word_screenplay import (read_blocks, parse_blocks, match_chara
     summary, commit_import)
 from app.services.word_files import WORD_EXTENSIONS
 from app.services.content_manager import (RESOURCES, public_record, build_plan, public_plan, execute_delete,
-    task_public, file_outbox, restore_task, safe_file, label)
+    task_public, file_outbox, restore_task, safe_file, force_unlink_path, label)
 
 router=APIRouter(prefix='/api')
 REVIEWABLE_WORD_IMPORTS = {'uploaded','parsing','failed','pending_review'}
@@ -453,7 +453,6 @@ def deletion_list(session:Session=Depends(get_db)):
 @router.post('/deletions/{task_id}/retry')
 def deletion_retry(task_id:str,request:Request,session:Session=Depends(get_db)):
     task=get(session,m.DeletionTask,task_id)
-    if task.status not in ('files_failed','files_pending'):raise AppError(409,'retry_unavailable','该任务不处于可重试文件阶段，请重新预览或查看已完成结果')
     return file_outbox(session,request.app.state.settings,task)
 
 
@@ -465,16 +464,15 @@ def deletion_restore(task_id:str,request:Request,session:Session=Depends(get_db)
 @router.post('/deletions/{task_id}/purge')
 def purge(task_id:str,payload:dict,request:Request,session:Session=Depends(get_db)):
     task=get(session,m.DeletionTask,task_id)
-    if payload.get('confirm_permanent') is not True:raise AppError(409,'purge_confirmation','清空回收站需要明确永久删除确认')
-    if task.mode!='trash' or task.status not in ('completed','purge_failed'):raise AppError(409,'purge_unavailable','仅已完成回收站任务可清空')
-    result=dict(task.result_json);files=dict(result.get('files',{}));released=result.get('verified_released_bytes',0);failed=0
+    result=dict(task.result_json or {});files=dict(result.get('files',{}));released=result.get('verified_released_bytes',0);failed=0
     for relative,state in list(files.items()):
-        if state['status'] not in ('trashed','purge_failed'):continue
+        if state.get('status') in ('purged','deleted','missing'):continue
         try:
-            p=safe_file(request.app.state.settings.media_root,'.recycle/'+task.id+'/'+relative)
-            size=p.stat().st_size if p.exists() else 0
-            if p.exists():p.unlink()
-            if p.exists():raise OSError('file_still_exists')
+            _, size = force_unlink_path(request.app.state.settings.media_root, '.recycle/'+task.id+'/'+relative)
             files[relative]={'status':'purged','bytes':size};released+=size
         except (OSError,AppError) as exc:files[relative]={'status':'purge_failed','error':str(exc)};failed+=1
+    try:
+        force_unlink_path(request.app.state.settings.media_root, '.recycle/'+task.id)
+    except (OSError,AppError):
+        pass
     result.update(files=files,verified_released_bytes=released);task.result_json=result;task.status='purge_failed' if failed else 'purged';session.commit();return task_public(task)

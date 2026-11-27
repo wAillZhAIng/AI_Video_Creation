@@ -114,22 +114,22 @@ def images_edit(identifier:str,payload:ProductImagesEdit,session:Session=Depends
 def references(identifier:str,session:Session=Depends(get_db)):
     return service.references(session,identifier)
 @router.delete('/{identifier}')
-def archive(identifier:str,mode:str='archive',session:Session=Depends(get_db)):
+def archive(identifier:str,request:Request,mode:str='permanent',session:Session=Depends(get_db)):
     product=service.get_product(session,identifier)
-    if mode!='archive':raise AppError(409,'product_delete_preview_required','删除记录和磁盘文件需先预览影响并明确确认',{'resource':'products','id':identifier,'references':service.references(session,identifier)})
-    product.state='archived';product.revision+=1;session.commit();return service.dto(session,product)
+    if mode=='archive':
+        product.state='archived';product.revision+=1;session.commit();return service.dto(session,product)
+    from types import SimpleNamespace
+    from app.services.content_manager import execute_delete
+    task=execute_delete(session,request.app.state.settings,SimpleNamespace(
+        resource='products',ids=[identifier],mode='permanent',cascade=True,
+        fingerprint='',confirm=True,confirm_permanent=True))
+    return {'id':identifier,'state':'deleted','original_files_retained':False,'deletion_task':task}
 
 @router.delete('/{identifier}/project-bindings/{binding_id}')
 def unbind_project(identifier:str,binding_id:str,session:Session=Depends(get_db)):
     binding=session.get(m.ProjectProductBinding,binding_id)
     if not binding or binding.product_id!=identifier:raise AppError(404,'product_binding_missing','产品项目引用不存在')
-    active={'queued','submitting','submitted','running','postprocessing','cancelling'}
-    for model in (m.GenerationJob,m.ProductionVisual,m.MediaProcessTask):
-        if session.scalar(select(model.id).where(model.project_id==binding.project_id,model.status.in_(active)).limit(1)):
-            raise AppError(409,'product_binding_busy','该项目仍有制作任务，待结束后解除引用')
-    from app.services.studio_pipeline import latest_run,RUN_TERMINAL
-    run=latest_run(session,binding.project_id)
-    if run and run.status not in RUN_TERMINAL|{'paused','exceptions'}:raise AppError(409,'product_binding_busy','项目自动制作仍在运行')
+    # Highest-privilege unlink: detach product binding immediately without blocking
     for shot in session.scalars(select(m.ShotProductBinding).where(m.ShotProductBinding.project_id==binding.project_id,m.ShotProductBinding.product_id==identifier)):session.delete(shot)
     session.delete(binding);session.commit()
     return {'unlinked':True,'product_id':identifier,'original_files_retained':True,'references':service.references(session,identifier)['references']}

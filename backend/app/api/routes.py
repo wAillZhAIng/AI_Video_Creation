@@ -536,25 +536,28 @@ def reject_shot(shot_id: str, payload: ReviewRequest, session: Session = Depends
 
 
 @router.delete("/shots/{shot_id}")
-def delete_shot(shot_id: str, session: Session = Depends(get_db)) -> dict[str, Any]:
+def delete_shot(shot_id: str, request: Request, permanent: bool = False, session: Session = Depends(get_db)) -> dict[str, Any]:
     shot = required(session, StoryboardShot, shot_id, "分镜")
+    if permanent:
+        from types import SimpleNamespace
+        from app.services.content_manager import execute_delete
+        task = execute_delete(session, request.app.state.settings, SimpleNamespace(
+            resource="shots", ids=[shot.id], mode="permanent", cascade=True,
+            fingerprint="", confirm=True, confirm_permanent=True,
+        ))
+        return {"id": shot_id, "status": "deleted", "deleted": True, "history_preserved": False, "deletion_task": task}
     if shot.status == "deleted":
         return {"id": shot.id, "status": "deleted", "deleted": True}
-    active_job = session.scalar(
-        select(GenerationJob.id)
-        .where(
+    active_jobs = list(session.scalars(
+        select(GenerationJob).where(
             GenerationJob.shot_id == shot.id,
             GenerationJob.status.in_(["submitting", "queued", "submitted", "running", "postprocessing", "cancelling", "reconciling", "unknown"]),
         )
-        .limit(1)
-    )
-    if active_job:
-        raise AppError(
-            409,
-            "shot_has_active_generation",
-            "分镜有运行中的生成任务，取消任务后才能删除",
-            {"job_id": active_job},
-        )
+    ))
+    for job in active_jobs:
+        job.status = "cancelled"
+        job.error_code = "shot_force_deleted"
+        job.error_message = "分镜已被最高权限删除，关联任务已自动取消" 
     previous_status = shot.status
     invalidated_videos = invalidate_shot_videos(session, shot.id)
     shot.status = "deleted"

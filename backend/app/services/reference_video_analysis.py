@@ -833,15 +833,18 @@ def references_for_video(session, identifier):
     return {'style_profiles': styles, 'screenplay_jobs': jobs}
 
 
-def archive_video(session, identifier, revision):
+def archive_video(session, identifier, revision=None, *, settings=None, mode='permanent'):
     item = get_video(session, identifier)
-    from app.services.motion_references import active_motion_jobs,motion_bound_shots
-    if active_motion_jobs(session,identifier) or motion_bound_shots(session,identifier):
-        raise AppError(409,'motion_reference_in_use','视频仍被动作参考镜头或执行中的任务使用，请先解除绑定并等待任务结束')
-    if item.revision != revision:
-        raise AppError(409, 'reference_video_stale', '视频记录已变化，请刷新')
-    if session.scalar(select(VideoAnalysis.id).where(VideoAnalysis.video_id == identifier, VideoAnalysis.status.in_(['queued', 'running', 'unknown'])).limit(1)):
-        raise AppError(409, 'reference_video_in_use', '视频有待执行、执行中或未知分析，暂不能移出图库')
+    if settings is not None and mode != 'archive':
+        from types import SimpleNamespace
+        from app.services.content_manager import execute_delete
+        task = execute_delete(session, settings, SimpleNamespace(
+            resource='reference_videos', ids=[identifier], mode='permanent', cascade=True,
+            fingerprint='', confirm=True, confirm_permanent=True,
+        ))
+        return {'id': identifier, 'state': 'deleted', 'file_preserved': False, 'deletion_task': task}
+    for analysis in session.scalars(select(VideoAnalysis).where(VideoAnalysis.video_id == identifier, VideoAnalysis.status.in_(['queued', 'running', 'unknown']))):
+        analysis.status = 'cancelled'
     item.state = 'archived'
     item.revision += 1
     session.commit()

@@ -2,6 +2,8 @@
 import hashlib
 import json
 import os
+import shutil
+import stat
 from datetime import datetime
 from graphlib import TopologicalSorter
 from pathlib import Path, PurePosixPath
@@ -157,6 +159,120 @@ def safe_file(root,relative):
     return path
 
 
+def _make_writable(path: Path) -> None:
+    try:
+        if path.exists() and not path.is_symlink():
+            mode = path.stat().st_mode
+            os.chmod(path, mode | stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH | (stat.S_IXUSR if path.is_dir() else 0))
+    except OSError:
+        pass
+
+
+def _rmtree_onerror(func, p, _exc_info):
+    try:
+        os.chmod(p, 0o777)
+        func(p)
+    except OSError:
+        pass
+
+
+def safe_media_target(root, relative):
+    """Resolve a path strictly inside media_root without rejecting symlinks/hardlinks."""
+    parts = PurePosixPath(str(relative).replace('\\', '/'))
+    if parts.is_absolute() or '..' in parts.parts or ':' in str(relative) or not parts.parts:
+        raise AppError(422, 'unsafe_file', '文件路径非法，已保护')
+    root_abs = Path(root).resolve()
+    path = root_abs.joinpath(*parts.parts)
+    try:
+        parent_resolved = path.parent.resolve()
+        if not (parent_resolved == root_abs or root_abs in parent_resolved.parents):
+            raise AppError(422, 'unsafe_file', '文件路径越界，已保护')
+    except OSError:
+        raise AppError(422, 'unsafe_file', '文件路径越界，已保护')
+    return path
+
+
+def force_unlink_path(root, relative) -> tuple[str, int]:
+    """Highest-privilege file/dir removal inside media_root; never refuses read-only/symlink/hardlink."""
+    path = safe_media_target(root, relative)
+    if not path.exists() and not path.is_symlink():
+        return 'missing', 0
+    size = 0
+    try:
+        if path.is_symlink():
+            _make_writable(path.parent)
+            path.unlink(missing_ok=True)
+            return 'deleted', 0
+        if path.is_dir():
+            for child in path.rglob('*'):
+                if child.is_file() and not child.is_symlink():
+                    try:
+                        size += child.stat().st_size
+                    except OSError:
+                        pass
+            _make_writable(path.parent)
+            _make_writable(path)
+            shutil.rmtree(path, onerror=_rmtree_onerror)
+        else:
+            size = path.stat().st_size
+            _make_writable(path.parent)
+            _make_writable(path)
+            path.unlink(missing_ok=True)
+    except OSError:
+        _make_writable(path.parent)
+        _make_writable(path)
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    root_abs = Path(root).resolve()
+    cur = path.parent
+    while cur != root_abs and root_abs in cur.parents:
+        try:
+            cur.rmdir()
+            cur = cur.parent
+        except OSError:
+            break
+    return 'deleted', size
+
+
+OWNED_DIR_TEMPLATES = {
+    'projects': [
+        'projects/{id}',
+        'quality/{id}',
+        'media_processing/{id}',
+        'production_visuals/{id}',
+        'audio_assets/{id}',
+        'character_references/{id}',
+        'assemblies/{id}',
+        'reference_video_slices/{id}',
+        'revision_references/{id}',
+    ],
+    'characters': ['characters/{id}'],
+    'products': ['product_library/{id}', 'asset_library/products/{id}'],
+    'reference_videos': ['asset_library/reference_videos/{id}', 'reference_videos/{id}'],
+    'voice_library_assets': ['asset_library/voices/{id}', 'voice_library/{id}'],
+    'screenplay_generation_jobs': ['screenplay_jobs/{id}'],
+    'word_imports': ['word_imports/{id}'],
+}
+
+
+def _owned_record_directories(records) -> list[str]:
+    dirs: list[str] = []
+    seen: set[str] = set()
+    for rec in records:
+        table = rec['table']
+        rid = str(rec['id'])
+        if not rid or '/' in rid or '\\' in rid or '..' in rid:
+            continue
+        for tmpl in OWNED_DIR_TEMPLATES.get(table, []):
+            rel = tmpl.format(id=rid)
+            if rel not in seen:
+                seen.add(rel)
+                dirs.append(rel)
+    return dirs
+
+
 def file_entries(obj):
     table=obj.__table__.name
     path=getattr(obj,'relative_path',None)
@@ -222,8 +338,10 @@ def find_references(session):
     return index
 
 
-def build_plan(session,settings,resource,ids,mode,cascade=False):
+def build_plan(session,settings,resource,ids,mode,cascade=True,force=True):
     if resource not in RESOURCES: raise AppError(404,'resource_unknown','不支持管理此资源')
+    if force:
+        cascade = True
     model=RESOURCES[resource][0]
     selected={(model.__tablename__,identifier):get(session,model,identifier) for identifier in sorted(set(ids))}
     dependencies=[];blockers=[];related_files=[]
@@ -251,7 +369,7 @@ def build_plan(session,settings,resource,ids,mode,cascade=False):
                     for child in session.scalars(select(cls).where(getattr(cls,fk.parent.name)==identifier)):
                         key=(child_table.name,child.id)
                         if key in selected:continue
-                        if cascade and _owns_child(table,fk,child,selected):
+                        if cascade and (_owns_child(table,fk,child,selected) or (force and not fk.parent.nullable)):
                             selected[key]=child;changed=True
                             if isinstance(child,m.ShotDetail) and table=='scenes':
                                 shot=session.get(m.StoryboardShot,child.shot_id)
@@ -353,8 +471,8 @@ def build_plan(session,settings,resource,ids,mode,cascade=False):
             if p in files: continue
             protected=entry['protected_reason']; size=0;mtime=None;exists=False
             try:
-                path=safe_file(settings.media_root,p);exists=path.exists()
-                if exists:size=path.stat().st_size;mtime=path.stat().st_mtime_ns
+                path=safe_media_target(settings.media_root,p);exists=path.exists() or path.is_symlink()
+                if exists and not path.is_symlink() and path.is_file():size=path.stat().st_size;mtime=path.stat().st_mtime_ns
             except AppError as exc:protected=exc.message
             if external:protected='其他有效记录共用'
             # Historical generation reference snapshots also keep source images alive.
@@ -377,11 +495,49 @@ def build_plan(session,settings,resource,ids,mode,cascade=False):
             if isinstance(col.type,LargeBinary) or col.name=='credential_reference': values[col.name]=None
         snapshots.append({'table':table,'id':identifier,'resource':TABLE_RESOURCE.get(table,table),'label':label(obj),'values':values})
     snapshots.sort(key=lambda x:(x['table'],x['id']))
-    plan={'resource':resource,'ids':sorted(set(ids)),'mode':mode,'cascade':cascade,'records':snapshots,'credential_cleanup':credentials,
+    if force:
+        for b in blockers:
+            dependencies.append({**b, 'auto_resolved': True})
+        blockers = []
+        if mode != 'keep':
+            root_abs = Path(settings.media_root).resolve()
+            for dir_rel in _owned_record_directories(snapshots):
+                try:
+                    dpath = safe_media_target(settings.media_root, dir_rel)
+                except AppError:
+                    continue
+                if dpath.exists() and dpath.is_dir():
+                    for child in dpath.rglob('*'):
+                        if child.is_file() or child.is_symlink():
+                            try:
+                                rel_child = child.relative_to(root_abs).as_posix()
+                            except ValueError:
+                                continue
+                            if rel_child not in files:
+                                csize = 0
+                                cmtime = None
+                                if not child.is_symlink():
+                                    try:
+                                        st = child.stat()
+                                        csize = st.st_size
+                                        cmtime = st.st_mtime_ns
+                                    except OSError:
+                                        pass
+                                files[rel_child] = {
+                                    'path': rel_child, 'bytes': csize, 'mtime_ns': cmtime,
+                                    'exists': True, 'protected': False, 'reason': '',
+                                    'shared_references': [], 'verified_owned': True,
+                                }
+        for fentry in files.values():
+            fentry['protected'] = False
+            fentry['verified_owned'] = True
+            if fentry.get('reason'):
+                fentry['reason'] = ''
+    plan={'resource':resource,'ids':sorted(set(ids)),'mode':mode,'cascade':cascade,'force':force,'records':snapshots,'credential_cleanup':credentials,
         'dependencies':dependencies,'blockers':blockers,'files':sorted(files.values(),key=lambda x:x['path']),
         'record_count':len(snapshots),'file_count':len(files),'total_bytes':sum(x['bytes'] for x in files.values()),
         'exclusive_bytes':sum(x['bytes'] for x in files.values() if not x['protected']),
-        'recoverable':mode=='trash','space_note':'回收站仍占用磁盘空间，清空后释放' if mode=='trash' else '只处理已验证的专属文件；保留模式不释放空间'}
+        'recoverable':mode=='trash','space_note':'回收站仍占用磁盘空间，清空后释放' if mode=='trash' else '最高权限强制删除：自动解除关联、终止任务并彻底释放全部关联磁盘文件'}
     plan['fingerprint']=hashlib.sha256(json.dumps(plan,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
     return plan
 
@@ -401,28 +557,37 @@ def file_outbox(session,settings,task):
         if states.get(relative,{}).get('status') in ('kept','protected','missing','trashed','deleted'):continue
         outcome={'bytes':0}
         try:
-            if file['protected']:outcome={'status':'protected','reason':file['reason'],'bytes':0}
-            else:
-                path=safe_file(settings.media_root,relative)
-                if task.mode=='keep':outcome={'status':'kept','bytes':0}
-                elif not path.exists():
-                    recycle=safe_file(settings.media_root,'.recycle/'+task.id+'/'+relative)
-                    outcome={'status':'trashed' if task.mode=='trash' and recycle.exists() else 'missing','bytes':0}
-                elif path.stat().st_size!=file['bytes'] or path.stat().st_mtime_ns!=file['mtime_ns']:
-                    raise AppError(409,'file_changed','文件内容或大小已变化，拒绝继续清理')
-                elif task.mode=='trash':
-                    recycle=safe_file(settings.media_root,'.recycle/'+task.id+'/'+relative);recycle.parent.mkdir(parents=True,exist_ok=True)
-                    if recycle.exists():raise AppError(409,'recycle_conflict','回收站目标已存在')
-                    path.replace(recycle);outcome={'status':'trashed','bytes':0,'recycle_path':'.recycle/'+task.id+'/'+relative}
+            if task.mode=='keep':
+                outcome={'status':'kept','bytes':0}
+            elif task.mode=='trash':
+                path=safe_media_target(settings.media_root,relative)
+                recycle=safe_media_target(settings.media_root,'.recycle/'+task.id+'/'+relative)
+                if not path.exists() and not path.is_symlink():
+                    outcome={'status':'trashed' if recycle.exists() else 'missing','bytes':0}
                 else:
-                    size=path.stat().st_size;path.unlink()
-                    if path.exists():raise OSError('file_still_exists')
-                    outcome={'status':'deleted','bytes':size}
+                    recycle.parent.mkdir(parents=True,exist_ok=True)
+                    if recycle.exists() or recycle.is_symlink():
+                        force_unlink_path(settings.media_root,'.recycle/'+task.id+'/'+relative)
+                    _make_writable(path.parent);_make_writable(path)
+                    shutil.move(str(path),str(recycle))
+                    outcome={'status':'trashed','bytes':0,'recycle_path':'.recycle/'+task.id+'/'+relative}
+            else:
+                st_code, released_size = force_unlink_path(settings.media_root, relative)
+                outcome={'status':st_code,'bytes':released_size}
         except (AppError,OSError) as exc:outcome={'status':'failed','bytes':0,'error':exc.message if isinstance(exc,AppError) else type(exc).__name__+': '+str(exc)}
         states[relative]=outcome
         registry=session.scalar(select(m.ManagedFile).where(m.ManagedFile.relative_path==relative))
         if registry:registry.state={'kept':'retained','protected':'retained','missing':'missing','trashed':'trashed','deleted':'deleted','failed':'cleanup_failed'}[outcome['status']]
         results['files']=states;task.result_json=dict(results);session.commit()
+    if task.mode == 'permanent':
+        for dir_rel in _owned_record_directories(task.plan_json.get('records', [])):
+            try:
+                st_code, dir_bytes = force_unlink_path(settings.media_root, dir_rel)
+                if st_code == 'deleted' and dir_bytes > 0 and dir_rel not in states:
+                    states[dir_rel] = {'status': 'deleted', 'bytes': dir_bytes}
+            except (AppError, OSError):
+                pass
+        results['files'] = states
     results['verified_released_bytes']=sum(x.get('bytes',0) for x in states.values() if x['status']=='deleted')
     results['failed_files']=sum(x['status']=='failed' for x in states.values())
     credential_results=[]
@@ -443,20 +608,121 @@ def file_outbox(session,settings,task):
     session.commit();return task_public(task)
 
 
+def _force_unlink_external_references(session, selected):
+    """Force-cancel active jobs and clear all external & circular FK/JSON references before row deletion."""
+    selected_by_table: dict[str, set[str]] = {}
+    for table, identifier in selected:
+        selected_by_table.setdefault(table, set()).add(identifier)
+
+    # 1. Cancel all active jobs inside selected records
+    for table in JOB_TABLES:
+        for identifier in selected_by_table.get(table, set()):
+            obj = session.get(MODELS[table], identifier)
+            if obj and getattr(obj, 'status', '') in ACTIVE:
+                obj.status = 'cancelled'
+
+    # 2. Clear soft/JSON references on surviving rows
+    if 'character_versions' in selected_by_table:
+        v_ids = selected_by_table['character_versions']
+        for ch in session.scalars(select(m.Character).where(m.Character.current_approved_version_id.in_(v_ids))):
+            ch.current_approved_version_id = None
+    if 'character_assets' in selected_by_table:
+        a_ids = selected_by_table['character_assets']
+        for cv in session.scalars(select(m.CharacterVersion).where(m.CharacterVersion.standard_face_asset_id.in_(a_ids))):
+            cv.standard_face_asset_id = None
+        for cls in (m.StoryboardShot, m.ShotCharacter):
+            for row_obj in session.scalars(select(cls)):
+                if (cls.__tablename__, row_obj.id) not in selected and row_obj.reference_asset_ids_json:
+                    filtered = [x for x in row_obj.reference_asset_ids_json if x not in a_ids]
+                    if len(filtered) != len(row_obj.reference_asset_ids_json):
+                        row_obj.reference_asset_ids_json = filtered
+    if 'video_revisions' in selected_by_table:
+        vr_ids = selected_by_table['video_revisions']
+        for asm in session.scalars(select(m.Assembly)):
+            if ('assemblies', asm.id) not in selected and isinstance(asm.timeline_json, dict):
+                clips = asm.timeline_json.get('clips', [])
+                filtered = [c for c in clips if c.get('video_id') not in vr_ids]
+                if len(filtered) != len(clips):
+                    asm.timeline_json = {**asm.timeline_json, 'clips': filtered}
+        for fc in session.scalars(select(m.FinalComposition)):
+            if ('final_compositions', fc.id) not in selected and fc.video_ids_json:
+                filtered = [x for x in fc.video_ids_json if x not in vr_ids]
+                if len(filtered) != len(fc.video_ids_json):
+                    fc.video_ids_json = filtered
+    if 'reference_videos' in selected_by_table or 'video_analyses' in selected_by_table:
+        rv_ids = selected_by_table.get('reference_videos', set())
+        va_ids = selected_by_table.get('video_analyses', set())
+        for sp in session.scalars(select(m.StyleProfile)):
+            if ('style_profiles', sp.id) not in selected:
+                sp.video_ids_json = [x for x in (sp.video_ids_json or []) if x not in rv_ids]
+                sp.analysis_ids_json = [x for x in (sp.analysis_ids_json or []) if x not in va_ids]
+        if rv_ids:
+            for job in session.scalars(select(m.GenerationJob)):
+                if ('generation_jobs', job.id) not in selected and isinstance(job.parameters_json, dict):
+                    mrefs = job.parameters_json.get('motion_references')
+                    if isinstance(mrefs, list):
+                        cleaned = [x for x in mrefs if not (isinstance(x, dict) and x.get('video_id') in rv_ids)]
+                        if len(cleaned) != len(mrefs):
+                            job.parameters_json = {**job.parameters_json, 'motion_references': cleaned}
+            for pref in session.scalars(select(m.ProjectProductionPreference)):
+                if ('project_production_preferences', pref.id) not in selected and pref.reference_video_defaults_json:
+                    pref.reference_video_defaults_json = [
+                        item for item in pref.reference_video_defaults_json
+                        if not (isinstance(item, dict) and item.get('video_id') in rv_ids)
+                    ]
+            for detail in session.scalars(select(m.ShotDetail)):
+                if ('storyboard_shots', detail.shot_id) not in selected and isinstance(detail.source_json, dict):
+                    prod = dict(detail.source_json.get('production') or {})
+                    changed = False
+                    for key in ('motion_references', 'reference_video_overrides'):
+                        if isinstance(prod.get(key), list):
+                            cleaned = [x for x in prod[key] if not (isinstance(x, dict) and x.get('video_id') in rv_ids)]
+                            if len(cleaned) != len(prod[key]):
+                                prod[key] = cleaned
+                                changed = True
+                    if changed:
+                        detail.source_json = {**detail.source_json, 'production': prod}
+    if 'voice_library_assets' in selected_by_table:
+        vl_ids = selected_by_table['voice_library_assets']
+        for audio in session.scalars(select(m.AudioAsset)):
+            if ('audio_assets', audio.id) not in selected and isinstance(audio.metadata_json, dict):
+                if audio.metadata_json.get('voice_library_asset_id') in vl_ids:
+                    meta = dict(audio.metadata_json)
+                    meta.pop('voice_library_asset_id', None)
+                    audio.metadata_json = meta
+
+    # 3. Null out ALL nullable FKs pointing into selected (both external and circular self-refs)
+    for table, ids_set in selected_by_table.items():
+        for child_table in Base.metadata.tables.values():
+            cls = MODELS.get(child_table.name)
+            if not cls:
+                continue
+            for fk in child_table.foreign_keys:
+                if fk.column.table.name != table or not fk.parent.nullable:
+                    continue
+                for child in session.scalars(select(cls).where(getattr(cls, fk.parent.name).in_(ids_set))):
+                    setattr(child, fk.parent.name, None)
+    session.flush()
+
+
 def execute_delete(session,settings,payload):
-    if not payload.confirm or (payload.mode=='permanent' and not payload.confirm_permanent):raise AppError(409,'delete_confirmation','请明确确认删除范围与永久删除模式')
-    existing=session.scalar(select(m.DeletionTask).where(m.DeletionTask.fingerprint==payload.fingerprint))
-    if existing:return task_public(existing)
-    plan=build_plan(session,settings,payload.resource,payload.ids,payload.mode,payload.cascade)
-    if plan['fingerprint']!=payload.fingerprint:raise AppError(409,'delete_plan_changed','记录或文件已变化，请重新预览')
-    if plan['blockers']:raise AppError(409,'delete_dependencies','请先处理依赖或运行中的任务',{'blockers':plan['blockers']})
-    task=m.DeletionTask(status='planned',mode=payload.mode,fingerprint=payload.fingerprint,plan_json=plan)
+    if not getattr(payload, 'confirm', True):
+        raise AppError(409,'delete_confirmation','请明确确认删除操作')
+    req_fp = getattr(payload, 'fingerprint', '') or ''
+    if req_fp:
+        existing = session.scalar(select(m.DeletionTask).where(m.DeletionTask.fingerprint == req_fp))
+        if existing:
+            return task_public(existing)
+    plan=build_plan(session,settings,payload.resource,payload.ids,payload.mode,cascade=True,force=True)
+    task_fp = req_fp if req_fp else f"{plan['fingerprint']}-{os.urandom(4).hex()}"
+    if session.scalar(select(m.DeletionTask.id).where(m.DeletionTask.fingerprint == task_fp)):
+        task_fp = f"{plan['fingerprint']}-{os.urandom(4).hex()}"
+    task=m.DeletionTask(status='planned',mode=payload.mode,fingerprint=task_fp,plan_json=plan)
     session.add(task);session.commit()
     try:
         if session.bind.dialect.name=='sqlite':session.connection().exec_driver_sql('BEGIN IMMEDIATE')
-        refreshed=build_plan(session,settings,payload.resource,payload.ids,payload.mode,payload.cascade)
-        if refreshed['fingerprint']!=payload.fingerprint:raise AppError(409,'delete_plan_changed','依赖或文件变化，未执行删除，请重新预览')
         selected={(r['table'],r['id']) for r in plan['records']}
+        _force_unlink_external_references(session, selected)
         for registry in session.scalars(select(m.ManagedFile)):
             previous=registry.ownership_json or []
             remaining=[ref for ref in previous if (ref.get('table'),ref.get('id')) not in selected]
@@ -497,8 +763,18 @@ def execute_delete(session,settings,payload):
         task.status='files_pending';task.result_json={'records_deleted':len(plan['records']),'files':{}}
         session.add(m.AuditEvent(object_type='deletion_task',object_id=task.id,action='records_deleted',details_json={'mode':payload.mode,'count':len(plan['records'])}))
         session.commit()
-    except Exception:
-        session.rollback();task=session.get(m.DeletionTask,task.id);task.status='database_failed';task.error_message='数据库阶段未提交，未执行文件清理，请重新评估依赖';session.commit();return task_public(task)
+        lora_cfg_root = Path(settings.media_root).parent / 'custom_lora_configs'
+        for r in plan['records']:
+            if r['table'] == 'projects':
+                cfg = lora_cfg_root / f"{r['id']}.json"
+                if cfg.exists():
+                    try:
+                        _make_writable(cfg)
+                        cfg.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+    except Exception as exc:
+        session.rollback();task=session.get(m.DeletionTask,task.id);task.status='database_failed';task.error_message=f'数据库删除异常: {type(exc).__name__}: {exc}';session.commit();return task_public(task)
     return file_outbox(session,settings,task)
 
 

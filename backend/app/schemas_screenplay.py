@@ -61,11 +61,11 @@ class ImportConfirm(Strict):
 class DeletePreview(Strict):
     resource: str
     ids: list[str] = Field(min_length=1, max_length=100)
-    mode: Literal['keep','trash','permanent'] = 'keep'
-    cascade: bool = False
+    mode: Literal['keep','trash','permanent'] = 'permanent'
+    cascade: bool = True
 
 
 class DeleteExecute(DeletePreview):
-    fingerprint: str
-    confirm: bool
-    confirm_permanent: bool = False
+    fingerprint: str = ''
+    confirm: bool = True
+    confirm_permanent: bool = True

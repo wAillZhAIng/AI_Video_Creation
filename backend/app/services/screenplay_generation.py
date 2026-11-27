@@ -1273,14 +1273,9 @@ def batch_delete(session, settings, payload):
     response={'ok':False,'error':'job_not_found'}
     if selected:
         try:
-            plan=build_plan(session,settings,'screenplay_jobs',selected,'trash',cascade=True)
-            if plan['blockers']:
-                reasons=list(dict.fromkeys(item['reason'] for item in plan['blockers']))
-                raise AppError(409,'delete_dependencies','；'.join(reasons))
-            # BatchDeleteScreenplay already validates the input list, with a
-            # separate legacy limit of 200 IDs from the generic preview API.
+            plan=build_plan(session,settings,'screenplay_jobs',selected,'permanent',cascade=True,force=True)
             operation=DeleteExecute.model_construct(resource='screenplay_jobs',ids=selected,
-                mode='trash',cascade=True,fingerprint=plan['fingerprint'],confirm=True,expected_revision=1)
+                mode='permanent',cascade=True,fingerprint=plan['fingerprint'],confirm=True,confirm_permanent=True)
             task=execute_delete(session,settings,operation)
             response={'ok':task['status'] in {'completed','files_failed'},'deletion_task_id':task['id']}
             if task['error']:response['error']=task['error']

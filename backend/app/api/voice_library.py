@@ -118,8 +118,12 @@ def reanalyze(identifier:str,request:Request,session:Session=Depends(get_db)):
     return library.reanalyze(session,request.app.state.settings,identifier)
 
 @router.delete('/{identifier}')
-def delete(identifier: str, mode: str = 'remove', session: Session = Depends(get_db)):
+def delete(identifier: str, request: Request, mode: str = 'permanent', session: Session = Depends(get_db)):
     library.get_asset(session, identifier)
-    raise AppError(409, 'voice_delete_preview_required', '请先在内容管理中预览引用与文件影响，再确认删除或仅解除关联',
-                   {'resource': 'voice_library', 'id': identifier, 'mode': mode,
-                    'references': library.references(session, identifier)})
+    from types import SimpleNamespace
+    from app.services.content_manager import execute_delete
+    del_mode = 'keep' if mode == 'keep' else 'trash' if mode == 'trash' else 'permanent'
+    task = execute_delete(session, request.app.state.settings, SimpleNamespace(
+        resource='voice_library', ids=[identifier], mode=del_mode, cascade=True,
+        fingerprint='', confirm=True, confirm_permanent=True))
+    return {'id': identifier, 'state': 'deleted', 'mode': del_mode, 'deletion_task': task}

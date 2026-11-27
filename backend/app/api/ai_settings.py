@@ -116,8 +116,16 @@ def set_default(service_id: str, session: Session = Depends(get_db)):
 
 
 @router.delete('/settings/ai-services/{service_id}')
-def disable_service(service_id: str, session: Session = Depends(get_db)):
+def disable_service(service_id: str, request: Request, permanent: bool = False, session: Session = Depends(get_db)):
     row = required(session, AIService, service_id, 'AI 服务')
+    if permanent:
+        from types import SimpleNamespace
+        from app.services.content_manager import execute_delete
+        task = execute_delete(session, request.app.state.settings, SimpleNamespace(
+            resource='services', ids=[service_id], mode='permanent', cascade=True,
+            fingerprint='', confirm=True, confirm_permanent=True,
+        ))
+        return {'id': service_id, 'deleted': True, 'deletion_task': task}
     row.enabled = row.is_default = False
     row.revision += 1
     audit(session, 'ai_service', row.id, 'disabled', {'historical_snapshots_preserved': True})
