@@ -599,6 +599,12 @@ class ComfyUIH3Provider:
                     raise AppError(422, "invalid_resolution", "分辨率必须为32的倍数，且不超过1344")
                 self._set_path(prompt, path, value)
         apply_sampling_steps(prompt, metadata, request.parameters)
+        from app.services.custom_loras import PARAMETER_KEY, inject_custom_loras
+        # Optional user LoRAs are chained after the workflow's own model
+        # chain only when selected; otherwise the frozen graph is unchanged.
+        custom_lora_nodes = inject_custom_loras(prompt, request.parameters.get(PARAMETER_KEY) or [])
+        if custom_lora_nodes:
+            metadata['custom_lora_nodes'] = custom_lora_nodes
         logdir = PROJECT_ROOT / "logs" / "jobs" / request.job_id
         logdir.mkdir(parents=True, exist_ok=True)
         try:
@@ -718,6 +724,7 @@ class ComfyUIH3Provider:
             "log_dir": str(logdir),
             'reference_manifest':manifest,'reference_uploads':uploads,
             'motion_reference_uploads':motion_uploads,'sampling_receipt':metadata.get('sampling_receipt'),
+            **({'custom_lora_nodes': custom_lora_nodes} if custom_lora_nodes else {}),
         })
 
     async def get_job(self, job_id: str) -> dict[str, Any]:

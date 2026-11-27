@@ -32,6 +32,7 @@ from app.services.screenplay_generation import screenplay_worker
 from app.api.product_library import router as product_library_router
 from app.api.voice_library import router as voice_library_router
 from app.api.reference_video_library import router as reference_video_router
+from app.api.custom_loras import router as custom_loras_router
 from app.services.reference_video_analysis import reference_video_worker
 from app.services.media_processing import media_worker
 from app.services.model_lab import model_lab_worker
@@ -226,6 +227,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(product_library_router)
     application.include_router(voice_library_router)
     application.include_router(reference_video_router)
+    application.include_router(custom_loras_router)
     frontend = PROJECT_ROOT / 'frontend' / 'dist'
     if os.getenv('VIDEO_FACTORY_PORTABLE') == '1' and (frontend / 'index.html').exists():
         @application.get('/api/portable/status')

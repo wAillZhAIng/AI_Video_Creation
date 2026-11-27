@@ -1145,7 +1145,7 @@ async def generate_for_shot(
             'duration_seconds','negative_prompt','reference_manifest','motion_references','motion_inputs_hash',
             'reference_videos','reference_videos_fingerprint','native_reference_constraints',
             'actual_motion_reference_uploads','actual_reference_uploads','quality_request','production_scope','revision_postprocess',
-            'based_on_video_id','original_prompt','native_ref2va_workflow')}
+            'based_on_video_id','original_prompt','native_ref2va_workflow','custom_loras','custom_loras_override')}
         configured = service_snapshot['settings'] if service_snapshot else {}
         from app.services.model_lab import default_generation_parameters
         saved_defaults=default_generation_parameters(session,service_snapshot) if service_snapshot else {}
@@ -1174,6 +1174,26 @@ async def generate_for_shot(
                 'workflow_template_sha256': workflow_snapshot['template_sha256'],
                 'workflow_tier': workflow_snapshot['steps'],
             }
+    if frozen_retry_input is None:
+        # Optional user LoRAs: an explicit per-request override (review
+        # re-render) wins, else the shot override, else the project default.
+        # The resolved list is frozen into the task parameters so retries and
+        # review comparisons replay exactly the same LoRA names and weights.
+        from app.services import custom_loras as custom_lora_service
+        if 'custom_loras_override' in payload.parameters:
+            requested_loras = custom_lora_service.effective_items(
+                custom_lora_service.normalize_selection(payload.parameters['custom_loras_override']))
+        else:
+            requested_loras = custom_lora_service.resolve_for_shot(settings, shot.project_id, shot.id)
+        effective_parameters.pop('custom_loras', None)
+        if requested_loras:
+            if settings.h3_demo_mode or provider.name != 'comfyui_h3':
+                effective_parameters['custom_loras_skipped'] = {
+                    'reason': '所选视频服务不是本机 MiniMax H3 原生工作流，自定义 LoRA 未应用',
+                    'requested': requested_loras}
+            else:
+                effective_parameters['custom_loras'] = custom_lora_service.validate_for_generation(
+                    requested_loras, effective_parameters['native_ref2va_workflow']['document'])
     if 'quality_request' in payload.parameters:
         # Historical explicit controls continue to describe their saved jobs.
         effective_parameters['quality_request']=payload.parameters['quality_request']
