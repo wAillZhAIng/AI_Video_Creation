@@ -191,13 +191,13 @@ describe('Studio UI contracts', () => {
     render(<MemoryRouter><StudioPage/></MemoryRouter>);
     const input=screen.getByLabelText('Word 剧本文档');
     await user.upload(input,new File(['contract fixture'],'scene.docx',{type:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}));
-    await user.click(screen.getByRole('button',{name:'导入并配置制作'}));
+    await user.click(screen.getByRole('button',{name:'仅导入，先配置素材'}));
     await waitFor(()=>expect(mockRequest.mock.calls.some(([path])=>path==='/api/studio/import')).toBe(true));
     const call=mockRequest.mock.calls.find(([path])=>path==='/api/studio/import')!;
     const form=call[1]?.body as FormData;
     expect(form.get('allow_cloud_costs')).toBe('false');expect(form.get('auto_start')).toBe('false');
     expect(form.get('file')).toBeInstanceOf(File);expect(JSON.parse(String(form.get('quality_json')))).toEqual({resolution:'720p',mode:'standard',aspect_ratio:'16:9',processing:'lanczos'});
-    expect(await screen.findByText('Word 已导入，尚未启动制作。请先在「角色配音」上传并保存参考音频，核对画质后点击「开始／增量续作」。')).toBeInTheDocument();
+    expect(await screen.findByText('Word 已导入。可补充参考图或配音，再点击「开始／增量续作」自动成片。')).toBeInTheDocument();
     expect(mockRequest.mock.calls.some(([url])=>url.endsWith('/start'))).toBe(false);
   });
 

@@ -16,6 +16,31 @@ function install(){let data={project_id:'p1',product,expected_token:'a'.repeat(6
   throw new Error('Unexpected request '+url);
 });}
 afterEach(()=>{cleanup();mocked.mockReset();vi.restoreAllMocks();});
+it('uses the server native H3 limit and submits every one of eight selected views',async()=>{
+  const images=Array.from({length:8},(_,index)=>({id:`view-${index}`,filename:`view-${index}.png`,thumbnail_url:`/view-${index}.png`}));
+  const item={...product,images};
+  let selected={project_id:'p1',product:item,expected_token:'b'.repeat(64),image_ids:[] as string[],shot_ids:[] as string[],bound:false,
+    shots:[{id:'s1',order:1,title:'固定礼盒特写',suggested:true}],note:'',limits:{max_reference_images:8}};
+  mocked.mockImplementation(async(url,init)=>{
+    if(url==='/api/product-library?include_archived=true')return {items:[item],limits:{max_generation_images:8}};
+    if(init?.method==='PUT'){selected={...selected,...JSON.parse(String(init.body)),bound:true};return structuredClone(selected);}
+    if(url.includes('/references?'))return structuredClone(selected);
+    throw new Error('Unexpected '+url);
+  });
+  const user=userEvent.setup();render(<ProjectProductPreparation projectId="p1" shots={[]} disabled={false}/>);
+  await user.click(screen.getByText('固定产品／道具参考图（可选）'));await screen.findAllByRole('option',{name:'固定礼盒'});
+  await user.selectOptions(screen.getByLabelText('固定产品／道具'),'product1');
+  await screen.findByLabelText('固定礼盒参考图 8');
+  for(let index=1;index<=8;index++)await user.click(screen.getByLabelText(`固定礼盒参考图 ${index}`));
+  await user.click(screen.getByRole('button',{name:'按剧本同名内容选择分镜'}));
+  await user.click(screen.getByRole('button',{name:'保存产品／道具项目引用'}));
+  await waitFor(()=>expect(mocked.mock.calls.some(([,init])=>init?.method==='PUT')).toBe(true));
+  const body=JSON.parse(String(mocked.mock.calls.find(([,init])=>init?.method==='PUT')![1]!.body));
+  expect(body.image_ids).toEqual(images.map(image=>image.id));
+  const headers=new Headers(mocked.mock.calls.find(([,init])=>init?.method==='PUT')![1]!.headers);
+  expect(headers.get('X-Reference-Image-Count')).toBe('8');
+  expect(headers.get('X-Reference-Trace-ID')).toMatch(/^[a-f0-9-]{36}$/);
+});
 it('is optional without fetching or creating references while collapsed',()=>{const states:unknown[]=[];render(<ProjectProductPreparation projectId="p1" shots={[]} disabled={false} onStateChange={state=>states.push(state)}/>);expect(screen.getByText('固定产品／道具参考图（可选）')).toBeInTheDocument();expect(mocked).not.toHaveBeenCalled();expect(states.at(-1)).toEqual({busy:false,dirty:false,overBudget:false});});
 it('saves zero product images for the selected shot and keeps its editor open',async()=>{
   const shots=[{id:'s1',order:1,title:'首镜'},{id:'s2',order:2,title:'次镜'}];

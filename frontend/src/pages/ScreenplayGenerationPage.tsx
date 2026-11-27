@@ -46,6 +46,8 @@ function Preview({ir}:{ir:ScreenplayIRPreview}){
 }
 function newKey(){return globalThis.crypto?.randomUUID?.()||`screenplay-${Date.now()}-${Math.random().toString(36).slice(2)}`;}
 const active=(job:ScreenplayJob|null)=>Boolean(job&&['queued','running'].includes(job.status));
+const awaitingAutomaticStart=(job:ScreenplayJob|null)=>Boolean(job?.produce_video&&job.status==='awaiting_review'&&job.stage==='awaiting_review');
+const documentState=(state:string)=>state==='automatic'?'已自动进入制作':state==='approved'?'已审核':'待审核';
 
 export function ScreenplayGenerationPage(){
   const [search,setSearch]=useSearchParams();
@@ -61,6 +63,7 @@ export function ScreenplayGenerationPage(){
   const [videoIds,setVideoIds]=useState<string[]>([]),[primaryVideo,setPrimaryVideo]=useState(''),[styleId,setStyleId]=useState(''),[videoCreationMode,setVideoCreationMode]=useState<'adaptation'|'style'>('adaptation'),[newTheme,setNewTheme]=useState('');
   const [pendingImages,setPendingImages]=useState<File[]>([]),[imageAssets,setImageAssets]=useState<ScreenplayInputAsset[]>([]),[uploadRows,setUploadRows]=useState<{name:string;status:string;error?:string}[]>([]);
   const [cloudCosts,setCloudCosts]=useState(false),[paidFallback,setPaidFallback]=useState(false),[cloudMedia,setCloudMedia]=useState(false);
+  const [produceVideo,setProduceVideo]=useState(true);
   const [loading,setLoading]=useState(true),[busy,setBusy]=useState(''),[error,setError]=useState(''),[notice,setNotice]=useState(''),[jobLoading,setJobLoading]=useState(false);
   const [selectedIds,setSelectedIds]=useState<Set<string>>(new Set());
   const [deleteIds,setDeleteIds]=useState<string[]|null>(null);
@@ -95,7 +98,7 @@ export function ScreenplayGenerationPage(){
       if(!alive.current||controller.signal.aborted||identity.current!==destination)return;
       setJob(next);setDocumentId(current=>current||next.latest_document_id||next.documents.at(-1)?.id||'');setJobLoading(false);
       setHistory(items=>[next,...items.filter(item=>item.id!==next.id)]);
-      if(active(next))timer=setTimeout(()=>void fetchJob(),4000);
+      if(active(next)||awaitingAutomaticStart(next))timer=setTimeout(()=>void fetchJob(),4000);
       else void request<ScreenplayOptions>('/api/screenplay/options').then(value=>{if(!controller.signal.aborted&&alive.current)setOptions(value);}).catch(()=>{});
     }catch(e){if(!controller.signal.aborted&&alive.current&&identity.current===destination){setError(String(e));setJobLoading(false);}}}
     void fetchJob();return()=>{controller.abort();if(timer)clearTimeout(timer);};
@@ -119,7 +122,7 @@ export function ScreenplayGenerationPage(){
   const selectedReferenceOptions=referenceUse==='character'?job?.screenplay?.characters:job?.screenplay?.scenes;
   const revisionOptions=revisionScope==='scene'?job?.screenplay?.scenes:job?.screenplay?.shots;
   const inputLimits=modeOptions?.limits;
-  const pollLabel=job?labels[job.stage]||labels[job.status]||job.status:'';
+  const pollLabel=awaitingAutomaticStart(job)?'准备自动制作':job?.stage==='video_automation'?'剧本已转入制作':job?.stage==='video_setup_failed'?'自动建项受阻':job?labels[job.stage]||labels[job.status]||job.status:'';
   const errorText=job?.error?valueText(job.error).replace(/[：:]\s*$/,''):'';
   const requestMayHaveBeenSubmitted=Boolean(job?.receipt?.provider_request_submitted);
   const attempts=job?.receipt?.attempt_history;
@@ -147,12 +150,12 @@ export function ScreenplayGenerationPage(){
     const destination=selectedId;
     const libraryProducts=mode==='image'&&imageSource==='products',libraryVideos=mode==='video'&&videoSource==='library',batch=libraryProducts&&productSelections.length>1&&productMode==='separate'&&!test;
     const sourcePayload=mode==='text'?{story_text:story}:libraryProducts?{product_selections:productSelections,product_mode:productSelections.length>1?productMode:'single',marketing_template:marketingTemplate}:libraryVideos?{reference_video_ids:videoIds,video_creation_mode:videoCreationMode,new_theme:newTheme,...(styleId?{style_profile_id:styleId}:{}),...(primaryVideo?{primary_reference_video_id:primaryVideo}:{})}:mode==='image'&&imageAssets.length>1?{asset_ids:imageAssets.map(item=>item.id)}:{asset_id:selectedAsset!.id};
-    const payload={project_name:projectName,creative_prompt:creativePrompt,input_mode:mode,...sourcePayload,...((test||serviceId)&&effectiveService?{service_id:effectiveService,...(candidate?.model_id?{model_id:candidate.model_id}:{})}:{}),allow_cloud_costs:cloudCosts,allow_cloud_media_upload:cloudMediaRequired&&cloudMedia,allow_paid_fallback:test?false:paidFallback};
+    const payload={project_name:projectName,creative_prompt:creativePrompt,input_mode:mode,...sourcePayload,...((test||serviceId)&&effectiveService?{service_id:effectiveService,...(candidate?.model_id?{model_id:candidate.model_id}:{})}:{}),allow_cloud_costs:cloudCosts,allow_cloud_media_upload:cloudMediaRequired&&cloudMedia,allow_paid_fallback:test?false:paidFallback,...(!test&&produceVideo?{produce_video:true}:{})};
     const fingerprint=JSON.stringify({test,...payload});if(submission.current?.fingerprint!==fingerprint)submission.current={fingerprint,key:newKey()};
     busyRef.current=true;setBusy(test?'test':'generate');setError('');setNotice('');
     try{const response=await request<ScreenplayJob|{jobs:ScreenplayJob[];errors?:{product_id:string;error:string}[]}>(test?'/api/screenplay/capability-tests':batch?'/api/screenplay/batches':'/api/screenplay/jobs',{method:'POST',body:JSON.stringify({...payload,idempotency_key:submission.current.key})});
       const createdJobs='jobs' in response?response.jobs:[response],created=createdJobs[0];if(!created)throw new Error('服务器未返回剧本任务');if('jobs' in response&&response.errors?.length)setError('部分产品尚未创建任务：'+response.errors.map(item=>`${item.product_id}：${item.error}`).join('；'));
-      if(alive.current){setHistory(items=>[...createdJobs,...items.filter(item=>!createdJobs.some(created=>created.id===item.id))]);if(identity.current===destination){setSearch(current=>{const next=new URLSearchParams(current);next.set('job',created.id);return next;});setNotice(test?'真实能力测试任务已提交。完成后仍需审核，不会自动创建项目。':batch?`已为 ${createdJobs.length} 个产品分别建立独立剧本任务。各产品素材不会混为同一商品。`:'剧本任务已提交。生成 Word 后由你审核，当前不会创建项目。');}}
+      if(alive.current){setHistory(items=>[...createdJobs,...items.filter(item=>!createdJobs.some(created=>created.id===item.id))]);if(identity.current===destination){setSearch(current=>{const next=new URLSearchParams(current);next.set('job',created.id);return next;});setNotice(test?'真实能力测试任务已提交。':batch?`已为 ${createdJobs.length} 个产品分别建立独立剧本任务。`:produceVideo?'任务已提交。剧本生成后会自动创建项目、制作分镜并导出成片。':'剧本任务已提交，完成后可下载 Word。');}}
     }catch(e){if(alive.current)setError(String(e)+'；如请求结果不明，请先刷新任务列表核对，重复提交会保留本次请求标识。');}finally{busyRef.current=false;if(alive.current)setBusy('');}
   }
   async function approve(){
@@ -264,7 +267,7 @@ export function ScreenplayGenerationPage(){
     setNotice('已将本版全部已保存的输入带回创作区。修改后生成将建立独立任务，历史版本保留。');document.getElementById('screenplay-creation-form')?.scrollIntoView?.({behavior:'smooth'});}
 
   return <div className="screenplay-center">
-    <PageHeader title="剧本生成" description="选择一种创作素材，生成可审核的 Word 和结构化分镜。审核后再决定是否创建制作项目。" actions={<Link className="button button-secondary" to="/">项目工作台<ArrowRight size={16}/></Link>}/>
+    <PageHeader title="剧本生成" description="用文字、图片或参考视频生成剧本。可自动制作成片，也可下载 Word。" actions={<Link className="button button-secondary" to="/">项目工作台<ArrowRight size={16}/></Link>}/>
     {error?<p className="inline-notice warning" role="alert">{error}</p>:null}{notice?<p className="inline-notice" role="status">{notice}</p>:null}
     {loading?<LoadingState label="读取剧本模型与历史任务…"/>:null}
     <form id="screenplay-creation-form" className="card screenplay-create" onSubmit={e=>{e.preventDefault();void generate();}}>
@@ -295,6 +298,7 @@ export function ScreenplayGenerationPage(){
       {hasCloudServices||cloud?<label><input type="checkbox" checked={cloudCosts} disabled={!!busy} onChange={e=>{setCloudCosts(e.target.checked);if(!e.target.checked)setPaidFallback(false);}}/>允许本次按所选策略调用付费云端服务</label>:null}
       {cloudMediaRequired?<label><input type="checkbox" checked={cloudMedia} disabled={!!busy} onChange={event=>setCloudMedia(event.target.checked)}/>允许将本次选中的图片、视频或派生参考分析发送到所选云端模型服务。此授权独立于费用授权，默认关闭。</label>:null}
       {cloudCosts?<label><input type="checkbox" checked={paidFallback} disabled={!!busy} onChange={e=>setPaidFallback(e.target.checked)}/>同时允许已明确配置的付费回退</label>:null}
+      <label><input type="checkbox" checked={produceVideo} disabled={!!busy} onChange={e=>setProduceVideo(e.target.checked)}/>剧本生成后自动制作成片</label>
       <div className="screenplay-actions"><button className="button button-primary" disabled={!canGenerate}><FileText size={16}/>{busy==='generate'?'正在提交…':generating?'本次任务仍在执行':'生成剧本'}</button><button type="button" className="button button-secondary" disabled={!validInput||!effectiveService||!!busy||generating||cloud&&!cloudCosts||cloudMediaRequired&&!cloudMedia||service?.provider==='cloud_draft'||mode==='image'&&imageSource==='products'&&productSelections.length>1&&productMode==='separate'} onClick={()=>void generate(true)}>{busy==='test'?'正在提交测试…':'使用当前输入测试此模式能力'}</button><Link to="/settings">配置模型与服务</Link></div>
       {!validInput?<p className="form-hint">请填写项目名称、创作提示词和当前模式的素材；图片或视频需先上传保存。</p>:!candidate?.eligible?<p className="form-hint">此模式尚无有效生成证据。可先明确选择服务并执行一次真实能力测试，成功后再用于日常创作。</p>:null}
     </form>
@@ -319,10 +323,11 @@ export function ScreenplayGenerationPage(){
             {job.uncertainties.length?<div><h3>需要核对的内容</h3><ul className="screenplay-warning-list">{job.uncertainties.map((item,index)=><li key={index}>{item}</li>)}</ul></div>:null}
             <Preview ir={job.screenplay}/>
           </>:null}
-          {job.documents.length?<><div className="screenplay-document-list">{job.documents.map(document=><a key={document.id} href={document.download_url} download><Download size={14}/> Word v{document.version} · {document.review_state==='approved'?'已审核':'待审核'}</a>)}</div>
-            <div className="screenplay-review-actions"><FormField label="本次审核的 Word 版本"><select value={documentId} disabled={!!busy} onChange={e=>{setDocumentId(e.target.value);setReviewed(false);}}>{job.documents.map(document=><option key={document.id} value={document.id}>Word v{document.version} · {document.review_state==='approved'?'已审核':'待审核'}</option>)}</select></FormField>
-              {job.project_id?<p role="status">项目已创建：<Link to={`/?project=${encodeURIComponent(job.project_id)}`}>{job.project_name} · 进入项目工作台<ArrowRight size={14}/></Link></p>:null}
-              {!job.project_id||selectedDocument?.review_state!=='approved'?<><label><input type="checkbox" checked={reviewed} disabled={!!busy||generating} onChange={e=>setReviewed(e.target.checked)}/>剧本内容审核通过</label>{!job.project_id?<label><input type="checkbox" checked={createProject} disabled={!!busy||generating} onChange={e=>setCreateProject(e.target.checked)}/>审核通过后创建项目</label>:null}
+          {job.documents.length?<><div className="screenplay-document-list">{job.documents.map(document=><a key={document.id} href={document.download_url} download><Download size={14}/> Word v{document.version} · {documentState(document.review_state)}</a>)}</div>
+            <div className="screenplay-review-actions"><FormField label="Word 版本"><select value={documentId} disabled={!!busy} onChange={e=>{setDocumentId(e.target.value);setReviewed(false);}}>{job.documents.map(document=><option key={document.id} value={document.id}>Word v{document.version} · {documentState(document.review_state)}</option>)}</select></FormField>
+              {job.project_id?<p role="status"><Link to={`/?project=${encodeURIComponent(job.project_id)}${job.produce_video?'#project-output':''}`}>{job.produce_video?'在项目工作台查看成片与进度':`${job.project_name} · 进入项目工作台`}<ArrowRight size={14}/></Link></p>:null}
+              {job.receipt?.production_start_error?<p role="alert">制作启动受阻。{valueText((job.receipt.production_start_error as Record<string,unknown>).message)}。可在项目工作台处理。</p>:null}
+              {!awaitingAutomaticStart(job)&&(!job.project_id||!['approved','automatic'].includes(selectedDocument?.review_state||''))?<><label><input type="checkbox" checked={reviewed} disabled={!!busy||generating} onChange={e=>setReviewed(e.target.checked)}/>剧本内容审核通过</label>{!job.project_id?<label><input type="checkbox" checked={createProject} disabled={!!busy||generating} onChange={e=>setCreateProject(e.target.checked)}/>审核通过后创建项目</label>:null}
                 {createProject&&job.input_mode==='image'&&job.input_asset?<><FormField label="输入图片的后续用途"><select value={referenceUse} disabled={!!busy} onChange={e=>{setReferenceUse(e.target.value as typeof referenceUse);setReferenceTarget('');}}><option value="none">仅作为本次创作素材</option><option value="character">保存为指定人物的参考图</option><option value="scene">保存为指定场景的参考图</option></select></FormField>{referenceUse!=='none'?<FormField label={referenceUse==='character'?'参考图对应人物':'参考图对应场景'}><select value={referenceTarget} disabled={!!busy} onChange={e=>setReferenceTarget(e.target.value)}><option value="">请选择明确对象</option>{selectedReferenceOptions?.map(item=><option key={item.key} value={item.key}>{item.name}</option>)}</select></FormField>:null}</>:null}
                 <button type="button" className="button button-primary" disabled={!reviewed||!selectedDocument||!!busy||generating||createProject&&referenceUse!=='none'&&!referenceTarget} onClick={()=>void approve()}>{busy==='approve'?'正在保存审核…':createProject?'确认审核并创建项目':'仅保存审核结果'}</button><p className="form-hint">未勾选创建项目时，只保存剧本与 Word。建项使用同一份结构化数据，名称保持原样，不会再次猜测文档。</p>
               </>:null}

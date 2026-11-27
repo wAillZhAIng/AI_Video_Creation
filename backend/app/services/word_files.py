@@ -228,7 +228,7 @@ def read_word_blocks(filename, data, limit):
     elif data.lstrip(b'\xef\xbb\xbf \t\r\n').startswith(b'{\\rtf'):
         data = _legacy_to_docx(data, '.rtf', limit)
     elif not data.startswith(b'PK'):
-        raise AppError(422, 'invalid_docx', '文件内容不是可识别的 Word 文档')
+        raise AppError(422, 'invalid_docx', '文件内容不是可识别的 Word 文档，请在 Word 中另存为 .docx 后重试')
     try:
         result = _archive_blocks(data, limit)
     except (zipfile.BadZipFile, etree.LxmlError, NotImplementedError, KeyError, RuntimeError,

@@ -9,13 +9,38 @@ from app import models as m
 from sqlalchemy import select
 
 router=APIRouter(prefix='/api/product-library',tags=['product-library'])
+
+
+def traced_selection(request,session,object_id,image_ids,save):
+    from app.services.asset_reference_audit import request_trace_id,audit_reference_stage
+    trace_id=request_trace_id(request)
+    refs=[]
+    for image_id in dict.fromkeys(image_ids):
+        image=session.get(m.ProductImage,image_id)
+        asset=session.get(m.ScreenplayInputAsset,image.asset_id) if image else None
+        refs.append({'image_id':image_id,'product_id':image.product_id if image else None,
+                     'sha256':asset.sha256 if asset else None,'source_path':asset.relative_path if asset else None})
+    try:
+        result=save()
+    except AppError as error:
+        session.rollback()
+        audit_reference_stage(session,trace_id,'api_reference_selection_failed',refs,object_id=object_id,error=error)
+        session.commit()
+        raise
+    audit_reference_stage(session,trace_id,'reference_selection_persisted',refs,object_id=object_id,
+                          client_image_count=request.headers.get('x-reference-image-count'))
+    session.commit()
+    return result
+
+
 @router.get('/projects/{project_id}/references')
 def project_references(project_id:str,product_id:str,session:Session=Depends(get_db)):
     return service.project_references(session,project_id,product_id)
 
 @router.put('/projects/{project_id}/references')
 def save_project_references(project_id:str,payload:ProjectProductReferenceEdit,request:Request,session:Session=Depends(get_db)):
-    return service.save_project_references(session,request.app.state.settings,project_id,payload)
+    return traced_selection(request,session,project_id,payload.image_ids,
+        lambda:service.save_project_references(session,request.app.state.settings,project_id,payload))
 
 @router.get('/projects/{project_id}/shots/{shot_id}/references')
 def selected_references(project_id:str,shot_id:str,session:Session=Depends(get_db)):
@@ -24,7 +49,9 @@ def selected_references(project_id:str,shot_id:str,session:Session=Depends(get_d
 async def save_selected_references(project_id:str,shot_id:str,payload:ShotProductReferencesEdit,request:Request,session:Session=Depends(get_db)):
     async with project_guard(request.app,project_id):
         session.expire_all()
-        return service.save_reference_selection(session,project_id,shot_id,payload,settings=request.app.state.settings)
+        return traced_selection(request,session,shot_id,
+            [identifier for product in payload.products for identifier in product.video_image_ids+product.keyframe_image_ids],
+            lambda:service.save_reference_selection(session,project_id,shot_id,payload,settings=request.app.state.settings))
 @router.get('')
 def listing(q:str='',category:str='',include_archived:bool=False,session:Session=Depends(get_db)):
     return service.list_products(session,q,category,include_archived)
@@ -56,18 +83,30 @@ def restore(identifier:str,request:Request,session:Session=Depends(get_db)):
     product.revision+=1;session.commit();return service.dto(session,product)
 @router.post('/{identifier}/images',status_code=201)
 async def upload(identifier:str,request:Request,files:list[UploadFile]=File(...),purpose:str=Form('other'),notes:str=Form(''),session:Session=Depends(get_db)):
+    import hashlib
+    from app.services.asset_reference_audit import request_trace_id,audit_reference_stage
+    trace_id=request_trace_id(request)
     settings=request.app.state.settings
     if not 1<=len(files)<=32:raise AppError(422,'product_file_count','每批请选择1至32张图片')
-    added=[];duplicates=[];errors=[]
-    for file in files:
+    added=[];duplicates=[];errors=[];received=[]
+    for ordinal,file in enumerate(files,1):
         try:
             data=await file.read(service.LIMITS['max_upload_bytes']+1)
+            received.append({'image_id':f'upload-{ordinal}','source_path':file.filename,
+                             'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data)})
             value,duplicate=service.add_image(session,settings,identifier,file.filename or '',data,purpose,notes)
             (duplicates if duplicate else added).append(value)
         except AppError as error:
-            session.rollback();errors.append({'filename':file.filename,'code':error.code,'error':error.message})
+            session.rollback();errors.append({'filename':file.filename,'code':error.code,'error':error.message,'error_type':type(error).__name__})
         finally:await file.close()
-    return {'product':service.dto(session,service.get_product(session,identifier)),'added':added,'duplicates':duplicates,'errors':errors}
+    audit_reference_stage(session,trace_id,'api_upload_received',received,object_id=identifier,
+                          client_image_count=request.headers.get('x-reference-image-count'))
+    audit_reference_stage(session,trace_id,'asset_persistence',
+        [{'image_id':item['id'],'sha256':item['sha256'],'source_path':item['filename'],
+          'width':item['width'],'height':item['height']} for item in added+duplicates],object_id=identifier,
+        errors=errors,received_image_count=len(files))
+    session.commit()
+    return {'product':service.dto(session,service.get_product(session,identifier)),'added':added,'duplicates':duplicates,'errors':errors,'trace_id':trace_id}
 @router.patch('/{identifier}/images')
 def images_edit(identifier:str,payload:ProductImagesEdit,session:Session=Depends(get_db)):
     return service.edit_images(session,identifier,payload)

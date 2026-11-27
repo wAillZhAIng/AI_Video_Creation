@@ -28,6 +28,7 @@ class GenerateScreenplay(Strict):
     model_id: str = Field(default='', max_length=240)
     allow_cloud_costs: bool = False
     allow_paid_fallback: bool = False
+    produce_video: bool = False
     idempotency_key: str = Field(min_length=8, max_length=120)
 
     @model_validator(mode='after')

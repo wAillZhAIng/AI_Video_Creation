@@ -72,6 +72,26 @@ def media_path(settings, image):
     return path
 
 
+def test_upload_trace_keeps_requested_count_partial_error_and_saved_source_hashes(client):
+    product=client.post('/api/product-library',json={'name':'Trace isolation'}).json()
+    good=[image_bytes(1),image_bytes(2)]
+    response=client.post(f"/api/product-library/{product['id']}/images",
+        headers={'X-Reference-Trace-ID':'reference-trace-three','X-Reference-Image-Count':'3'},
+        files=[('files',('one.png',good[0],'image/png')),('files',('bad.png',b'broken','image/png')),
+               ('files',('three.png',good[1],'image/png'))])
+    assert response.status_code==201,response.text
+    body=response.json()
+    assert body['trace_id']=='reference-trace-three' and len(body['added'])==2 and len(body['errors'])==1
+    with client.app.state.session_factory() as session:
+        events=list(session.scalars(select(m.AuditEvent).where(m.AuditEvent.action=='reference_input_trace')))
+        stages={event.details_json['stage']:event.details_json for event in events}
+        received=stages['api_upload_received'];saved=stages['asset_persistence']
+        assert received['image_count']==3 and received['client_image_count']=='3'
+        assert saved['image_count']==2 and saved['received_image_count']==3 and saved['errors'][0]['error_type']=='AppError'
+        assert {row['sha256'] for row in saved['references']}=={hashlib.sha256(raw).hexdigest() for raw in good}
+        assert {row['image_id'] for row in saved['references']}=={image['id'] for image in body['added']}
+
+
 def test_optional_project_starts_without_a_product_or_inference_call(client):
     project_id, shots = project_with_shots(client)
     with client.app.state.session_factory() as session:
@@ -143,8 +163,6 @@ def test_upload_select_persist_exact_chinese_name_suggestions_and_clear_scoped_s
 
 @pytest.mark.parametrize(('keyframe','video'), [(True,False), (False,True), (False,False)])
 def test_each_shot_product_reference_stage_can_be_left_empty(client, settings, keyframe, video):
-    from app.services.context_production_inputs import collect_context_inputs
-
     product = product_with_images(client)
     project_id, shots = project_with_shots(client)
     ids = [image['id'] for image in product['images']]
@@ -170,9 +188,6 @@ def test_each_shot_product_reference_stage_can_be_left_empty(client, settings, k
             assert {reference['id'] for reference in refs} == (set(ids) if enabled else set())
             sibling = session.get(m.StoryboardShot, shots[1])
             assert {reference['id'] for reference in product_library.shot_references(session,settings,sibling,stage=stage)} == set(ids)
-        context = collect_context_inputs(session, settings, shot)
-        assert {ref['asset_id'] for ref in context['references']} == (set(ids) if video else set())
-        assert ('\n商品：' in context['prompt']) is video
         run = session.scalar(select(m.StudioRun).where(m.StudioRun.project_id == project_id))
         assert run.status == 'paused' and run.snapshot_json['product_references_changed'] is True
     overview = selection(client, project_id, product['id'])

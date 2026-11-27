@@ -118,10 +118,13 @@ def compile_visual(client,settings,fixture,*,model_id=None):
 def patched_repair(monkeypatch,*,gpu='idle'):
     calls=[]
     async def state():return {'state':gpu,'reason':'isolated_'+gpu}
+    async def recovery(_app,_session):return []
     async def advance(_app,_settings,_session,run):
         calls.append({'status':run.status,'nodes':copy.deepcopy(run.nodes_json)})
     async def forbidden(*args,**kwargs):raise AssertionError('Isolated repair must never submit inference')
     monkeypatch.setattr(gpu_gate,'owned_model_status',state)
+    from app.services import studio_model_recovery
+    monkeypatch.setattr(studio_model_recovery,'recover_model_connections',recovery)
     monkeypatch.setattr(studio_pipeline,'advance_pipeline',advance)
     monkeypatch.setattr(cinematic_visuals,'service_request',forbidden)
     return calls

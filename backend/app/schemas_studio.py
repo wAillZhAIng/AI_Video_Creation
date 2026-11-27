@@ -9,12 +9,13 @@ class StudioInput(BaseModel):
 
 class StudioProductReferencePlan(StudioInput):
     product_id:str=Field(min_length=1,max_length=64)
-    image_ids:list[str]=Field(min_length=1,max_length=4)
+    image_ids:list[str]=Field(min_length=1,max_length=8)
     selection_reason:str=Field(min_length=1,max_length=2000)
 
 class PipelineStart(StudioInput):
     dialogue_audio_policy:Literal['auto','native','tts','skip']|None=None
     automatic_draft_assembly:bool=False
+    automatic_final_assembly:bool=True
     product_reference_plan:StudioProductReferencePlan|None=None
     quality:QualitySettings|None=None
     allow_cloud_costs:bool=False
@@ -24,6 +25,8 @@ class PipelineStart(StudioInput):
     shot_ids:list[str]|None=None
     prompt_overrides:dict[str,Annotated[str,Field(min_length=1)]]=Field(default_factory=dict)
     reference_image_ids:dict[str,Annotated[list[Annotated[str,Field(min_length=1,max_length=64)]],Field(max_length=9)]]=Field(default_factory=dict)
+    reference_video_defaults:list[MotionReferenceInput]=Field(default_factory=list,max_length=3)
+    shot_reference_video_overrides:dict[str,Annotated[list[MotionReferenceInput],Field(max_length=3)]]=Field(default_factory=dict)
     motion_reference_overrides:dict[str,Annotated[list[MotionReferenceInput],Field(max_length=3)]]=Field(default_factory=dict)
     max_retries:int=Field(default=2,ge=0,le=3)
 
@@ -33,6 +36,21 @@ class PipelineStart(StudioInput):
             raise ValueError('镜头生成要求不能为空白')
         if any(len(ids)!=len(set(ids)) for ids in self.reference_image_ids.values()):
             raise ValueError('同一镜头不能重复选择参考图片')
+        return self
+
+
+class ProjectReferenceVideoConfig(StudioInput):
+    """Persisted project defaults and explicit per-shot native video bindings."""
+
+    expected_revision: int = Field(ge=0)
+    reference_video_defaults: list[MotionReferenceInput] = Field(default_factory=list, max_length=3)
+    shot_reference_video_overrides: dict[str, Annotated[list[MotionReferenceInput], Field(max_length=3)]] = Field(default_factory=dict)
+
+    @model_validator(mode='after')
+    def distinct_sources(self):
+        groups = [self.reference_video_defaults, *self.shot_reference_video_overrides.values()]
+        if any(len({item.video_id for item in group}) != len(group) for group in groups):
+            raise ValueError('同一项目或镜头不能重复选择参考视频')
         return self
 
 

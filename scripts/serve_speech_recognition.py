@@ -39,7 +39,7 @@ def read_pcm(raw):
     return pcm
 
 
-def create_app(model, identity):
+def create_app(model, identity, *, model_factory=None):
     import numpy as np
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -48,7 +48,8 @@ def create_app(model, identity):
     @app.get('/health')
     def health():
         return {'service': PROTOCOL, 'ready': True, 'busy': lock.locked(), 'offline': True,
-                'device': 'cpu', 'compute_type': 'int8', **identity}
+                'device': 'cpu', 'compute_type': 'int8', 'loaded': model is not None,
+                'load_policy': 'per_request' if model_factory else 'persistent', **identity}
 
     @app.post('/factory/transcribe')
     def transcribe(payload: AudioRequest):
@@ -63,13 +64,19 @@ def create_app(model, identity):
             raise HTTPException(422, 'Expected a complete 16 kHz mono PCM16 WAV') from exc
         if not lock.acquire(blocking=False):
             raise HTTPException(409, 'Transcription is already running')
+        active_model = None
         try:
+            active_model = model if model is not None else model_factory()
             samples = np.frombuffer(pcm, dtype='<i2').astype(np.float32) / 32768
-            segments, info = model.transcribe(samples, task='transcribe', language=None, beam_size=5,
+            segments, info = active_model.transcribe(samples, task='transcribe', language=None, beam_size=5,
                                               vad_filter=True, condition_on_previous_text=False)
             rows = [{'start': round(s.start, 3), 'end': round(s.end, 3), 'text': s.text.strip(), 'speaker': 'unknown'}
                     for s in segments if s.text.strip() and s.end > s.start]
         finally:
+            if model_factory is not None:
+                active_model = None
+                import gc
+                gc.collect()
             lock.release()
         probability = round(info.language_probability, 4) if rows else None
         language = info.language if probability is not None and probability >= LANGUAGE_THRESHOLD else None
@@ -101,10 +108,11 @@ def main():
     from faster_whisper import WhisperModel
     import uvicorn
 
-    model = WhisperModel(str(args.model_dir.resolve()), device='cpu', compute_type='int8',
-                         cpu_threads=args.threads, local_files_only=True)
+    def model_factory():
+        return WhisperModel(str(args.model_dir.resolve()), device='cpu', compute_type='int8',
+                            cpu_threads=args.threads, local_files_only=True)
     public_identity = {key: identity[key] for key in ('model_id', 'revision', 'model_sha256')}
-    uvicorn.run(create_app(model, public_identity), host='127.0.0.1', port=args.port)
+    uvicorn.run(create_app(None, public_identity, model_factory=model_factory), host='127.0.0.1', port=args.port)
 
 
 if __name__ == '__main__':

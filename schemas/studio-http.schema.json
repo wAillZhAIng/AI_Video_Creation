@@ -12,7 +12,7 @@
         "items": {
           "type": "string"
         },
-        "maxItems": 4,
+        "maxItems": 8,
         "minItems": 1,
         "title": "Image Ids",
         "type": "array"
@@ -174,7 +174,7 @@
             "items": {
               "type": "string"
             },
-            "maxItems": 4,
+            "maxItems": 8,
             "minItems": 1,
             "title": "Image Ids",
             "type": "array"
@@ -218,6 +218,11 @@
       "automatic_draft_assembly": {
         "default": false,
         "title": "Automatic Draft Assembly",
+        "type": "boolean"
+      },
+      "automatic_final_assembly": {
+        "default": true,
+        "title": "Automatic Final Assembly",
         "type": "boolean"
       },
       "product_reference_plan": {

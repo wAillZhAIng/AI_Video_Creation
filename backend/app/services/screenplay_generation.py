@@ -19,7 +19,7 @@ from app.models.entities import new_id, utcnow
 from app.models.screenplay_generation import ScreenplayGenerationJob as Job, ScreenplayDocument as Document, ScreenplayInputAsset as Asset, ScreenplayProjectNameClaim as NameClaim
 from app.schemas_cinematic import ScreenplayIR
 from app.schemas_screenplay import ImportConfirm
-from app.schemas_screenplay_generation import GenerateScreenplay
+from app.schemas_screenplay_generation import ApproveScreenplay, GenerateScreenplay
 from app.services.ai_services import service_snapshot, service_request, public_service
 from app.services.cinematic_rules import rules_bundle
 from app.services.runtime_registry import file_sha
@@ -71,7 +71,9 @@ def dto(session,job):
         'receipt':job.receipt_json,'input_request':source_input(job),'source_selection':source_input(job),
         'input_assets':[asset_dto(row) for item in job.snapshot_json.get('input_assets',[]) if (row:=session.get(Asset,item['id']))],
         'products':job.snapshot_json.get('products',[]),
-        'reference_context':job.snapshot_json.get('reference_context'),'capability_test':job.capability_test,'created_at':job.created_at.isoformat(),'updated_at':job.updated_at.isoformat()}
+        'reference_context':job.snapshot_json.get('reference_context'),'capability_test':job.capability_test,
+        'produce_video':job.snapshot_json.get('produce_video',False),
+        'created_at':job.created_at.isoformat(),'updated_at':job.updated_at.isoformat()}
 
 def screenplay_evidence(session,settings,service,model,slot):
     mode=next((mode for mode,value in SLOTS.items() if value==slot),None)
@@ -116,7 +118,11 @@ def options(session,settings):
         'limitations':['图片模式真实发送图片；视频模式抽取带时间戳的8帧。','有声音轨会提取；已配置的本机ASR可自动转写，原话与说话人仍需核对，未配置ASR时标受限。','测试结果仅证明对应输入链路可执行，剧情与感知质量仍需人工审核。']}
 
 def create_generation(session,settings,payload,*,capability_test=False,parent=None,scope='all',target_key=None,instruction='',retry_of_job_id=None):
-    data=payload.model_dump();request_hash=content_sha({**data,'capability_test':capability_test,'parent_job_id':parent.id if parent else None,'scope':scope,'target_key':target_key,'instruction':instruction,
+    data=payload.model_dump()
+    produce_video=data.pop('produce_video') and not capability_test
+    if produce_video:
+        data['produce_video']=True
+    request_hash=content_sha({**data,'capability_test':capability_test,'parent_job_id':parent.id if parent else None,'scope':scope,'target_key':target_key,'instruction':instruction,
         **({'retry_of_job_id':retry_of_job_id} if retry_of_job_id else {})})
     existing=session.scalar(select(Job).where(Job.idempotency_key==payload.idempotency_key))
     if existing:
@@ -158,6 +164,7 @@ def create_generation(session,settings,payload,*,capability_test=False,parent=No
         parent_job_id=parent.id if parent else None,scope=scope,target_key=target_key,instruction=instruction,capability_test=capability_test,
         snapshot_json={**extras,'service_snapshot':snapshot,'route':route,'request_service_id':payload.service_id,'request_model_id':payload.model_id,
             'allow_cloud_costs':payload.allow_cloud_costs,'allow_paid_fallback':payload.allow_paid_fallback,
+            **({'produce_video':True} if produce_video else {}),
             'source_asset_sha256':asset.sha256 if asset else None,'rules_snapshot':rules_bundle(),
             'base_ir':copy.deepcopy(parent.screenplay_json) if parent else None,'lineage_job_id':(parent.snapshot_json.get('lineage_job_id') or parent.id) if parent else None,
             **({'retry_of_job_id':retry_of_job_id} if retry_of_job_id else {})})
@@ -213,6 +220,7 @@ def resume_generation(session,settings,identifier,payload):
         input_mode=job.input_mode,story_text=job.story_text,**source_input(job),
         service_id=service_id,model_id=model_id,
         allow_cloud_costs=payload.allow_cloud_costs,allow_paid_fallback=payload.allow_paid_fallback,
+        produce_video=job.snapshot_json.get('produce_video',False),
         idempotency_key=payload.idempotency_key)
     parent=session.get(Job,job.parent_job_id) if job.parent_job_id else None
     result=create_generation(session,settings,request,capability_test=job.capability_test,parent=parent,
@@ -239,7 +247,8 @@ def retry_generation(session,settings,identifier,payload):
         model_id=row.default_model
     request=GenerateScreenplay(project_name=previous.project_name,creative_prompt=previous.creative_prompt,input_mode=previous.input_mode,
         story_text=previous.story_text,**source_input(previous),service_id=service_id,model_id=model_id,
-        allow_cloud_costs=payload.allow_cloud_costs,allow_paid_fallback=payload.allow_paid_fallback,idempotency_key=payload.idempotency_key)
+        allow_cloud_costs=payload.allow_cloud_costs,allow_paid_fallback=payload.allow_paid_fallback,
+        produce_video=previous.snapshot_json.get('produce_video',False),idempotency_key=payload.idempotency_key)
     parent=session.get(Job,previous.parent_job_id) if previous.parent_job_id else None
     result=create_generation(session,settings,request,capability_test=previous.capability_test,parent=parent,
         scope=previous.scope,target_key=previous.target_key,instruction=previous.instruction,retry_of_job_id=previous.id)
@@ -289,7 +298,7 @@ observations:[素材中真实可见的线索],uncertainties:[需要用户确认�
                 'photography':{'shot_size':'中景','camera_position':'眼平'},'production':{'start_state':'站立','end_state':'站立','wardrobe_states':{},'prop_states':[],'beats':[]}}],
             'designs':[],'observations':[],'uncertainties':[]}
         system+='\n合法JSON层级示例（仅示范结构，按用户主题重新创作实际人物/镜头数量/时长/内容，不照抄人物示例）：\n'+canonical(exemplar)
-    system+='\nJSON层级必须正确：project对象在continuity字段后立即闭合。characters、scenes、shots、designs、observations、uncertainties、marketing都位于最外层，与project并列；不能放进project里面。designs/observations/uncertainties不能放进shots里面。无人产品镜头的participants、dialogues、beats均为[]，不要生成character_key为空字符串的虚构人物动作。每镜的products必须直接放在该shot上，与production并列，不要藏在designs.spec里。'
+    system+='\nJSON层级必须正确：project对象在continuity字段后立即闭合。characters、scenes、shots、designs、observations、uncertainties、marketing都位于最外层，与project并列；不能放进project里面。designs/observations/uncertainties不能放进shots里面。没有对白的镜头写dialogues:[]。无人产品镜头的participants、dialogues、beats均为[]，不要生成character_key为空字符串的虚构人物动作。每镜的products必须直接放在该shot上，与production并列，不要藏在designs.spec里。'
     rules=job.snapshot_json.get('rules_snapshot',{})
     instructions=['\n'.join([section.get('title',''),*section.get('instructions',[])]) for section in rules.get('sections',{}).values()]
     system+='\n当前项目统一制作规范（各模式相同，不能把字数当时长）：\n'+'\n'.join(instructions)
@@ -541,6 +550,11 @@ def normalize_ir(session,job,raw,source):
             if any(k in event for k in ('relative_path','path','url')):raise ValueError('模型声音记录不能引用未经上传的文件')
     for shot in ir['shots']:
         shot.setdefault('dialogues',[]);shot.setdefault('audio_events',[]);shot.setdefault('photography',{});shot.setdefault('production',{})
+        if isinstance(shot['dialogues'],list):
+            # Preserve the raw response, but omit empty dialogue placeholders
+            # from the executable screenplay for otherwise wordless shots.
+            shot['dialogues']=[line for line in shot['dialogues'] if not (
+                isinstance(line,dict) and isinstance(line.get('text'),str) and not line['text'].strip())]
         if not shot.get('visual_prompt') or not shot.get('photography'):raise ValueError('分镜缺少独立画面或摄影字段')
         placeholders={'按真实参考图与用户要求描述画面','按用户要求描写','按所选产品资料创作','按用户目标编写','只描述参考可证实特征'}
         if str(shot['visual_prompt']).strip() in placeholders or any(str(p.get('display_features','')).strip() in placeholders for p in shot.get('products',[]) if isinstance(p,dict)):
@@ -994,17 +1008,19 @@ def _check_document(session,settings,job,identifier):
     if file_sha(path)!=document.sha256 or document.screenplay_sha256!=content_sha(job.screenplay_json):raise AppError(409,'screenplay_document_changed','Word或对应剧本发生变化，请重新核对')
     return document,path
 
-def approve(session,settings,identifier,payload):
+def approve(session,settings,identifier,payload,*,automatic=False):
     job=get_job(session,identifier)
     # A completed create request is safe to repeat even when its old revision is retried.
     if job.project_id and payload.approve and payload.create_project:
         checked,_=_check_document(session,settings,job,payload.document_id)
         if [target.model_dump() for target in payload.reference_targets]!=job.receipt_json.get('project_reference_targets',[]):
             raise AppError(409,'screenplay_project_already_created','项目已经创建；新参考图请到项目工作台明确保存，不会重复建项或静默修改')
-        if checked.review_state=='approved':return job
+        if checked.review_state in {'approved','automatic'}:return job
     if job.revision!=payload.expected_revision:raise AppError(409,'screenplay_stale','审核对象已变化，请刷新后重新确认')
     if not payload.approve:raise AppError(422,'screenplay_review_required','请先明确勾选剧本内容审核通过')
     if job.status not in {'awaiting_review','approved'}:raise AppError(409,'screenplay_review_unavailable','当前任务尚未生成可审核Word')
+    if automatic and (job.capability_test or not job.snapshot_json.get('produce_video')):
+        raise AppError(409,'screenplay_automatic_start_not_requested','此剧本任务没有请求自动制作成片')
     document,path=_check_document(session,settings,job,payload.document_id)
     if payload.reference_targets and not payload.create_project:raise AppError(422,'screenplay_reference_needs_project','创建项目后才能绑定素材参考')
     try:
@@ -1029,10 +1045,14 @@ def approve(session,settings,identifier,payload):
             project=session.get(m.Project,job.project_id)
             if project.name!=job.project_name:raise ValueError('Project title differs from exact reviewed value')
             project.source_uri='screenplay_job:'+job.id
-            session.add(m.AuditEvent(object_type='project',object_id=project.id,action='screenplay_review_created_project',details_json={
+            session.add(m.AuditEvent(object_type='project',object_id=project.id,
+                action='screenplay_automation_created_project' if automatic else 'screenplay_review_created_project',details_json={
                 'job_id':job.id,'document_id':document.id,'ir_sha256':document.screenplay_sha256,'service_snapshot':job.snapshot_json['service_snapshot'],
                 'source_asset_id':job.input_asset_id,'rules_versions':job.screenplay_json['versions'],'production_auto_started':False}))
-        document.review_state='approved';job.review_state='approved';job.status='approved';job.stage='approved';job.error_message=None
+            if automatic:
+                _start_linked_production(session,settings,job,result)
+        document.review_state=job.review_state='automatic' if automatic else 'approved'
+        job.status='approved';job.stage='video_automation' if automatic else 'approved';job.error_message=None
         session.commit();session.refresh(job);return job
     except IntegrityError as exc:
         session.rollback();current=get_job(session,identifier)
@@ -1040,6 +1060,47 @@ def approve(session,settings,identifier,payload):
         raise AppError(409,'screenplay_project_name_conflict','项目名称或建项状态已被其他窗口占用，已保留剧本与Word') from exc
     except Exception:
         session.rollback();raise
+
+
+def _start_linked_production(session, settings, job, result):
+    from app.services.studio_pipeline import create_pipeline
+    from app.services.studio_voice import assert_voice_preparation
+    consent=job.snapshot_json.get('allow_cloud_costs',False)
+    # The authoring job's visual-media permission also applies to its downstream input.
+    if job.input_mode!='text' and not source_input(job).get('allow_cloud_media_upload'):
+        consent=False
+    fallback=consent and job.snapshot_json.get('allow_paid_fallback',False)
+    try:
+        with session.begin_nested():
+            assert_voice_preparation(session,settings,job.project_id,consent,fallback)
+            run=create_pipeline(session,settings,job.project_id,{
+                'allow_cloud_costs':consent,'allow_paid_fallback':fallback,
+                'shot_ids':result['shot_ids'],'input_revision_id':result['script_id'],
+                'source':'screenplay_generation','automatic_final_assembly':True})
+            job.receipt_json={**job.receipt_json,'production_auto_started':True,'production_run_id':run.id}
+    except AppError as exc:
+        job.receipt_json={**job.receipt_json,'production_start_error':{'code':exc.code,'message':exc.message}}
+
+
+def _continue_with_video(settings,factory,identifier):
+    with factory() as session:
+        job=session.get(Job,identifier)
+        if not job or job.project_id or job.status!='awaiting_review' or job.stage!='awaiting_review':
+            return
+        available=documents(session,job.id)
+        if not available:
+            set_stage(session,job,'export_failed','failed','自动建项缺少已保存的 Word。请重试 Word 导出。')
+            return
+        document=available[-1]
+        try:
+            approve(session,settings,job.id,ApproveScreenplay(expected_revision=job.revision,
+                document_id=document.id,approve=True,create_project=True),automatic=True)
+        except AppError as exc:
+            session.rollback()
+            job=get_job(session,identifier)
+            if not job.project_id and job.status=='awaiting_review':
+                set_stage(session,job,'awaiting_review','video_setup_failed',exc.message)
+
 
 def _adopt_references(session,settings,job,result,targets):
     asset=session.get(Asset,job.input_asset_id) if job.input_asset_id else None
@@ -1097,6 +1158,13 @@ def export_new_version(session,settings,identifier,revision):
     return job
 
 async def screenplay_tick(settings,factory):
+    with factory() as session:
+        ready_for_video=session.scalar(select(Job.id).where(Job.status=='awaiting_review',Job.stage=='awaiting_review',
+            Job.project_id.is_(None),Job.capability_test.is_(False),Job.snapshot_json['produce_video'].as_boolean().is_(True))
+            .order_by(Job.created_at,Job.id).limit(1))
+    if ready_for_video:
+        await asyncio.to_thread(_continue_with_video,settings,factory,ready_for_video)
+        return
     with factory() as session:
         local_identifier=cloud_identifier=None
         candidates=session.scalars(select(Job).where(Job.status=='queued').order_by(Job.created_at,Job.id).execution_options(yield_per=64))

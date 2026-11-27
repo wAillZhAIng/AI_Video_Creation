@@ -24,6 +24,9 @@ def inspect_reference_budget_repairs(session,settings,run,nodes):
             continue
         try:
             service,snapshot=_service(session,run,'image','keyframe_image',item['target_id'])
+            observed = (service.capabilities_json or {}).get('reference_image') or {}
+            if observed.get('state') not in {'detected','verified'}:
+                raise AppError(409,'reference_budget_capability_missing','当前服务缺少参考图能力回执，请重新测试连接；未自动重排或提交模型。')
             limit=native_visual_reference_limit(snapshot,service.capabilities_json)
             if snapshot['provider']!='comfyui' or snapshot.get('is_cloud') or limit<=4:
                 raise AppError(409,'reference_budget_adapter_unverified','当前服务／模型没有匹配的原生多参考图链能力，未更换服务或丢弃图片。')

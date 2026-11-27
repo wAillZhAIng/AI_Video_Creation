@@ -83,9 +83,17 @@ def parse_shot_duration(value: str, *, timeline=False) -> float:
             duration = annotation['pipe'] or annotation['paren']
             duration = re.sub(r'^(?:时长|duration)\s*[:=]?\s*', '', duration.strip(), flags=re.I)
             declared = _elapsed(duration)
+            # Both “00:00–00:03（3秒）” and “3秒（00:00–00:03）”
+            # declare the same interval. Validate both values; never default
+            # a valid reversed annotation to the suggested five-second shot.
+            leading = _elapsed(annotation['interval'].strip())
+            if declared is None and leading is not None and is_time_range(duration, timeline=True):
+                declared = leading
+                text = duration
+            else:
+                text = annotation['interval']
             if declared is None:
                 raise ValueError('时间区间附带的时长无法识别')
-            text = annotation['interval']
         seconds = _interval_seconds(text, declared, timeline=timeline)
         if seconds is None:
             raise ValueError('无法确定时长，请填写秒数或明确的起止时间码')

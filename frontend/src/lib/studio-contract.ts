@@ -11,6 +11,7 @@ export interface StudioProductReferencePlan {
 export interface PipelineStart {
   dialogue_audio_policy?: "auto" | "native" | "tts" | "skip" | null;
   automatic_draft_assembly?: boolean;
+  automatic_final_assembly?: boolean;
   product_reference_plan?: StudioProductReferencePlan | null;
   quality?: QualitySettings | null;
   allow_cloud_costs?: boolean;

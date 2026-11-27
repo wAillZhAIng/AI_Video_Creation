@@ -63,10 +63,10 @@ describe("AppShell provider truth labels", () => {
     const user=userEvent.setup();
     render(<MemoryRouter><AppShell><p>测试内容</p></AppShell></MemoryRouter>);
     const primary=within(screen.getByRole('navigation',{name:'主导航'}));
-    expect(primary.getAllByRole('link').map(link=>link.textContent)).toEqual(['项目工作台','剧本生成','脚本与分镜','成片审核','合成成片','系统设置']);
+    expect(primary.getAllByRole('link').map(link=>link.textContent)).toEqual(['项目工作台','剧本生成','脚本与分镜','系统设置']);
     expect(primary.getByRole('link',{name:'脚本与分镜'})).toHaveAttribute('href','/storyboard');
-    expect(primary.getByRole('link',{name:'成片审核'})).toHaveAttribute('href','/review');
-    expect(primary.getByRole('link',{name:'合成成片'})).toHaveAttribute('href','/final');
+    expect(primary.queryByRole('link',{name:'成片审核'})).not.toBeInTheDocument();
+    expect(primary.queryByRole('link',{name:'合成成片'})).not.toBeInTheDocument();
     await user.click(screen.getByText('辅助与高级工具'));
     expect(within(screen.getByRole('navigation',{name:'辅助与高级工具'})).getByRole('link',{name:'人物素材库'})).toHaveAttribute('href','/characters');
     expect(within(screen.getByRole('navigation',{name:'辅助与高级工具'})).queryByRole('link',{name:'脚本与分镜'})).not.toBeInTheDocument();
@@ -76,22 +76,14 @@ describe("AppShell provider truth labels", () => {
     expect(screen.queryByRole('link',{name:'视频制作'})).not.toBeInTheDocument();
   });
 
-  it('shows a live queue when compiler health is temporarily withheld during work',async()=>{
+  it('shows a live queue when native H3 health is temporarily withheld during work',async()=>{
     vi.spyOn(api,'getContextProviderHealth').mockResolvedValue({ok:false,connected:true,ready:false,busy:true,mode:'real'});
     render(<MemoryRouter><AppShell><p>测试内容</p></AppShell></MemoryRouter>);
     expect(await screen.findByText('本地 H3 队列处理中')).toBeInTheDocument();
     expect(screen.queryByText('本地后端不可达')).not.toBeInTheDocument();
   });
 
-  it('shows Qwen processing when the video compiler is waiting to use the GPU',async()=>{
-    vi.spyOn(api,'getContextProviderHealth').mockResolvedValue(
-      {ok:false,connected:true,ready:false,busy:true,busy_reason:'qwen',mode:'real'});
-    render(<MemoryRouter><AppShell><p>测试内容</p></AppShell></MemoryRouter>);
-    expect(await screen.findByText('本地 Qwen 处理中')).toBeInTheDocument();
-    expect(screen.queryByText('本地模型未就绪')).not.toBeInTheDocument();
-  });
-
-  it.each([['项目工作台','/'],['脚本与分镜','/storyboard'],['成片审核','/review'],['合成成片','/final']])('keeps the older current project when opening %s without carrying another module’s selection',async(label,path)=>{
+  it.each([['项目工作台','/'],['脚本与分镜','/storyboard']])('keeps the older current project when opening %s without carrying another module’s selection',async(label,path)=>{
     vi.spyOn(api,'getContextProviderHealth').mockResolvedValue({ok:true,connected:true,configured:true,provider:'comfyui_h3',mode:'real'});
     const user=userEvent.setup();
     render(<MemoryRouter initialEntries={['/storyboard?project=prj_older&shot=old-shot&video=old-video&job=old-job&slot=video_generation&workspace=review#old-details']}><AppShell><LocationProbe/></AppShell></MemoryRouter>);
@@ -110,7 +102,7 @@ describe("AppShell provider truth labels", () => {
     render(<MemoryRouter initialEntries={['/?project=%20%20&shot=old-shot']}><AppShell><p>内容</p></AppShell></MemoryRouter>);
     const primary=within(screen.getByRole('navigation',{name:'主导航'}));
     expect(primary.getByRole('link',{name:'项目工作台'})).toHaveAttribute('href','/');
-    expect(primary.getByRole('link',{name:'成片审核'})).toHaveAttribute('href','/review');
+    expect(primary.getByRole('link',{name:'脚本与分镜'})).toHaveAttribute('href','/storyboard');
     expect(await screen.findByText('ComfyUI 已连接')).toBeInTheDocument();
   });
 

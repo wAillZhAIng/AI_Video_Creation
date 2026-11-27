@@ -67,8 +67,8 @@ def bind_product(client, settings, product):
         shot = m.StoryboardShot(project_id=project['id'], order=1, scene_title='Local fixture product view')
         session.add(shot)
         session.flush()
-        frozen = product_library.freeze_products(session, settings,
-            [ProductSelection(product_id=product['id'], image_ids=[image['id'] for image in product['images']])])[0]
+        frozen = product_library.freeze_video_product_references(session, settings,
+            product['id'], [image['id'] for image in product['images']])
         project_binding = m.ProjectProductBinding(project_id=project['id'], product_id=product['id'], snapshot_json=frozen)
         shot_binding = m.ShotProductBinding(project_id=project['id'], shot_id=shot.id, product_id=product['id'],
             image_ids_json=[image['id'] for image in frozen['images']], state_json={'visible_state': 'visible'})
@@ -527,7 +527,8 @@ def test_studio_plan_selects_explicit_images_by_script_entities_and_preserves_ex
             assert uploaded[2]['id'] not in {x['id'] for x in refs}
             assert session.get(m.StoryboardShot,shot.id).status=='approved'
         assert run.snapshot_json['options']['product_reference_plan']==plan
-        assert any(n['kind']=='keyframe' and n['target_id']==shots[0].id for n in run.nodes_json)
+        assert any(n['kind']=='video' and n['target_id']==shots[0].id for n in run.nodes_json)
+        assert not any(n['kind']=='keyframe' and n['target_id']==shots[0].id for n in run.nodes_json)
 
 
 def test_studio_product_plan_does_not_guess_when_brand_absent(client, settings):
@@ -565,3 +566,117 @@ def test_studio_product_plan_subset_uses_anchor_from_current_full_script(client,
         assert [x['shot_id'] for x in result['affected_shots']]==[shots[1].id]
         assert not product_library.shot_product_snapshot(session,shots[0])
         assert product_library.shot_product_snapshot(session,shots[1])
+
+
+def test_studio_product_plan_accepts_explicit_single_token_brand_and_word_product_lock(client, settings):
+    response=client.post('/api/product-library',json={'name':'Owala FreeSip','brand':'Owala','category':'drinkware'})
+    assert response.status_code==201,response.text
+    product=response.json()
+    image=upload(client,product['id'],[png()])['added'][0]
+    project=client.post('/api/projects',json={'name':'Owala explicit product lock'}).json()
+    shots=[]
+    source='''核心产品锁定：Owala FreeSip 深棕色保温杯。全片锁定同一只 Owala FreeSip，镜头推近、拉远时产品身份保持一致。'''
+    with client.app.state.session_factory() as session:
+        project_row=session.get(m.Project,project['id'])
+        project_row.source_text=source
+        for order in range(1,4):
+            shot=m.StoryboardShot(project_id=project['id'],order=order,scene_title=f'无结构化道具的镜头 {order}',status='draft')
+            session.add(shot);shots.append(shot)
+        session.commit()
+        plan={'product_id':product['id'],'image_ids':[image['id']],'selection_reason':'User selected the matching Owala product photos'}
+        result=product_library.apply_studio_product_plan(session,settings,project['id'],shots,plan)
+        assert result['project_script_lock_used'] is True
+        assert result['anchor_entity_ids']==[]
+        assert {x['text_anchor']['method'] for x in result['affected_shots']}=={'explicit_project_lock_with_unparsed_shot_details'}
+        assert {x['shot_id'] for x in result['affected_shots']}=={shot.id for shot in shots}
+        assert all(product_library.shot_product_snapshot(session,shot) for shot in shots)
+
+
+def test_studio_product_plan_requires_explicit_lock_for_unstructured_word_import(client, settings):
+    response=client.post('/api/product-library',json={'name':'Owala FreeSip','brand':'Owala','category':'drinkware'})
+    assert response.status_code==201,response.text
+    product=response.json()
+    image=upload(client,product['id'],[png()])['added'][0]
+    project=client.post('/api/projects',json={'name':'Owala mention without lock'}).json()
+    with client.app.state.session_factory() as session:
+        project_row=session.get(m.Project,project['id'])
+        project_row.source_text='A person sees an Owala FreeSip cup in a shop.'
+        shot=m.StoryboardShot(project_id=project['id'],order=1,scene_title='Shop scene',status='draft')
+        session.add(shot);session.commit()
+        plan={'product_id':product['id'],'image_ids':[image['id']],'selection_reason':'User selected the matching product photos'}
+        with pytest.raises(AppError) as e:
+            product_library.apply_studio_product_plan(session,settings,project['id'],[shot],plan)
+        assert e.value.code=='product_script_anchor_missing'
+
+
+def test_native_h3_project_can_save_nine_views_without_spending_keyframe_budget(client, settings):
+    product=upload(client,create_product(client, 'Nine-view product')['id'],[png(index) for index in range(9)])['product']
+    project_id,shot_id,_,_=bind_product(client,settings,product)
+    with client.app.state.session_factory() as session:
+        service=session.scalar(select(m.AIService).where(m.AIService.module=='video_generation',m.AIService.is_default.is_(True)))
+        service.settings_json={**service.settings_json,'workflow_profile':'native_h3_r2v'}
+        session.commit()
+    endpoint=f'/api/product-library/projects/{project_id}/references'
+    current=client.get(endpoint,params={'product_id':product['id']}).json()
+    assert current['limits']['max_reference_images']==9
+    ids=[image['id'] for image in product['images']]
+    saved=client.put(endpoint,json={'product_id':product['id'],'expected_token':current['expected_token'],
+        'image_ids':ids,'shot_ids':[shot_id]})
+    assert saved.status_code==200,saved.text
+    assert saved.json()['image_ids']==ids
+    with client.app.state.session_factory() as session:
+        shot=session.get(m.StoryboardShot,shot_id)
+        references=product_library.shot_references(session,settings,shot,stage='video')
+        assert [image['sha256'] for image in references]==[image['sha256'] for image in product['images']]
+        assert product_library.shot_references(session,settings,shot,stage='keyframe')==[]
+        assert session.scalar(select(m.GenerationJob.id)) is None
+
+
+def test_reference_selection_reads_word_import_placeholder_snapshot(client):
+    product = create_product(client)
+    project = client.post('/api/projects', json={'name': 'Imported product snapshot'}).json()
+    with client.app.state.session_factory() as session:
+        shot = m.StoryboardShot(project_id=project['id'], order=1, scene_title='Imported', status='draft')
+        session.add(shot)
+        session.flush()
+        session.add(m.ProjectProductBinding(
+            project_id=project['id'], product_id=product['id'],
+            snapshot_json={'import_id': 'legacy-word-import'},
+        ))
+        session.add(m.ShotProductBinding(
+            project_id=project['id'], shot_id=shot.id, product_id=product['id'],
+            image_ids_json=[], state_json={},
+        ))
+        session.commit()
+        shot_id = shot.id
+    response = client.get('/api/product-library/projects/' + project['id'] + '/shots/' + shot_id + '/references')
+    assert response.status_code == 200, response.text
+    assert response.json()['products'][0]['name'] == product['name']
+
+
+@pytest.mark.parametrize('path_kind', ['relative_path', 'media_url'])
+def test_frozen_product_image_path_uses_existing_snapshot_fields(client, settings, path_kind):
+    product = create_product(client)
+    upload(client, product['id'], [png()])
+    product = client.get('/api/product-library/' + product['id']).json()
+    _, shot_id, binding_id, frozen = bind_product(client, settings, product)
+    expected = frozen['images'][0]['relative_path']
+    with client.app.state.session_factory() as session:
+        binding = session.get(m.ProjectProductBinding, binding_id)
+        snapshot = copy.deepcopy(binding.snapshot_json)
+        if path_kind == 'media_url':
+            snapshot['images'][0].pop('relative_path')
+        binding.snapshot_json = snapshot
+        session.commit()
+        shot = session.get(m.StoryboardShot, shot_id)
+        refs = product_library.shot_references(session, settings, shot)
+        assert refs[0]['relative_path'] == expected
+        assert product_library.shot_product_snapshot(session, shot)[0]['images'][0]['relative_path'] == expected
+        assert binding.snapshot_json == snapshot
+
+
+@pytest.mark.parametrize('image', [{}, {'media_url': 'https://other.invalid/image.png'}])
+def test_frozen_product_image_rejects_missing_local_path(image):
+    with pytest.raises(AppError) as error:
+        product_library._frozen_image_relative_path(image)
+    assert error.value.code == 'product_frozen_image_missing'

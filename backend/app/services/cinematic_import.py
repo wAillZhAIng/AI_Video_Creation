@@ -4,6 +4,7 @@ Heuristics never certify semantic understanding: inferred splits/attribution rem
 suggestions and unknown prose is retained for review.
 """
 import copy
+import math
 import re
 import unicodedata
 
@@ -35,7 +36,8 @@ _WORD_FIELDS = {
     '音频与音效':'音效','音频设计':'音效','sound design':'音效','sfx':'音效',
     '字幕':'字幕','字幕内容':'字幕','屏幕文字':'字幕','屏幕文本':'字幕','字幕与屏幕文字':'字幕',
     'subtitles':'字幕','captions':'字幕','on-screen text':'字幕',
-    '画幅比例':'画幅','宽高比':'画幅','aspect ratio':'画幅','aspect':'画幅',
+    '画幅比例':'画幅','宽高比':'画幅','画幅与设备':'画幅','视频画幅':'画幅','aspect ratio':'画幅','aspect':'画幅',
+    '空间环境':'环境','环境描述':'环境','空间描述':'环境','氛围基调':'氛围','音频与口播':'音频与口播',
 }
 _WORD_FIELDS.update(dict.fromkeys(MUSIC_FIELDS, '音乐'))
 _WORD_FIELDS.update(dict.fromkeys(MIXED_MUSIC_FIELDS, '音乐与音效'))
@@ -47,6 +49,132 @@ _NUMBERED_SHOT = re.compile(
     r'(?:镜头|分镜|shots?|cuts?)\s*[#＃]?\s*([\d一二三四五六七八九十]+))'
     r'\s*[:：.、|｜\-]*\s*(.*)$', re.I,
 )
+_TIMECODE = r"\d{1,3}:\d{2}(?::\d{2})?(?:[.,]\d+)?"
+_TIMELINE_RANGE = re.compile(
+    rf"(?P<start>{_TIMECODE})\s*(?:-|–|—|−|~|～|至|到|→)\s*(?P<end>{_TIMECODE})"
+)
+_TIMELINE_INTRO = re.compile(
+    r"^(?:逐秒)?(?:时间轴|时间线|分镜时间轴|分镜时间线|镜头列表|镜头表|分镜表|timeline|shot timeline|shot list)", re.I
+)
+_INLINE_TIMED_SHOT = re.compile(
+    r'【\s*(?P<start>\d+(?:[.,]\d+)?)\s*(?:秒|s|sec(?:onds?)?)?\s*'
+    r'(?:-|–|—|−|~|～|至|到|→)\s*(?P<end>\d+(?:[.,]\d+)?)\s*'
+    r'(?:秒|s|sec(?:onds?)?)?\s*(?:[|｜])\s*(?P<title>[^】\n]+?)\s*】', re.I,
+)
+_INLINE_FIELD = re.compile(
+    r'(?:景别与运镜|机位与运镜|运镜|景别|画面文字|屏幕文字|字幕|画面内容|画面描述|画面|台词|对白|'
+    r'口播|旁白|音频与口播|音效|环境声|音乐与音效|音乐)\s*[：:]',
+)
+_INLINE_CONSTRAINT = re.compile(r'(?:[一二三四五六七八九十\d]+[、.．])?\s*(?:全片约束|制作约束|制作规范|硬性约束)')
+# Matches 参考图N：...上传图片 filename in 【基础设定】 blocks
+_REF_IMAGE_DECL = re.compile(
+    r'参考图\s*(\d+)\s*[:：][^\n]*?(?:上传图片|图片名[称]?|文件名?)\s+([\w.\-]+\.(?:jpe?g|png|webp|gif))',
+    re.I,
+)
+# Matches shot-level product ref usage, e.g. "调用参考图2" or "参考图2"
+_SHOT_USES_REF = re.compile(r'(?:调用|使用|参考)参考图\s*(\d+)', re.I)
+
+
+def _timeline_header(text):
+    """Return an explicit timed-shot heading without changing its source text."""
+    cleaned = unicodedata.normalize('NFKC', text).strip().strip('【[]】')
+    match = _TIMELINE_RANGE.search(cleaned)
+    if not match or not is_time_range(match.group(0), timeline=True):
+        return None
+    prefix = cleaned[:match.start()].strip(' ：:（(')
+    # A timecode inside an action or dialogue is source content, not a new
+    # shot. Only a bare interval or an explicit timeline heading is structural.
+    if prefix and not _TIMELINE_INTRO.fullmatch(prefix.strip('】] ')):
+        return None
+    suffix = cleaned[match.end():].strip()
+    title_match = re.search(r'[（(]([^）)]+)[）)]', suffix)
+    if _TIMELINE_INTRO.match(prefix) and not title_match:
+        # A heading such as “逐秒时间线（00:00–00:15）” gives the overall
+        # runtime; it is not itself a rendered shot.
+        return None
+    title = title_match.group(1).strip() if title_match else suffix.strip(' ：:（()）[]【】')
+    return match.group('start'), match.group('end'), title
+
+
+def _inline_timed_shot_blocks(text, source):
+    """Normalize explicit in-paragraph timed Chinese shots without inventing facts."""
+    matches = list(_INLINE_TIMED_SHOT.finditer(text))
+    if len(matches) < 2:
+        return None
+    result=[]
+    def emit(value):
+        # `parse_blocks` uses source identity to carry a wrapped caption forward.
+        # These are distinct logical lines from one original paragraph, just like
+        # normalized table rows, so each needs a stable child source ID.
+        result.append(paragraph(value,f'{source}:inline:{len(result)+1}'))
+    preamble=text[:matches[0].start()].strip()
+    title_match=re.match(r'\s*(.+?)(?=(?:[一二三四五六七八九十\d]+[、.．])?\s*(?:整体设定|项目设定|脚本设定|参考引用|详细分镜))', preamble, re.S)
+    if title_match and title_match.group(1).strip():
+        emit('项目名称：'+title_match.group(1).strip())
+    emit('项目基本信息')
+    if preamble:
+        emit('制作约束：'+preamble)
+    emit('正文剧情')
+    trailing_constraints=[]
+    for index,match in enumerate(matches,1):
+        body=text[match.end():matches[index].start() if index<len(matches) else len(text)].strip()
+        constraint=_INLINE_CONSTRAINT.search(body)
+        if constraint:
+            trailing_constraints.append(body[constraint.start():].strip())
+            body=body[:constraint.start()].strip()
+        emit(f"分镜 {index} {match.group('title').strip()}")
+        emit(f"时段：{match.group('start')}秒–{match.group('end')}秒")
+        fields=list(_INLINE_FIELD.finditer(body))
+        if not fields:
+            if body:
+                emit('画面：'+body)
+            continue
+        prefix=body[:fields[0].start()].strip()
+        if prefix:
+            emit('画面：'+prefix)
+        subtitles=[]
+        for field_index,field in enumerate(fields):
+            label=field.group().rstrip('：:').strip()
+            value=body[field.end():fields[field_index+1].start() if field_index+1<len(fields) else len(body)].strip()
+            if not value:
+                continue
+            if label in {'景别与运镜','机位与运镜'}:
+                label='运镜'
+            elif label in {'画面文字','屏幕文字'}:
+                label='字幕'
+            if label in {'台词','对白','字幕'} and value.strip(' 。.') in {'无','无口播'}:
+                continue
+            if label=='字幕':
+                subtitles.append(value)
+            else:
+                emit(label+'：'+value)
+        for subtitle in subtitles:
+            emit('字幕：'+subtitle)
+    if trailing_constraints:
+        emit('额外约束')
+        for constraint in trailing_constraints:
+            emit('制作约束：'+constraint)
+    return result
+
+
+def _explicit_camera_move(value):
+    """Extract only an explicit movement phrase; composition stays separate."""
+    terms = (
+        (r'\bslow\s+push[- ]?in\b', 'Slow Push-in'),
+        (r'\bslow\s+pull[- ]?back\b', 'Slow Pull-back'),
+        (r'\bslow\s+dolly[- ]?in\b', 'Slow Dolly-in'),
+        (r'\bslow\s+dolly[- ]?out\b', 'Slow Dolly-out'),
+        (r'\bpan\s+left\b', 'Pan left'),
+        (r'\bpan\s+right\b', 'Pan right'),
+        (r'\btilt\s+up\b', 'Tilt up'),
+        (r'\btilt\s+down\b', 'Tilt down'),
+        (r'镜头[^。；;\n]{0,40}(?:缓慢|平滑|匀速)?(?:向前推近|前推|推近)', '缓慢前推'),
+        (r'镜头[^。；;\n]{0,40}(?:缓慢|平滑|匀速)?(?:向后拉远|后拉|拉远)', '缓慢后拉'),
+    )
+    for pattern, normalized in terms:
+        if re.search(pattern, value, re.I):
+            return normalized
+    return None
 
 
 def timeline_table(block, canonical_field):
@@ -68,7 +196,7 @@ def timeline_table(block, canonical_field):
 
 
 def normalize_blocks(blocks,rules):
-    result=[];notes=[];names=[];scene=False;shot=False;in_people=False;timeline=False;prelude=False
+    result=[];notes=[];names=[];scene=False;shot=False;in_people=False;timeline=False;prelude=False;named_person=False
     aliases={name.casefold():canonical for canonical,values in rules['aliases'].items() for name in values}
 
     def canonical_field(label):
@@ -110,30 +238,143 @@ def normalize_blocks(blocks,rules):
                 notes.append({'source':block['id'],'kind':'table_normalized','message':'场景/分镜表转为统一结构，逐行保留来源'})
             else:result.append({**block,'rows':[canon,*rows[1:]]})
             continue
-        original=block['text'];text=re.sub(r'^\s*(?:#{1,6}\s*|[-•]\s*)','',original).strip();source=block['id']
+        original=block['text'];text=re.sub(r'^\s*(?:#{1,6}\s*|[-–—−•]\s*)','',original).strip();source=block['id']
         if not text:result.append(block);continue
-        heading=re.sub(r'^\d+(?:\.\d+)*[.)、\s]+','',text)
+        # Handle 【Section】 prefixed paragraphs (non-template format like 33.docx)
+        bracket_match = re.match(r'^【\s*([^】]+?)\s*】\s*(.*)', text, re.S)
+        if bracket_match:
+            sec_name = unicodedata.normalize('NFKC', bracket_match.group(1)).strip()
+            sec_body = bracket_match.group(2).strip()
+            if sec_name in ('基础设定', '基础信息', '基础资料'):
+                # Extract 参考图N：...文件名 declarations and emit as parseable metadata lines
+                for ref_num, ref_file in _REF_IMAGE_DECL.findall(sec_body):
+                    result.append(paragraph(f'产品参考图：{ref_num}:{ref_file}', source))
+                # Extract shot-level 分镜X中调用 usage hints
+                for shot_ref_match in re.finditer(
+                        r'参考图\s*(\d+)[^。\n]*?(?:在\s*)?(分镜[一二三四五六七八九十\d]+(?:[、及和，,]\s*分镜[一二三四五六七八九十\d]+)*)[^。\n]*?调用',
+                        sec_body):
+                    for shot_num in re.findall(r'分镜([一二三四五六七八九十\d]+)', shot_ref_match.group(2)):
+                        result.append(paragraph(f'分镜产品图使用：{shot_num}:{shot_ref_match.group(1)}', source))
+                if sec_body:
+                    result.append(paragraph('制作约束：' + sec_body[:500], source))
+                prelude = True
+                continue
+            elif sec_name in ('氛围与画质', '画质与氛围', '风格与画质', '视觉风格'):
+                if sec_body:
+                    result.append(paragraph('制作约束：' + sec_body, source))
+                continue
+            elif sec_name == '画面内容':
+                # Expand each inline shot paragraph into separate field lines so
+                # parse_blocks can route each field (画面内容, 运镜, 音效, 口播…)
+                result.append(paragraph('正文剧情', source))
+                if not scene:
+                    result.append(paragraph('场景 1 待确认场景', source))
+                    scene = True
+                # Split on shot boundaries
+                parts_raw = re.split(r'(?=(?:分镜|镜头)\s*[一二三四五六七八九十\d]+\s*[:：])', sec_body)
+                _SHOT_FIELD = re.compile(
+                    r'(?:景别|机位|角度|构图|焦段|运镜|镜头运动|画面内容|画面描述|视觉重点|画面|动作|'
+                    r'口播|旁白|音频与口播|环境声|音效|音乐与音效|音乐|时长|建议时长|时段|画幅|灯光)\s*[:：]'
+                )
+                for part in parts_raw:
+                    part = part.strip()
+                    if not part:
+                        continue
+                    # Find first line (shot heading) vs remaining body
+                    first_line, _, rest = part.partition('\n')
+                    first_line = first_line.strip()
+                    rest = rest.strip()
+                    # Combine rest back so we scan the full body after shot heading
+                    body = rest if rest else ''
+                    # Also scan body embedded in first_line after the shot number/title
+                    # e.g. "分镜一：00:00-00:05 景别：中近景 运镜：手持微晃..."
+                    shot_match = re.match(
+                        r'^((?:分镜|镜头)\s*[一二三四五六七八九十\d]+)\s*[:：]\s*', first_line
+                    )
+                    if shot_match:
+                        after_num = first_line[shot_match.end():].strip()
+                        # Emit shot heading with just the timecode/brief title
+                        time_part = re.match(r'(\d{1,2}[:：]\d{2}[-–—]\d{1,2}[:：]\d{2})', after_num)
+                        shot_title = time_part.group(1) if time_part else after_num[:60]
+                        result.append(paragraph(f'{shot_match.group(1)} {shot_title}', source + ':s'))
+                        # Inline fields after the shot number on same line
+                        fields = list(_SHOT_FIELD.finditer(after_num))
+                        for fi, fm in enumerate(fields):
+                            end = fields[fi+1].start() if fi+1 < len(fields) else len(after_num)
+                            field_label = after_num[fm.start():fm.end()].rstrip('：:').strip()
+                            field_value = after_num[fm.end():end].strip().rstrip('。，；')
+                            if field_value:
+                                result.append(paragraph(f'{field_label}：{field_value}', source + ':f'))
+                    else:
+                        result.append(paragraph(first_line, source + ':s'))
+                    # Expand any remaining body lines
+                    if body:
+                        body_fields = list(_SHOT_FIELD.finditer(body))
+                        if body_fields:
+                            for fi, fm in enumerate(body_fields):
+                                end = body_fields[fi+1].start() if fi+1 < len(body_fields) else len(body)
+                                field_label = body[fm.start():fm.end()].rstrip('：:').strip()
+                                field_value = body[fm.end():end].strip().rstrip('。，；')
+                                if field_value:
+                                    result.append(paragraph(f'{field_label}：{field_value}', source + ':fb'))
+                        else:
+                            result.append(paragraph(body, source + ':fb'))
+                shot = True; prelude = False; in_people = False
+                continue
+        inline_timed=_inline_timed_shot_blocks(text,source)
+        if inline_timed:
+            result.extend(inline_timed)
+            notes.append({'source':source,'kind':'inline_timed_sections_normalized',
+                'message':'单段落中的显式时间分镜已按原文拆为统一结构'})
+            scene=True;shot=True;in_people=False;timeline=True;prelude=False
+            continue
+        heading=re.sub(r'^\d+(?:\.\d+)*[.)、\s]+','',text).strip().rstrip(' :：')
         heading_key=unicodedata.normalize('NFKC',heading).casefold().strip(' :：')
-        if heading_key in _TIMELINE_HEADINGS:
+        script_title = re.fullmatch(r'脚本\s*\d+\s*[:：]\s*(.+)', text)
+        if script_title and not shot and not scene:
+            result.append(paragraph('项目名称：'+script_title[1],source))
+            continue
+        timed_header = _timeline_header(text)
+        if timed_header:
+            start, end, title = timed_header
+            index=sum(x.get('text','').startswith('分镜 ') for x in result)+1
+            result.extend([
+                paragraph(f'分镜 {index} {title or f"时间段 {start}–{end}"}',source),
+                paragraph(f'时段：{start}–{end}',source),
+            ])
+            timeline=True;shot=True;prelude=False;in_people=False
+            continue
+        if heading_key in _TIMELINE_HEADINGS or _TIMELINE_INTRO.match(heading_key):
             timeline=True;prelude=False;shot=False;in_people=False
             result.append(paragraph('分镜正文',source))
             continue
-        if heading_key in {'物理与画面硬性规范','全片制作规范','全片约束','制作规范','technical requirements'}:
+        if heading_key in {'物理与画面硬性规范','物理与硬性规范','全片制作规范','全片约束','制作规范','technical requirements',
+                           '技术参数','技术参数和禁止项','技术参数与禁止项','严格禁止项','禁止项'}:
             prelude=True;timeline=False;shot=False;in_people=False
             result.append(paragraph('额外约束',source))
             continue
         if heading in ['项目基本信息','项目资料','人物设定','场景设定','正文剧情','分镜正文','连续性要求','额外约束','编写说明','梗概','制作资料']:
             scene=shot=False;in_people=heading=='人物设定'
+            named_person=False
+            prelude=heading in {'连续性要求','额外约束'}
+            if heading=='场景设定':
+                scene=True
+                index=sum(x.get('text','').startswith('场景 ') for x in result)+1
+                result.append(paragraph(f'场景 {index} 场景设定',source))
+                continue
+            text=heading
+            result.append(paragraph(text,source))
+            continue
         if heading in ['角色介绍','角色设定','主要人物','人物介绍','人物小传','人物表','Characters','CHARACTERS','Cast']:
             text='人物设定';in_people=True;scene=shot=False
         elif heading in ['故事梗概','剧情梗概','Synopsis']:text='梗概';in_people=False
         elif heading in ['剧本正文','剧情正文','故事正文','SCREENPLAY']:text='正文剧情';in_people=False
         character = character_heading(text)
         if character and not scene:
-            names.append(character[0]);in_people=True
+            names.append(character[0]);in_people=True;named_person=True
         compact=re.match(r'^([\u4e00-\u9fa5A-Za-z·]{2,20})[（(](\d{2})\s*岁?[,，、]?\s*(.*)[）)]$',text)
         if compact and in_people and not scene:
-            name,age,identity=compact.groups();names.append(name)
+            name,age,identity=compact.groups();names.append(name);named_person=True
             result.extend([paragraph('人物：'+name,source),paragraph('年龄：'+age,source)])
             if identity:result.append(paragraph('身份：'+identity,source))
             continue
@@ -146,7 +387,10 @@ def normalize_blocks(blocks,rules):
             result.append(paragraph(text,source));result.append(paragraph('内外景：'+('内景' if spatial[1] in ['INT.','内景'] else '外景'),source))
             if spatial[3]:result.append(paragraph('时间：'+spatial[3],source))
             scene=True;shot=False;in_people=False;continue
-        if re.match(r'^场景\s*[\d一二三四五六七八九十]+',text):scene=True;shot=False;in_people=False
+        if re.match(r'^场景\s*[\d一二三四五六七八九十]+',text):
+            scene=True;shot=False;in_people=False;prelude=False;named_person=False
+            result.append({**block,'text':text})
+            continue
         first,_,remainder=text.partition('\n')
         shot_heading=_NUMBERED_SHOT.fullmatch(first)
         period=first.strip('[]【】()（） ')
@@ -161,13 +405,40 @@ def normalize_blocks(blocks,rules):
             numbers={v:str(i) for i,v in enumerate('一二三四五六七八九',1)}
             number=shot_heading[1] or shot_heading[2]
             title=shot_heading[3] or '待命名镜头'
-            text='分镜 '+numbers.get(number,number)+' '+title
-            candidates=[title, *re.findall(r'[（(\[【](.*?)[）)\]】]',title)]
-            shot_period=next((value for value in candidates if is_time_range(value,timeline=True)),None)
+            # Detect inline fields embedded in the title (e.g. "景别：中近景 运镜：手持微晃 画面内容：…")
+            _INLINE_FIELD_SPLIT = re.compile(
+                r'(?:景别|机位|角度|构图|焦段|运镜|镜头运动|画面内容|画面描述|视觉重点|画面|动作|'
+                r'口播|旁白|音频与口播|环境声|音效|音乐与音效|音乐|时长|建议时长|时段|画幅|灯光)\s*[:：]'
+            )
+            inline_fields = list(_INLINE_FIELD_SPLIT.finditer(title))
+            if inline_fields:
+                # Extract clean title up to first field
+                prefix = title[:inline_fields[0].start()].strip()
+                candidates = [prefix, *re.findall(r'[（(\[【](.*?)[）)\]】]', prefix)]
+                shot_period = next((v for v in candidates if is_time_range(v, timeline=True)), None)
+                clean_title = prefix or ('分镜' + numbers.get(number, number))
+                result.append(paragraph('分镜 ' + numbers.get(number, number) + ' ' + clean_title, source))
+                if shot_period:
+                    result.append(paragraph('时段：' + shot_period, source))
+                # Emit each inline field as separate line
+                for fi, fm in enumerate(inline_fields):
+                    end = inline_fields[fi+1].start() if fi+1 < len(inline_fields) else len(title)
+                    field_label = title[fm.start():fm.end()].rstrip('：:').strip()
+                    field_value = title[fm.end():end].strip().rstrip('。，；、')
+                    if field_value:
+                        result.append(paragraph(field_label + '：' + field_value, source))
+                if remainder:
+                    result.append({**block, 'text': remainder, 'style': 'Compatibility normalized'})
+                shot = True; prelude = False
+                continue
+            # No inline fields: use full title as before
+            text = '分镜 ' + numbers.get(number, number) + ' ' + title
+            candidates = [title, *re.findall(r'[（(\[【](.*?)[）)\]】]', title)]
+            shot_period = next((value for value in candidates if is_time_range(value, timeline=True)), None)
             if shot_period:
-                text+='\n时段：'+shot_period
-            if remainder:text+='\n'+remainder
-            shot=True;prelude=False
+                text += '\n时段：' + shot_period
+            if remainder: text += '\n' + remainder
+            shot = True; prelude = False
         parts=re.split('[:：]',text,maxsplit=1)
         if len(parts)==2:
             key,value=parts[0].strip(),parts[1].strip();canonical=canonical_field(key)
@@ -175,6 +446,22 @@ def normalize_blocks(blocks,rules):
                 index=sum(x.get('text','').startswith('场景 ') for x in result)+1
                 result.extend([paragraph(f'场景 {index} 场景设定',source),paragraph('环境：'+value,source)])
                 scene=True;in_people=False
+                continue
+            if canonical=='摄影与构图' and shot:
+                result.append(paragraph('摄影与构图：'+value,source))
+                movement=_explicit_camera_move(value)
+                if movement:
+                    result.append(paragraph('运镜：'+movement,source))
+                continue
+            if in_people and not shot and not named_person and canonical not in {'人物','角色'}:
+                # Keep appearance notes for anonymous/POV performers as source
+                # constraints; do not invent a named identity from them.
+                result.append(paragraph('制作约束：'+text,source))
+                continue
+            if not prelude and scene and not shot and canonical not in {'地点','时间','天气','内外景','空间布局','环境','氛围','灯光','主色调','关键道具','连续性'}:
+                # Free-form scene labels (for example vehicle/interior details)
+                # belong to the scene description, not to a new subject.
+                result.append(paragraph('环境：'+key+'：'+value,source))
                 continue
             if canonical=='时段' and is_time_range(value,timeline=True) and (timeline or not shot):
                 index=sum(x.get('text','').startswith('分镜 ') for x in result)+1
@@ -212,6 +499,21 @@ def build_ir(blocks,legacy_parser):
     screenplay_blocks,music=word_music_sections(blocks)
     rules=rules_bundle();normalized,notes=normalize_blocks(screenplay_blocks,rules)
     ir=legacy_parser(normalized)
+    source_text=unicodedata.normalize('NFKC',blocks_text(blocks))
+    aspect_values={re.sub(r'\s+','',value.replace('：',':')) for value in re.findall(
+        r'(?<![\d:：])(16\s*[:：]\s*9|9\s*[:：]\s*16|1\s*[:：]\s*1)(?![\d:：])',source_text)}
+    if not aspect_values:
+        for width,height in re.findall(r'(?<!\d)(\d{3,5})\s*[xX×]\s*(\d{3,5})(?!\d)',source_text):
+            divisor=math.gcd(int(width),int(height))
+            ratio=f'{int(width)//divisor}:{int(height)//divisor}'
+            if ratio in {'16:9','9:16','1:1'}:aspect_values.add(ratio)
+    if len(aspect_values)==1:
+        ir['project']['aspect_ratio']=next(iter(aspect_values))
+        ir['project'].setdefault('provenance',{})['aspect_ratio']=field_provenance(
+            ir['project']['aspect_ratio'],[b['id'] for b in blocks],reason='原始 Word 明确画幅')
+    elif len(aspect_values)>1:
+        notes.append({'source':blocks[0]['id'] if blocks else 'document:empty','kind':'unresolved_semantics',
+            'message':'原始 Word 出现互相冲突的输出画幅：'+', '.join(sorted(aspect_values))})
     if not ir['scenes'] or not ir['shots']:
         # All readable Word is previewable. Unknown free text is not fabricated
         # into a cast or story; the proposed envelope must be confirmed.
@@ -258,6 +560,30 @@ def build_ir(blocks,legacy_parser):
     for design in ir['designs']:
         design['provenance']={key:field_provenance(value,design['source']) for key,value in design['spec'].items()}
     try:
+        # Sanitize shots before schema validation:
+        # 1. title empty or missing → use fallback
+        # 2. title over 240 chars → truncate to first sentence or 240 chars
+        # 3. duration_seconds out of [1,60] → clamp to range
+        for shot in ir.get('shots', []):
+            title = str(shot.get('title') or '').strip()
+            if not title:
+                title = '待确认分镜'
+            elif len(title) > 240:
+                # Try to cut at first sentence break within limit
+                for sep in ('。', '，', ',', '.', ' '):
+                    pos = title.rfind(sep, 0, 237)
+                    if pos > 10:
+                        title = title[:pos + 1]
+                        break
+                else:
+                    title = title[:240]
+            shot['title'] = title
+            dur = shot.get('duration_seconds', 5.0)
+            try:
+                dur = float(dur)
+            except (TypeError, ValueError):
+                dur = 5.0
+            shot['duration_seconds'] = max(1.0, min(60.0, dur))
         return ScreenplayIR.model_validate(ir).model_dump()
     except ValidationError as exc:
         errors = exc.errors(include_url=False, include_context=False, include_input=False)[:8]

@@ -8,10 +8,10 @@
     "min_comfyui_version": "0.38.0",
     "modifications": [
       "ref2va pruned w6a8 for measured 16311 MiB GPU",
-      "640x384 at 24 fps, 124 frames, 20 steps",
+      "768x1344 9:16 portrait canvas, 24 fps, 124 frames, SMD 4-step LoRA",
       "ComfyUI native automatic device/offload policy",
       "one approved identity image in Picture 1",
-      "removed optional turbo switches / LoRA branch",
+      "VAEDecodeTiled tile_size=128 temporal_size=8 for VRAM stability",
       "inlined resolution/duration/prompt primitives; same R2V-sampler-decode path",
       "MP4/H264 explicit"
     ],
@@ -51,15 +51,14 @@
       "filename_prefix"
     ],
     "reference_paths": [
-      [
-        "137",
-        "inputs",
-        "image"
-      ]
+      ["137", "inputs", "image"]
     ],
     "reference_tags": [
       "<Picture 1>"
     ],
+    "max_references": 9,
+    "product_reference_slot": 1,
+    "product_reference_note": "Picture 1 = character identity; Picture 2+ = product appearance. bind_ordered_reference_slots injects all supplied images.",
     "commercial_use": "unconfirmed; internal test only",
     "deployment_region": "mainland China (user confirmed)"
   },
@@ -105,8 +104,8 @@
           0
         ],
         "prompt": "Use <Picture 1> as the identity reference. Original adult woman, cinematic realism.",
-        "width": 640,
-        "height": 384,
+        "width": 768,
+        "height": 1344,
         "length": 124,
         "ref_image_size": "match",
         "vae": [
@@ -132,32 +131,36 @@
     "123": {
       "class_type": "KSamplerSelect",
       "inputs": {
-        "sampler_name": "res_multistep"
+        "sampler_name": "euler"
       }
     },
     "124": {
-      "class_type": "BasicScheduler",
+      "class_type": "ManualSigmas",
       "inputs": {
-        "model": [
-          "127",
-          0
-        ],
-        "scheduler": "simple",
-        "steps": 20,
-        "denoise": 1.0
+        "sigmas": "1.0, 0.9677419355, 0.9, 0.6666666667, 0.0"
+      }
+    },
+    "140": {
+      "class_type": "LoraLoaderModelOnly",
+      "inputs": {
+        "model": ["127", 0],
+        "lora_name": "SMD-MiniMax-H3-Ref2VA-4step.safetensors",
+        "strength_model": 1.0
+      }
+    },
+    "141": {
+      "class_type": "MiniMaxH3SigmaShift",
+      "inputs": {
+        "model": ["140", 0],
+        "shift_video": 12.0,
+        "shift_audio": 3.0
       }
     },
     "126": {
       "class_type": "BasicGuider",
       "inputs": {
-        "model": [
-          "127",
-          0
-        ],
-        "conditioning": [
-          "136",
-          0
-        ]
+        "model": ["141", 0],
+        "conditioning": ["136", 0]
       }
     },
     "125": {
@@ -186,16 +189,14 @@
       }
     },
     "122": {
-      "class_type": "VAEDecode",
+      "class_type": "VAEDecodeTiled",
       "inputs": {
-        "samples": [
-          "125",
-          0
-        ],
-        "vae": [
-          "119",
-          0
-        ]
+        "samples": ["125", 0],
+        "vae": ["119", 0],
+        "tile_size": 128,
+        "overlap": 32,
+        "temporal_size": 8,
+        "temporal_overlap": 4
       }
     },
     "121": {

@@ -72,7 +72,7 @@ it('retains import quality across ambiguous Word confirmation and stops for voic
   await user.click(screen.getByRole('checkbox',{name:/允许本项目调用已配置的云端生成服务/}));
   await user.click(screen.getByRole('checkbox',{name:/允许本次制作在已保存策略许可时回退/}));
   await user.upload(screen.getByLabelText('Word 剧本文档'),new File(['fixture'],'test.docx',{type:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}));
-  await user.click(screen.getByRole('button',{name:'导入并配置制作'}));
+  await user.click(screen.getByRole('button',{name:'仅导入，先配置素材'}));
   const confirm=await screen.findByRole('button',{name:'确认歧义测试'});
   const importCall=mocked.mock.calls.find(([url])=>url==='/api/studio/import')!;
   const form=importCall[1]!.body as FormData;

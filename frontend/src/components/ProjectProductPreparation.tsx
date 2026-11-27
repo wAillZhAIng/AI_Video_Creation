@@ -4,8 +4,12 @@ import type {ProductAsset,ProductLibraryOverview} from '../lib/asset-library-con
 import {FormField} from './ui';
 import {ProjectProductReferences} from './ProjectProductReferences';
 
-type Selection={project_id:string;product:ProductAsset;expected_token:string;image_ids:string[];shot_ids:string[];bound:boolean;shots:{id:string;order:number;title:string;suggested:boolean}[];note:string};
+type Selection={project_id:string;product:ProductAsset;expected_token:string;image_ids:string[];shot_ids:string[];bound:boolean;shots:{id:string;order:number;title:string;suggested:boolean}[];note:string;limits?:{max_reference_images:number}};
 type State={busy:boolean;dirty:boolean;overBudget:boolean};
+
+function referenceTraceHeaders(count:number){
+  return {'X-Reference-Trace-ID':crypto.randomUUID(),'X-Reference-Image-Count':String(count)};
+}
 
 /** Files are saved to the shared library; explicit shot choices drive both generators. */
 export function ProjectProductPreparation({projectId,shots,disabled,bulkDisabled=false,onStateChange,onChanged}:{projectId:string;shots:{id:string;order:number;title:string}[];disabled:boolean;bulkDisabled?:boolean;onStateChange?:(state:State)=>void;onChanged?:()=>void|Promise<void>}){
@@ -21,6 +25,7 @@ export function ProjectProductPreparation({projectId,shots,disabled,bulkDisabled
   const onDetailChanged=useCallback(async()=>{setReload(n=>n+1);await callbacks.current.onChanged?.();},[]);
   const active=useRef(true),busyRef=useRef(false);useEffect(()=>{active.current=true;return()=>{active.current=false;callbacks.current.onStateChange?.({busy:false,dirty:false,overBudget:false});};},[]);
   const referenceDirty=Boolean(selection&&(JSON.stringify(imageIds)!==JSON.stringify(selection.image_ids)||JSON.stringify(shotIds)!==JSON.stringify(selection.shot_ids)));
+  const imageLimit=selection?.limits?.max_reference_images??library?.limits.max_generation_images??8;
   const dirty=Boolean(files.length||name.trim())||referenceDirty;
   useEffect(()=>{callbacks.current.onStateChange?.({busy:Boolean(busy)||detailState.busy,dirty:dirty||detailState.dirty,overBudget:detailState.overBudget});},[busy,dirty,detailState]);
   const loadLibrary=open||shotOpen;
@@ -39,7 +44,7 @@ export function ProjectProductPreparation({projectId,shots,disabled,bulkDisabled
       let target=uploadTarget;
       if(!target){const product=await request<ProductAsset>('/api/product-library',{method:'POST',body:JSON.stringify({name:name.trim(),category:'项目固定产品／道具'})});target=product.id;if(active.current){setUploadTarget(target);setName('');}}
       const form=new FormData();files.forEach(file=>form.append('files',file));form.set('purpose','other');form.set('notes','项目工作台批量上传的固定产品／道具参考');
-      const result=await request<{product:ProductAsset;added:unknown[];duplicates:unknown[];errors:{filename:string;error:string}[]}>(`/api/product-library/${encodeURIComponent(target)}/images`,{method:'POST',body:form});
+      const result=await request<{product:ProductAsset;added:unknown[];duplicates:unknown[];errors:{filename:string;error:string}[]}>(`/api/product-library/${encodeURIComponent(target)}/images`,{method:'POST',headers:referenceTraceHeaders(files.length),body:form});
       if(!active.current)return;
       const failedNames=new Set(result.errors.map(item=>item.filename));setFiles(previous=>previous.filter(file=>failedNames.has(file.name)));setFileKey(value=>value+1);setProductId(target);setReload(value=>value+1);
       setShotReferenceRevision(value=>value+1);
@@ -48,10 +53,10 @@ export function ProjectProductPreparation({projectId,shots,disabled,bulkDisabled
     }catch(e){if(active.current)setError(String(e));}finally{busyRef.current=false;if(active.current)setBusy('');}
   }
   async function save(){
-    if(blocked||busyRef.current||!selection||shotIds.length>0&&(!imageIds.length||imageIds.length>4))return;
+    if(blocked||busyRef.current||!selection||shotIds.length>0&&(!imageIds.length||imageIds.length>imageLimit))return;
     busyRef.current=true;setBusy('save');setError('');setNotice('');
     try{
-      const value=await request<Selection>(`/api/product-library/projects/${encodeURIComponent(projectId)}/references`,{method:'PUT',body:JSON.stringify({product_id:productId,expected_token:selection.expected_token,image_ids:shotIds.length?imageIds:[],shot_ids:shotIds})});
+      const value=await request<Selection>(`/api/product-library/projects/${encodeURIComponent(projectId)}/references`,{method:'PUT',headers:referenceTraceHeaders(shotIds.length?imageIds.length:0),body:JSON.stringify({product_id:productId,expected_token:selection.expected_token,image_ids:shotIds.length?imageIds:[],shot_ids:shotIds})});
       if(!active.current)return;setSelection(value);setImageIds(value.image_ids);setShotIds(value.shot_ids);setReload(n=>n+1);
       setShotReferenceRevision(value=>value+1);
       setNotice(`已保存：${shotIds.length} 个分镜使用此产品原图。后续关键画面和视频自动使用所选参考；旧视频保留。`);await callbacks.current.onChanged?.();
@@ -78,13 +83,13 @@ export function ProjectProductPreparation({projectId,shots,disabled,bulkDisabled
         <p className="form-hint">这里用于批量绑定产品，可为所选分镜统一保存一组图片。为每镜单独选图，请使用上方「产品图的制作引用」。</p>
         <button type="button" className="button button-ghost" onClick={()=>{if(dirty&&!window.confirm('放弃尚未保存的产品参考草稿并重新读取？'))return;setFiles([]);setName('');setFileKey(n=>n+1);setReload(n=>n+1);}}>刷新图库与项目引用</button>
         {loading?<p role="status">读取产品原图与项目分镜…</p>:null}
-        {selection?<><p>本次制作选择 {imageIds.length}/4 张；同一包装版本请保持一致。人物与场景也占参考图预算，超出模型能力会明确提示。</p>
-          <div className="asset-picker-images">{selection.product.images.map((image,index)=><label key={image.id}><input type="checkbox" aria-label={`${selection.product.name}参考图 ${index+1}`} checked={imageIds.includes(image.id)} disabled={!imageIds.includes(image.id)&&imageIds.length>=4} onChange={e=>setImageIds(ids=>e.target.checked?[...ids,image.id]:ids.filter(id=>id!==image.id))}/><img src={api.mediaUrl(image.thumbnail_url||image.media_url)} alt={`${selection.product.name}原图 ${index+1}`}/><span>{image.filename}</span></label>)}</div>
+        {selection?<><p>本次制作选择 {imageIds.length}/{imageLimit} 张；同一包装版本请保持一致。人物与场景也占视频参考图预算，图片生成服务另按其实际能力校验。</p>
+          <div className="asset-picker-images">{selection.product.images.map((image,index)=><label key={image.id}><input type="checkbox" aria-label={`${selection.product.name}参考图 ${index+1}`} checked={imageIds.includes(image.id)} disabled={!imageIds.includes(image.id)&&imageIds.length>=imageLimit} onChange={e=>setImageIds(ids=>e.target.checked?[...ids,image.id]:ids.filter(id=>id!==image.id))}/><img src={api.mediaUrl(image.thumbnail_url||image.media_url)} alt={`${selection.product.name}原图 ${index+1}`}/><span>{image.filename}</span></label>)}</div>
           <p>使用此产品的分镜（只影响勾选的镜头）</p>
           <button type="button" className="button button-secondary button-small" disabled={!selection.shots.some(shot=>shot.suggested)} onClick={()=>setShotIds(selection.shots.filter(shot=>shot.suggested).map(shot=>shot.id))}>按剧本同名内容选择分镜</button>
           <p className="form-hint">名称匹配只是建议，请核对。无法匹配时手动勾选；未勾选的分镜不会收到此产品图。取消全部分镜并保存，可解除此产品的制作引用。</p>
           {selection.shots.map(shot=><label className="studio-check" key={shot.id}><input type="checkbox" checked={shotIds.includes(shot.id)} onChange={e=>setShotIds(ids=>e.target.checked?[...ids,shot.id]:ids.filter(id=>id!==shot.id))}/><span>#{shot.order} · {shot.title}{shot.suggested?' · 同名匹配':''}</span></label>)}
-          <button type="button" className="button button-primary" disabled={shotIds.length>0&&(!imageIds.length||imageIds.length>4)||(!dirty&&selection.bound)} onClick={()=>void save()}>{busy==='save'?'正在保存项目引用…':'保存产品／道具项目引用'}</button>
+          <button type="button" className="button button-primary" disabled={shotIds.length>0&&(!imageIds.length||imageIds.length>imageLimit)||(!dirty&&selection.bound)} onClick={()=>void save()}>{busy==='save'?'正在保存项目引用…':'保存产品／道具项目引用'}</button>
         </>:null}
       </fieldset>
     </>:null}

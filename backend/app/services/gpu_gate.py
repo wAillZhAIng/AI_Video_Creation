@@ -2,6 +2,7 @@
 import asyncio
 import functools
 import weakref
+from contextlib import asynccontextmanager
 import errno
 import json
 import logging
@@ -114,6 +115,12 @@ def _managed_screenplay_process_state():
     A missing/unreadable/mismatched registry is deliberately unknown.
     """
     registry_path = Path(PROJECT_ROOT) / 'data' / 'pids' / 'dev-processes.json'
+    # A refused health endpoint plus no registry means this application did not
+    # start a managed screenplay worker.  That is a known idle state, not an
+    # ambiguous one: treating a missing optional registry as unknown blocks all
+    # unrelated H3 jobs forever after a clean model shutdown.
+    if not registry_path.is_file():
+        return False
     try:
         document = json.loads(registry_path.read_text(encoding='utf-8-sig'))
         recorded_root = Path(document.get('projectRoot', '')).resolve()
@@ -122,6 +129,8 @@ def _managed_screenplay_process_state():
                 not isinstance(document.get('processes'), list)):
             return None
     except (OSError, ValueError, TypeError):
+        # An existing but unreadable or malformed registry is different from an
+        # absent registry.  Keep the conservative unknown result in that case.
         return None
 
     entries = [item for item in document['processes']
@@ -220,3 +229,22 @@ def gpu_submission(function):
             if await owned_model_busy():return None
             return await function(*args,**kwargs)
     return wrapped
+
+
+@asynccontextmanager
+async def local_llm_gpu_admission(settings):
+    """Serialize and verify shared-GPU admission for foreground local LLM work.
+
+    A caller only enters after the owned model is idle and Comfy has released
+    its allocator.  `None` means the caller must defer, never race the model.
+    """
+    loop=asyncio.get_running_loop();lock=_locks.setdefault(loop,asyncio.Lock())
+    async with lock:
+        if await owned_model_busy():
+            yield None
+            return
+        state=await prepare_local_llm_gpu(settings)
+        if state is None:
+            yield None
+            return
+        yield state

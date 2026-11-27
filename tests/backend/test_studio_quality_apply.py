@@ -182,7 +182,6 @@ def test_retry_rebinds_a_frozen_mismatched_upscale_route_without_regenerating(pr
     nodes[1].update(code='quality_method_unverified', error='old frozen route fails')
     run.nodes_json = nodes
     snapshot = copy.deepcopy(run.snapshot_json)
-    snapshot.update(context_production=True, h3_context_by_shot={shot.id:{}})
     snapshot['options']['quality_by_shot'][shot.id] = quality
     run.snapshot_json = snapshot
     session.commit()
@@ -295,18 +294,14 @@ def test_unfinished_video_does_not_change_generation_mapping(prepared, settings)
 
 
 @pytest.mark.parametrize('scope', ['project', 'shot'])
-@pytest.mark.parametrize('context_run', [True, False])
-def test_workflow_mode_edit_requires_new_run_even_before_quality_nodes(context, settings, scope, context_run):
+def test_native_generation_mode_edit_requires_new_run_even_before_quality_nodes(context, settings, scope):
     session, _, project, shot, _ = context
     frozen = QualitySettings(mode='high').model_dump()
     next_run = QualitySettings(mode='fast').model_dump()
-    workflow = {'quality_mode': 'high', 'workflow_id': 'H3_R2V_OpenH3IR_Quality', 'actual_steps': 30}
     snapshot = {
         'shot_ids': [shot.id],
         'options': {'quality': frozen, 'quality_by_shot': {shot.id: frozen}},
     }
-    if context_run:
-        snapshot.update(context_production=True, h3_context_by_shot={shot.id: {'service': {'h3_workflow': workflow}}})
     run = m.StudioRun(project_id=project.id, status='paused', snapshot_json=snapshot,
         nodes_json=[{'id': 'video:' + shot.id, 'kind': 'video', 'target_id': shot.id, 'status': 'pending'}],
         result_json={})
@@ -316,7 +311,7 @@ def test_workflow_mode_edit_requires_new_run_even_before_quality_nodes(context, 
 
     with pytest.raises(AppError) as blocked:
         apply_saved_quality(session, settings, project.id, expected_profile_revision=1 if scope == 'project' else 0)
-    assert blocked.value.code == ('quality_apply_context_mode_frozen' if context_run else 'quality_apply_legacy_fast_requires_new_run')
+    assert blocked.value.code == 'quality_apply_generation_mode_frozen'
     assert blocked.value.details['run_id'] == run.id
     session.expire_all()
     assert run.snapshot_json == snapshot and run.nodes_json[0]['status'] == 'pending'
@@ -494,3 +489,42 @@ def test_pause_committed_between_final_read_and_cas_is_not_overwritten(prepared,
     assert not list(session.scalars(select(m.AuditEvent).where(
         m.AuditEvent.object_id == run.id,
         m.AuditEvent.action == 'explicit_quality_applied_to_undispatched_nodes')))
+
+
+def test_native_h3_route_preserves_saved_fast_mode_for_existing_run(context, settings):
+    session, _, project, shot, _ = context
+    high = QualitySettings(mode='high').model_dump()
+    fast = QualitySettings(mode='fast').model_dump()
+    route = {'configured': True, 'selected': {'service_snapshot': {
+        'provider': 'comfyui',
+        'settings': {'workflow_profile': 'native_h3_r2v'},
+    }}}
+    run = m.StudioRun(project_id=project.id, status='paused',
+        snapshot_json={'shot_ids': [shot.id],
+            'options': {'quality': high, 'quality_by_shot': {shot.id: high}},
+            'routes_by_shot': {shot.id: {'video_generation': route}}},
+        nodes_json=[{'id': 'video:' + shot.id, 'kind': 'video',
+                     'target_id': shot.id, 'status': 'pending'}], result_json={})
+    profile = m.QualityProfile(scope='project', target_id=project.id, revision=1,
+                               settings_json=fast)
+    session.add_all([run, profile]); session.commit()
+
+    result = apply_saved_quality(session, settings, project.id, expected_profile_revision=1)
+
+    assert result['applied'] == []
+    assert result['run_status'] == 'paused'
+    assert run.snapshot_json['options']['quality_by_shot'][shot.id] == high
+
+
+def test_native_h3_quality_apply_requires_selected_route_snapshot():
+    from app.services.studio_quality_apply import _native_h3_video_route
+
+    native = {'configured': True, 'selected': {'service_snapshot': {
+        'provider': 'comfyui',
+        'settings': {'workflow_profile': 'native_h3_r2v'},
+    }}}
+    assert _native_h3_video_route({'routes_by_shot': {'shot': {'video_generation': native}}}, 'shot')
+    assert not _native_h3_video_route({'services': {'video': {
+        'provider': 'comfyui',
+        'settings': {'workflow_profile': 'native_h3_r2v'},
+    }}}, 'shot')

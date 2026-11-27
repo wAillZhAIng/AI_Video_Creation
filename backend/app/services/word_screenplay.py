@@ -18,6 +18,9 @@ from app.schemas_product import IdentityProfile
 CAPTION_FIELDS = {'字幕','字幕内容','字幕与屏幕文字','屏幕文字','屏幕文本','subtitles','captions','on-screen text'}
 VALID_ASPECTS = {'16:9', '9:16', '1:1'}
 _ASPECT = re.compile(r'(?<![\d:：])(?:16\s*[:：]\s*9|9\s*[:：]\s*16|1\s*[:：]\s*1)(?![\d:：])')
+# Metadata lines emitted by cinematic_import for product reference image bindings
+_SHOT_USES_REF = re.compile(r'^分镜产品图使用：([一二三四五六七八九十\d]+):(\d+)$')
+_PRODUCT_REF_DECL = re.compile(r'^产品参考图：(\d+):([\w.\-]+\.(?:jpe?g|png|webp|gif))$', re.I)
 
 
 def _declared_aspect(value):
@@ -43,6 +46,8 @@ def block_lines(blocks):
             headers = rows[0] if rows else []
             matrix = '人物' in headers and any(v in headers for v in ['动作','台词','外观'])
             for n,values in enumerate(rows):
+                if n == 0 and [value.strip() for value in headers] in (['属性', '内容'], ['字段', '内容']):
+                    continue
                 if matrix:
                     if n==0: continue
                     record = dict(zip(headers,values))
@@ -63,7 +68,10 @@ def block_lines(blocks):
 
 def parse_blocks(blocks):
     preview = {'project':{'name':'未命名剧本','aspect_ratio':'16:9','style':'','synopsis':''},
-               'characters':[],'scenes':[],'shots':[],'unrecognized':[],'parser':'local_template_rules_v1'}
+               'characters':[],'scenes':[],'shots':[],'unrecognized':[],'parser':'local_template_rules_v1',
+               '_product_ref_map':{}, '_shot_product_hints':{}}
+    # _product_ref_map: {slot_num_str: filename}
+    # _shot_product_hints: {shot_order_str: [slot_num_str, ...]}
     person = scene = shot = None
     section = ''
     name_map = {}
@@ -142,6 +150,19 @@ def parse_blocks(blocks):
     for text,source in block_lines(blocks):
         text=text.strip()
         if not text: continue
+        # Handle product reference metadata lines emitted by cinematic_import
+        m_ref = _PRODUCT_REF_DECL.match(text)
+        if m_ref:
+            preview['_product_ref_map'][m_ref.group(1)] = m_ref.group(2)
+            continue
+        m_use = _SHOT_USES_REF.match(text)
+        if m_use:
+            shot_num = m_use.group(1)
+            # Convert chinese numerals to arabic
+            _cn = {'一':'1','二':'2','三':'3','四':'4','五':'5','六':'6','七':'7','八':'8','九':'9','十':'10'}
+            shot_num = _cn.get(shot_num, shot_num)
+            preview['_shot_product_hints'].setdefault(shot_num, []).append(m_use.group(2))
+            continue
         parts=re.split(r'[:：]',text,maxsplit=1)
         key,value=(parts[0].strip(),parts[1].strip()) if len(parts)==2 else ('',text)
         caption_field=key.casefold() in CAPTION_FIELDS
@@ -164,6 +185,9 @@ def parse_blocks(blocks):
         if declared and section not in ('正文剧情','分镜正文'):
             name, slot = declared
             person = ensure_person(name, source, True)
+            base_name = name_without_annotation(name)
+            if base_name != name:
+                bind_label(base_name, person)
             if slot:
                 bind_label(slot, person)
             shot = None
@@ -220,7 +244,7 @@ def parse_blocks(blocks):
                 else:
                     for label in entries:
                         participate(label, source, text)
-            elif key in ('画面','画面描述','视觉重点'):
+            elif key in ('画面','画面描述','视觉重点','画面内容'):
                 shot['visual_prompt']='\n'.join(v for v in (shot['visual_prompt'],value) if v)
             elif key=='动作': shot['action']=value
             elif key in ('运镜','镜头运动'):
@@ -228,9 +252,6 @@ def parse_blocks(blocks):
             elif key in ('画幅','摄影与构图'):
                 if key=='摄影与构图':
                     shot['photography']['composition']=value
-                    if value and len(value)<=200 and 'camera_move' in shot['suggested']:
-                        shot['camera_move']=value
-                        shot['suggested'].remove('camera_move')
                 if aspect:=_declared_aspect(value):
                     shot['aspect_ratio']=aspect
                     shot.setdefault('provenance',{})['aspect_ratio']=field_provenance(aspect,[source])
@@ -270,6 +291,8 @@ def parse_blocks(blocks):
                         if len(kv)==2 and kv[0].strip() in perf_fields: p['performance'][perf_fields[kv[0].strip()]]=kv[1].strip()
                         elif pair.strip(): preview['unrecognized'].append({'source':source,'text':pair,'reason':'人物表演字段待确认'})
                 else: preview['unrecognized'].append({'source':source,'text':text,'reason':'表演写法需为 人物｜动作=…；情绪=…'})
+            elif key in ('音频与口播', '口播', '旁白', '台词'):
+                shot['audio_events'].append({'kind':'voice','description':value,'source':[source]})
             elif key in ('环境声','音效','音乐','音乐与音效'):
                 shot['audio_events'].append({'kind':{'环境声':'ambience','音效':'sfx'}.get(key,'music'),'description':value,'source':[source]})
                 if key=='音乐与音效':
@@ -281,6 +304,10 @@ def parse_blocks(blocks):
                 spoken=re.split('[:：]',value,maxsplit=1) if key=='对白' else [key,value]
                 if len(spoken)==2:
                     speaker=spoken[0].strip(); delivery={}
+                    if re.fullmatch(r'(?:全家|全体|众人|大家)(?:齐声|合唱|一起)?|合唱', speaker) and len(shot['participants']) > 1:
+                        shot['audio_events'].append({'kind':'voice','description':speaker+'：'+spoken[1].strip(),
+                            'group_character_keys':[item['character_key'] for item in shot['participants']], 'source':[source]})
+                        continue
                     m=re.match(r'(.+?)[（(](.+)[）)]$',speaker)
                     if m and m[2] not in local_labels and speaker not in name_map and speaker not in local_labels:
                         speaker=m[1].strip();delivery['emotion']=m[2]
@@ -290,9 +317,18 @@ def parse_blocks(blocks):
                 else: preview['unrecognized'].append({'source':source,'text':text,'reason':'对白缺少说话人'})
             elif not key and shot.get('time_range'):
                 shot['visual_prompt']='\n'.join(v for v in (shot['visual_prompt'],text) if v)
+            elif not key and not value:
+                # Free text inside a shot block with no field label → visual description
+                shot['visual_prompt']='\n'.join(v for v in (shot['visual_prompt'],text) if v)
             else: preview['unrecognized'].append({'source':source,'text':text,'reason':'镜头正文待归类'})
             continue
-        if scene and key in env_fields: scene['environment'][env_fields[key]]=value;continue
+        if scene and key in env_fields:
+            field=env_fields[key]
+            if field=='description' and scene['environment'].get(field):
+                scene['environment'][field]+='\n'+value
+            else:
+                scene['environment'][field]=value
+            continue
         if scene and key in ('环境声','音乐'):
             scene.setdefault('audio_events',[]).append({'kind':'ambience' if key=='环境声' else 'music','description':value,'source':[source]});continue
         if '剧本模板' in text or '剧本示例' in text: continue
@@ -474,6 +510,91 @@ def persisted_shot_digest(session,shot):
         'designs':[{'id':e.id,'spec':e.spec_json} for identifier in entities if identifier and (e:=session.get(ProductionEntity,identifier))]})
 
 
+def _auto_bind_product_refs(session, project, preview, shot_ids, import_id):
+    """Auto-bind product images declared in 【基础设定】 to per-shot bindings.
+
+    Matches filenames from _product_ref_map to ScreenplayInputAsset records,
+    then creates ProjectProductBinding + ShotProductBinding for each shot that
+    references a given slot via _shot_product_hints.
+    Falls through silently if no matching asset is found — human binding is
+    still available via the product library UI.
+    """
+    from app.models.product_library import Product, ProductImage, ProjectProductBinding, ShotProductBinding
+    from app.models.screenplay_generation import ScreenplayInputAsset
+    ref_map = preview.get('_product_ref_map', {})         # slot -> filename
+    hint_map = preview.get('_shot_product_hints', {})     # shot_order -> [slot,...]
+    if not ref_map:
+        return
+    # Build slot -> (product_id, image_ids) mapping by filename lookup
+    slot_to_product = {}
+    for slot, filename in ref_map.items():
+        assets = list(session.scalars(
+            select(ScreenplayInputAsset).where(ScreenplayInputAsset.filename == filename)
+        ))
+        if len(assets) != 1:
+            continue
+        asset = assets[0]
+        pimage = session.scalar(
+            select(ProductImage).where(ProductImage.asset_id == asset.id).limit(1)
+        )
+        if not pimage:
+            continue
+        all_images = list(session.scalars(
+            select(ProductImage).where(ProductImage.product_id == pimage.product_id)
+            .order_by(ProductImage.order, ProductImage.id)
+        ))
+        slot_to_product[slot] = (pimage.product_id, [i.id for i in all_images])
+
+    if not slot_to_product:
+        return
+
+    # Several declared slots may resolve to different photos of the same product.
+    # Queue one project-level binding per product before flushing the session.
+    product_ids = list(dict.fromkeys(product_id for product_id, _ in slot_to_product.values()))
+    bound_product_ids = set(session.scalars(
+        select(ProjectProductBinding.product_id).where(
+            ProjectProductBinding.project_id == project.id,
+            ProjectProductBinding.product_id.in_(product_ids),
+        )
+    ))
+    for product_id in product_ids:
+        if product_id not in bound_product_ids:
+            from app.services.product_library import dto
+            snapshot = dto(session, session.get(Product, product_id))
+            session.add(ProjectProductBinding(
+                project_id=project.id, product_id=product_id,
+                snapshot_json={**snapshot, 'import_id': import_id}
+            ))
+    session.flush()
+
+    # Create per-shot bindings using hint_map
+    _cn = {'一':'1','二':'2','三':'3','四':'4','五':'5','六':'6','七':'7','八':'8','九':'9','十':'10'}
+    for order_1indexed, shot_id in enumerate(shot_ids, 1):
+        order_str = str(order_1indexed)
+        slots = hint_map.get(order_str, [])
+        if not slots and len(slot_to_product) == 1:
+            # Single product declared: bind to every shot
+            slots = list(slot_to_product.keys())
+        for slot in slots:
+            info = slot_to_product.get(slot)
+            if not info:
+                continue
+            product_id, image_ids = info
+            exists = session.scalar(
+                select(ShotProductBinding).where(
+                    ShotProductBinding.shot_id == shot_id,
+                    ShotProductBinding.product_id == product_id
+                )
+            )
+            if not exists:
+                session.add(ShotProductBinding(
+                    project_id=project.id, shot_id=shot_id, product_id=product_id,
+                    image_ids_json=image_ids,
+                    state_json={'auto_bound': True, 'import_id': import_id, 'slot': slot}
+                ))
+    session.flush()
+
+
 def commit_import(session,batch,payload):
     if batch.status=='completed': return batch.result_json
     if batch.status!='pending_review' or batch.revision!=payload.revision: raise AppError(409,'import_stale','预览已变化，请刷新后确认')
@@ -602,6 +723,9 @@ def commit_import(session,batch,payload):
         session.flush()
         detail=session.scalar(select(ShotDetail).where(ShotDetail.shot_id==shot.id))
         detail.source_json={**detail.source_json,'import_semantic_hash':persisted_shot_digest(session,shot)}
+    # Auto-bind product reference images declared in 【基础设定】
+    # _product_ref_map: {slot: filename}  _shot_product_hints: {shot_order: [slot,...]}
+    _auto_bind_product_refs(session, project, p, shot_ids, batch.id)
     script.parsed_json={**script.parsed_json,'explicit_shot_ids':shot_ids,'shot_source_hashes':source_hashes,
         'shot_source_hash_version':2,'identity_bindings':identities,'scene_bindings':{key:value.id for key,value in smap.items()},'reused_shot_ids':[s.id for s in reused.values()]}
     old_order=previous.parsed_json.get('explicit_shot_ids',[]) if previous else []

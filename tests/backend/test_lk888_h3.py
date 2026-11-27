@@ -195,8 +195,8 @@ def _contact_prompt(*, explicit=False, pad=5200):
     if explicit:
         states[1].update(holder='Alice', hand='右手', location='桌边', open_state='打开')
     data = {'production': {'prop_states': states, 'beats': []}, 'entities': [
-        {'id': 'a', 'logical_id': 'A', 'spec': {'color': '红色', 'details': '甲' * 200}},
-        {'id': 'b', 'logical_id': 'B', 'spec': {'color': '蓝色', 'details': '乙' * 200}},
+        {'id': 'a', 'kind': 'prop', 'logical_id': 'A', 'spec': {'color': '红色', 'details': '甲' * 200}},
+        {'id': 'b', 'kind': 'prop', 'logical_id': 'B', 'spec': {'color': '蓝色', 'details': '乙' * 200}},
     ]}
     canonical = physical_directions(data)
     design = json.dumps(data, ensure_ascii=False)

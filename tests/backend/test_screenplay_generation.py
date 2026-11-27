@@ -72,6 +72,18 @@ def test_provider_plain_wardrobe_and_prop_descriptions_keep_their_words(factory,
         assert prop['description']=='合上的记录本' and prop['prop_key']
         assert raw['shots'][0]['production']['prop_states']==['合上的记录本']
 
+def test_blank_model_dialogue_placeholder_does_not_block_a_valid_shot(factory,settings,model):
+    with factory() as session:
+        job=service.create_generation(session,settings,payload(model),capability_test=True)
+        raw=raw_ir()
+        raw['shots'][0]['dialogues'].append({'character_key':'','text':' \t '})
+        raw['shots'][1]['dialogues']=[{'character_key':'A','text':''}]
+        normalized=service.normalize_ir(session,job,raw,{})
+        assert len(normalized['shots'][0]['dialogues'])==2
+        assert normalized['shots'][1]['dialogues']==[]
+        assert raw['shots'][1]['dialogues']==[{'character_key':'A','text':''}]
+
+
 @pytest.mark.parametrize('placeholder',['按真实参考图与用户要求描述画面','按用户要求描写'])
 def test_model_template_placeholder_is_not_a_production_ready_shot(factory,settings,model,placeholder):
     with factory() as session:
@@ -327,6 +339,30 @@ def test_real_docx_preview_and_review_without_project_then_idempotent_create(fac
         assert session.scalar(select(func.count()).select_from(m.DialogueLine))==4
         assert service.approve(session,settings,identifier,request).project_id==created.project_id
         assert session.scalar(select(func.count()).select_from(m.Project))==1
+
+
+def test_validated_screenplay_transfers_to_studio_once_without_human_approval(factory,settings,model):
+    identifier=make_ready(factory,settings,model)
+    with factory() as session:
+        job=service.get_job(session,identifier)
+        job.snapshot_json={**job.snapshot_json,'produce_video':True}
+        ir=copy.deepcopy(job.screenplay_json)
+        for shot in ir['shots']:
+            shot['dialogues']=[]
+        job.screenplay_json=ir
+        session.commit()
+        service.export_job(session,settings,job)
+    service._continue_with_video(settings,factory,identifier)
+    service._continue_with_video(settings,factory,identifier)
+    with factory() as session:
+        job=service.get_job(session,identifier)
+        assert job.project_id and job.review_state=='automatic' and job.stage=='video_automation'
+        assert job.receipt_json['production_auto_started'] is True
+        runs=list(session.scalars(select(m.StudioRun).where(m.StudioRun.project_id==job.project_id)))
+        assert len(runs)==1 and runs[0].snapshot_json['automatic_final']
+        assert runs[0].id==job.receipt_json['production_run_id']
+        assert service.documents(session,identifier)[-1].review_state=='automatic'
+
 
 def test_conflicting_project_name_rolls_back_without_losing_word(factory,settings,model):
     identifier=make_ready(factory,settings,model,name='重名项目')

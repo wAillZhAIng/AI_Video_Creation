@@ -76,7 +76,7 @@ export function useStudio() {
   const selectProject = useCallback((id: string) => {
     setParams(current => {
       const next = new URLSearchParams(current);
-      next.delete('shot');next.delete('video');next.delete('quality_render');
+      for(const selection of ['shot','video','job','quality_render','qualityrender'])next.delete(selection);
       if (id) next.set('project', id); else next.delete('project');
       return next;
     });

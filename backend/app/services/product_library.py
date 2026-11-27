@@ -1,5 +1,6 @@
 """Products reuse validated screenplay images and freeze actual visual inputs."""
 import copy
+import hashlib
 import io
 import json
 import datetime as dt
@@ -15,7 +16,7 @@ from app.models.screenplay_generation import ScreenplayInputAsset,ScreenplayGene
 from app.services.screenplay_generation_media import upload_asset,sha
 
 PURPOSES={'main','front','back','side','detail','usage','packaging','dimensions','other'}
-LIMITS={'max_images_per_product':32,'max_generation_images':8,'max_upload_bytes':10*1024**2,'formats':['.png','.jpg','.jpeg','.webp']}
+LIMITS={'max_images_per_product':32,'max_generation_images':8,'max_project_reference_images':9,'max_upload_bytes':10*1024**2,'formats':['.png','.jpg','.jpeg','.webp']}
 
 SHOT_REFERENCE_LIMITS={'keyframe_total_max':4,'video_total_max':9}
 _PRODUCT_SUBJECT_ERROR = 'Model ImageCard did not establish one object subject for product-unit:'
@@ -219,6 +220,30 @@ def freeze_products(session,settings,selections):
     if count>8:raise AppError(422,'product_model_image_limit','本次剧本模型最多接入8张图片，请从产品中选择部分图片')
     return result
 
+
+def freeze_video_product_references(session, settings, product_id, image_ids):
+    """Freeze up to the native H3 nine-image video budget without widening script limits.
+
+    ``freeze_products`` remains bounded by the script-model contract.  A direct
+    H3 video task accepts one additional image, so its immutable source records
+    are frozen in independently validated batches and then combined in the
+    user's existing product order.
+    """
+    if not image_ids or len(set(image_ids)) != len(image_ids):
+        raise AppError(422, 'product_reference_scope', '产品图片不能为空且不能重复')
+    if len(image_ids) > SHOT_REFERENCE_LIMITS['video_total_max']:
+        raise AppError(422, 'product_reference_budget', '本镜产品参考超过当前视频模型9张预算')
+    from app.schemas_product_library import ProductSelection
+    batches = []
+    for start in range(0, len(image_ids), LIMITS['max_generation_images']):
+        batches.append(freeze_products(session, settings, [ProductSelection(
+            product_id=product_id,
+            image_ids=list(image_ids[start:start + LIMITS['max_generation_images']]),
+        )])[0])
+    merged = {key:value for key,value in batches[0].items() if key != 'images'}
+    merged['images'] = [image for batch in batches for image in batch['images']]
+    return merged
+
 def bind_created_project(session,job,result):
     products=job.snapshot_json.get('products',[])
     if not products:return
@@ -236,6 +261,15 @@ def bind_created_project(session,job,result):
             state={k:v for k,v in value.items() if k not in {'keyframe_image_ids','video_image_ids','reference_selection_confirmed'}}
             session.add(ShotProductBinding(project_id=job.project_id,shot_id=shot_id,product_id=identifier,image_ids_json=[i['id'] for i in product['images']],state_json=state))
 
+def _frozen_image_relative_path(item):
+    rel = item.get('relative_path')
+    if rel:
+        return rel
+    media_url = item.get('media_url') or ''
+    if media_url.startswith('/api/media/'):
+        return media_url[len('/api/media/'):]
+    raise AppError(409, 'product_frozen_image_missing', '冻结产品参考图缺少相对路径')
+
 def shot_references(session,settings,shot,*,stage='video',include_image_notes=False,exclude_product_ids=()):
     result=[]
     for binding in session.scalars(select(ShotProductBinding).where(ShotProductBinding.shot_id==shot.id).order_by(ShotProductBinding.product_id)):
@@ -247,10 +281,11 @@ def shot_references(session,settings,shot,*,stage='video',include_image_notes=Fa
         if chosen-{item['id'] for item in project.snapshot_json.get('images',[])}:raise AppError(409,'product_frozen_image_missing','镜头所选产品图不在冻结项目资料中')
         for item in project.snapshot_json.get('images',[]):
             if item['id'] not in chosen:continue
-            path=safe_media_path(settings.media_root,item['relative_path'],must_exist=True)
+            rel_path=_frozen_image_relative_path(item)
+            path=safe_media_path(settings.media_root,rel_path,must_exist=True)
             if sha(path.read_bytes())!=item['sha256']:raise AppError(409,'product_source_changed','冻结产品参考图发生变化')
             ref={'id':item['id'],'product_id':binding.product_id,'source':'product_library','purpose':item['purpose'],'order':item['order'],
-                 'relative_path':item['relative_path'],'absolute_path':str(path),'sha256':item['sha256'],'product_name':project.snapshot_json['name'],'visible_state':binding.state_json}
+                 'relative_path':rel_path,'absolute_path':str(path),'sha256':item['sha256'],'product_name':_snapshot_product_name(session, project),'visible_state':binding.state_json}
             if include_image_notes:
                 ref['image_notes']=item.get('notes','')
             result.append(ref)
@@ -260,8 +295,15 @@ def shot_product_snapshot(session,shot):
     result=[]
     for binding in session.scalars(select(ShotProductBinding).where(ShotProductBinding.shot_id==shot.id).order_by(ShotProductBinding.product_id)):
         project=session.scalar(select(ProjectProductBinding).where(ProjectProductBinding.project_id==shot.project_id,ProjectProductBinding.product_id==binding.product_id))
-        if project:result.append({'product_id':binding.product_id,'state':binding.state_json,'images':[{k:i[k] for k in ('id','sha256','relative_path','purpose','order')} for i in project.snapshot_json.get('images',[]) if i['id'] in binding.image_ids_json]})
+        if project:result.append({'product_id':binding.product_id,'state':binding.state_json,'images':[{'id':i['id'],'sha256':i['sha256'],'relative_path':_frozen_image_relative_path(i),'purpose':i['purpose'],'order':i['order']} for i in project.snapshot_json.get('images',[]) if i['id'] in binding.image_ids_json]})
     return result
+
+def _snapshot_product_name(session, binding):
+    name = binding.snapshot_json.get('name')
+    if name:
+        return name
+    product = session.get(Product, binding.product_id)
+    return product.name if product else binding.product_id
 
 def reference_selection(session,project_id,shot_id):
     shot=session.get(m.StoryboardShot,shot_id)
@@ -275,7 +317,7 @@ def reference_selection(session,project_id,shot_id):
         if product and product.state=='active':
             for image in images(session,binding.product_id):
                 if image.id not in available:available[image.id]=image_dto(session,image)
-        result.append({'product_id':binding.product_id,'name':project.snapshot_json['name'],'revision':binding.revision,
+        result.append({'product_id':binding.product_id,'name':_snapshot_product_name(session, project),'revision':binding.revision,
             'images':list(available.values()),'video_image_ids':binding.image_ids_json,
             'keyframe_image_ids':binding.state_json.get('keyframe_image_ids',binding.image_ids_json)})
     return {'project_id':project_id,'shot_id':shot_id,'products':result,'limits':SHOT_REFERENCE_LIMITS,
@@ -393,7 +435,9 @@ def bind_existing_project(session, settings, project_id, payload):
         if len(set(entry.image_ids))!=len(entry.image_ids) or set(entry.image_ids)-selected:
             raise AppError(422,'product_reference_scope','镜头图片不属于本次产品快照或存在重复')
     from app.schemas_product_library import ProductSelection
-    frozen=freeze_products(session,settings,[ProductSelection(product_id=payload.product_id,image_ids=payload.image_ids)])[0]
+    native_h3 = _native_h3_product_references(session, project_id)
+    frozen=(freeze_video_product_references(session,settings,payload.product_id,payload.image_ids)
+            if native_h3 else freeze_products(session,settings,[ProductSelection(product_id=payload.product_id,image_ids=payload.image_ids)])[0])
     project_binding=session.scalar(select(ProjectProductBinding).where(ProjectProductBinding.project_id==project_id,ProjectProductBinding.product_id==payload.product_id))
     if project_binding:
         old={x['id']:x['sha256'] for x in project_binding.snapshot_json.get('images',[])}
@@ -416,6 +460,21 @@ def bind_existing_project(session, settings, project_id, payload):
     session.commit()
     return {'project_id':project_id,'product_id':payload.product_id,'shots':[reference_selection(session,project_id,x) for x in shot_ids],
         'human_visual_approval':False,'note':'产品原图已冻结；旧关键画面需重新核对，尚未批准镜头'}
+
+
+def _native_h3_product_references(session, project_id):
+    """Whether the selected production service accepts direct H3 image slots.
+
+    All supported ComfyUI video services now use the native H3 R2V path.  This
+    avoids a separate compiler profile while preserving the smaller keyframe
+    budget for non-H3 adapters.
+    """
+    from app.services.ai_services import resolve_service
+    try:
+        _, snapshot = resolve_service(session, 'video_generation', project_id=project_id)
+    except AppError:
+        return False
+    return snapshot.get('provider') == 'comfyui'
 
 
 def project_references(session, project_id, product_id):
@@ -455,6 +514,7 @@ def project_references(session, project_id, product_id):
         available[image['id']]=image
     current['images']=list(available.values())
     return {'project_id':project_id,'product':current,'expected_token':token,
+        'limits':{'max_reference_images':LIMITS['max_project_reference_images'] if _native_h3_product_references(session,project_id) else 4},
         'image_ids':selected,'shot_ids':[shot_id for shot_id,image_ids in choices.items() if image_ids],
         'shots':result,'bound':binding is not None,
         'note':'仅所选分镜使用产品原图；更改后旧视频保留，后续生成会重新检查输入。'}
@@ -503,10 +563,12 @@ def save_project_references(session, settings, project_id, payload):
         raise AppError(422,'product_reference_scope','所选图片不属于当前产品')
     # Existing immutable photo entries are retained; only newly chosen entries
     # are frozen. No old file, video, or historical input snapshot is overwritten.
+    native_h3 = _native_h3_product_references(session, project_id)
     new_ids=chosen-set(old_images)
     if new_ids:
         from app.schemas_product_library import ProductSelection
-        frozen=freeze_products(session,settings,[ProductSelection(product_id=payload.product_id,image_ids=sorted(new_ids))])[0]
+        frozen=(freeze_video_product_references(session,settings,payload.product_id,sorted(new_ids))
+                if native_h3 else freeze_products(session,settings,[ProductSelection(product_id=payload.product_id,image_ids=sorted(new_ids))])[0])
     else:
         if current['product']['state']!='active':raise AppError(409,'product_archived','已移出图库的产品不能用于新配置')
         frozen={k:v for k,v in current['product'].items() if k!='images'}|{'images':[]}
@@ -520,8 +582,10 @@ def save_project_references(session, settings, project_id, payload):
     for shot_id in shots:
         others=list(session.scalars(select(ShotProductBinding).where(ShotProductBinding.shot_id==shot_id,
             ShotProductBinding.product_id!=payload.product_id)))
-        total=len(chosen)+sum(len(row.state_json.get('keyframe_image_ids',row.image_ids_json)) for row in others)
-        if total>4:raise AppError(422,'product_keyframe_budget','此镜产品关键画面参考超过4张，请减少图片或调整分镜产品选择')
+        total=len(chosen)+sum(len(row.image_ids_json if native_h3 else row.state_json.get('keyframe_image_ids',row.image_ids_json)) for row in others)
+        if total>(SHOT_REFERENCE_LIMITS['video_total_max'] if native_h3 else SHOT_REFERENCE_LIMITS['keyframe_total_max']):
+            raise AppError(422,'product_reference_budget' if native_h3 else 'product_keyframe_budget',
+                           '本镜产品参考超过当前视频模型9张预算' if native_h3 else '此镜产品关键画面参考超过4张，请分别配置视频与关键画面参考')
     if not project:
         project=ProjectProductBinding(project_id=project_id,product_id=payload.product_id,snapshot_json=frozen);session.add(project)
     else:project.snapshot_json=frozen
@@ -533,7 +597,9 @@ def save_project_references(session, settings, project_id, payload):
         if not row:
             row=ShotProductBinding(project_id=project_id,shot_id=shot_id,product_id=payload.product_id,revision=0);session.add(row)
         row.image_ids_json=list(payload.image_ids)
-        row.state_json={**(row.state_json or {}),'keyframe_image_ids':list(payload.image_ids),
+        previous_state={key:value for key,value in (row.state_json or {}).items() if key != 'context_only_references'}
+        row.state_json={**previous_state,'keyframe_image_ids':[] if native_h3 else list(payload.image_ids),
+            'native_video_references':native_h3,
             'source':'project_product_preparation','reference_selection_confirmed':True}
         row.revision+=1
     if run and run.status in {'paused','exceptions'}:
@@ -566,8 +632,13 @@ def apply_studio_product_plan(session, settings, project_id, shots, plan):
     for model in (m.GenerationJob,m.ProductionVisual,m.MediaProcessTask):
         if session.scalar(select(model.id).where(model.project_id==project_id,model.status.in_({'queued','submitting','submitted','running','cancelling'})).limit(1)):
             raise AppError(409,'product_binding_busy','项目仍有制作任务，不能更改产品参考')
+    native_h3 = _native_h3_product_references(session, project_id)
     product=get_product(session,values['product_id'])
-    frozen=freeze_products(session,settings,[ProductSelection(product_id=product.id,image_ids=identifiers)])[0]
+    frozen=(freeze_video_product_references(session,settings,product.id,identifiers)
+            if native_h3 else freeze_products(session,settings,[ProductSelection(product_id=product.id,image_ids=identifiers)])[0])
+    if not native_h3 and len(identifiers) > SHOT_REFERENCE_LIMITS['keyframe_total_max']:
+        raise AppError(422,'product_keyframe_budget','当前制作入口需要关键画面，请分别配置视频与关键画面参考，未丢弃所选图片')
+    keyframe_identifiers = [] if native_h3 else list(identifiers)
     existing=session.scalar(select(ProjectProductBinding).where(ProjectProductBinding.project_id==project_id,ProjectProductBinding.product_id==product.id))
     if existing:
         known={item['id']:item['sha256'] for item in existing.snapshot_json.get('images',[])}
@@ -576,10 +647,14 @@ def apply_studio_product_plan(session, settings, project_id, shots, plan):
     else:
         existing=ProjectProductBinding(project_id=project_id,product_id=product.id,snapshot_json=copy.deepcopy(frozen))
         session.add(existing)
-    # Use the entire nontrivial Latin brand phrase, not filenames or colors.
-    # If no such phrase exists, require explicit work rather than guessing.
-    brand=[x.casefold() for x in re.findall(r'[A-Za-z0-9]+', product.brand or product.name) if len(x)>=3]
-    if len(brand)<2:
+    # A user-configured brand is already an explicit identity anchor. Some
+    # legitimate brands (for example, Owala) are a single token; requiring two
+    # tokens rejected every project using those products. When no brand was
+    # configured, keep the stricter multi-token product-name rule.
+    explicit_brand=(product.brand or '').strip()
+    brand_source=explicit_brand or product.name
+    brand=[x.casefold() for x in re.findall(r'[A-Za-z0-9]+', brand_source) if len(x)>=3]
+    if not brand or (not explicit_brand and len(brand)<2):
         raise AppError(422,'product_script_anchor_missing','产品名称缺少足够的明确品牌词，无法从剧本安全匹配')
     from app.api.routes import project_shot_statement
     # Establish product lineage from the current complete script, even when
@@ -603,7 +678,36 @@ def apply_studio_product_plan(session, settings, project_id, shots, plan):
         tokens=set(re.findall(r'[a-z0-9]+',text))
         return all(term in tokens for term in brand)
     anchors={entity.id for entity in entities.values() if matches(entity)}
-    if not anchors:
+
+    # Word imports may retain the complete, explicit product-lock section but
+    # not create ProductionEntity/prop_states rows. In that case, use the full
+    # script as identity evidence, then preserve the stronger shot-level match
+    # below whenever imported shot prose exists.
+    project=session.get(m.Project,project_id)
+    current_script=production_context(session,script_shots[0])[2] if script_shots else None
+    source_text=((current_script.raw_text or '') if current_script else '') or ((project.source_text or '') if project else '')
+    brand_tokens=set(brand)
+    name_tokens=[x.casefold() for x in re.findall(r'[A-Za-z0-9]+',product.name or '')
+                 if len(x)>=3 and x.casefold() not in brand_tokens]
+    identity_tokens=[x.casefold() for x in re.findall(r'[A-Za-z0-9]+',product.name or '') if len(x)>=3]
+    source_tokens=set(re.findall(r'[a-z0-9]+', source_text.casefold()))
+    lock_markers=(
+        ('核心产品锁定', 'core_product_lock'),
+        ('核心商品锁定', 'core_product_lock'),
+        ('全片锁定', 'whole_film_product_lock'),
+        ('全片保持同一', 'whole_film_product_lock'),
+        ('same product throughout', 'whole_film_product_lock'),
+        ('product locked throughout', 'whole_film_product_lock'),
+    )
+    normalized_source=source_text.casefold()
+    lock_marker=next((key for phrase,key in lock_markers if phrase in normalized_source),None)
+    script_product_identity=bool(
+        source_text and identity_tokens and all(token in source_tokens for token in identity_tokens)
+    )
+    explicit_project_lock=bool(script_product_identity and lock_marker)
+    script_product_lock=bool(brand_tokens and brand_tokens.issubset(source_tokens) and name_tokens
+                             and all(token in source_tokens for token in name_tokens))
+    if not anchors and not explicit_project_lock:
         raise AppError(422,'product_script_anchor_missing','剧本道具没有明确匹配的产品品牌，未自动猜测绑定')
     linked=set(anchors)
     for ids in states.values():
@@ -611,29 +715,65 @@ def apply_studio_product_plan(session, settings, project_id, shots, plan):
     affected=[];skipped=[];changes=[]
     for shot in shots:
         matched=[entity_id for entity_id in states[shot.id] if entity_id in linked]
-        if not matched:continue
+        text_evidence=None
+        if not matched and script_product_lock:
+            shot_text=' '.join(str(getattr(shot,key,'') or '') for key in
+                ('scene_title','visual_prompt','action','narration','dialogue')).casefold()
+            shot_tokens=set(re.findall(r'[a-z0-9]+',shot_text))
+            if brand_tokens.issubset(shot_tokens):
+                text_evidence={'method':'exact_brand_in_shot','brand_tokens':sorted(brand_tokens)}
+            elif name_tokens and all(token in shot_tokens for token in name_tokens):
+                text_evidence={'method':'exact_product_model_in_shot','model_tokens':name_tokens}
+            elif (product.category or '').strip().casefold() in {
+                    'drinkware','drinkware product','水杯','保温杯','饮具','饮料容器'}:
+                object_match=re.search(
+                    r'保温杯|保温瓶|水杯|杯身|杯体|杯盖|杯子|'
+                    r'\b(?:water[ -]?bottle|tumbler|thermos|flask|travel mug|mug|bottle)\b',
+                    shot_text,re.I)
+                if object_match:
+                    text_evidence={'method':'explicit_product_lock_and_shot_category',
+                        'script_anchor_tokens':sorted(brand_tokens|set(name_tokens)),
+                        'shot_object_term':object_match.group(0)}
+            # The Word import path can produce shot titles while dropping all
+            # visual/action/narration/dialogue fields. Only those empty imported
+            # records may inherit an explicit full-project product lock.
+            shot_body=' '.join(str(getattr(shot,key,'') or '') for key in
+                ('visual_prompt','action','narration','dialogue')).strip()
+            if not text_evidence and explicit_project_lock and not shot_body:
+                text_evidence={'method':'explicit_project_lock_with_unparsed_shot_details',
+                    'product_identity_tokens':identity_tokens,'lock_marker':lock_marker,
+                    'source_text_sha256':hashlib.sha256(source_text.encode('utf-8')).hexdigest()}
+        if not matched and not text_evidence:continue
         if session.scalar(select(m.VideoRevision.id).where(m.VideoRevision.shot_id==shot.id).limit(1)):
             skipped.append({'shot_id':shot.id,'reason':'existing_video_preserved'})
             continue
         item=session.scalar(select(ShotProductBinding).where(ShotProductBinding.shot_id==shot.id,ShotProductBinding.product_id==product.id))
         previous=list(item.image_ids_json) if item else None
-        evidence={'method':'brand_anchor_and_same_shot_props','anchor_entity_ids':sorted(anchors),
-                  'matched_entity_ids':matched,'user_selection_reason':reason}
+        evidence={'method':'brand_anchor_and_same_shot_props' if matched else text_evidence['method'],
+                  'anchor_entity_ids':sorted(anchors),'matched_entity_ids':matched,
+                  'user_selection_reason':reason}
+        if text_evidence:
+            evidence['text_anchor']=text_evidence
         if item:
             if item.project_id!=project_id:raise AppError(409,'product_binding_conflict','镜头产品绑定属于其他项目')
             item.image_ids_json=list(identifiers)
-            item.state_json={**item.state_json,'keyframe_image_ids':list(identifiers),'automation_product_evidence':evidence}
+            item.state_json={**item.state_json,'keyframe_image_ids':keyframe_identifiers,'automation_product_evidence':evidence}
             item.revision+=1
         else:
             item=ShotProductBinding(project_id=project_id,shot_id=shot.id,product_id=product.id,image_ids_json=list(identifiers),
-                    state_json={'keyframe_image_ids':list(identifiers),'reference_selection_confirmed':False,'automation_product_evidence':evidence})
+                    state_json={'keyframe_image_ids':keyframe_identifiers,'reference_selection_confirmed':False,'automation_product_evidence':evidence})
             session.add(item)
-        affected.append({'shot_id':shot.id,'matched_entity_ids':matched})
+        affected_item={'shot_id':shot.id,'matched_entity_ids':matched}
+        if text_evidence:affected_item['text_anchor']=text_evidence
+        affected.append(affected_item)
         changes.append({'shot_id':shot.id,'previous_image_ids':previous,'image_ids':list(identifiers)})
     if not affected and not skipped:
         raise AppError(422,'product_script_shot_missing','没有镜头明确引用匹配的产品道具')
     result={'product_id':product.id,'image_ids':list(identifiers),'image_sha256':{x['id']:x['sha256'] for x in frozen['images']},
             'selection_reason':reason,'brand_tokens':brand,'anchor_entity_ids':sorted(anchors),'linked_entity_ids':sorted(linked),
+            'project_script_lock_used':explicit_project_lock,
+            'text_linked_shots':[{'shot_id':item['shot_id'],'evidence':item['text_anchor']}
+                for item in affected if item.get('text_anchor')],
             'affected_shots':affected,'skipped_shots':skipped,'changes':changes,
             'human_visual_approval':False,'keyframes':'input hashes change; existing keyframes require rebuild'}
     session.add(m.AuditEvent(object_type='project',object_id=project_id,action='studio_product_plan_applied',details_json=copy.deepcopy(result)))

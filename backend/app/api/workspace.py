@@ -260,6 +260,7 @@ def parse_import(session,settings,batch):
         session.rollback()
         raise AppError(409,'import_stale','预览已变化，请重新读取当前版本')
     session.commit()
+    session.expire_all()
     return import_public(get(session,m.WordImport,identifier),session)
 
 

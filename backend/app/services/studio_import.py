@@ -27,6 +27,39 @@ from app.services.word_screenplay import (block_lines, commit_import, duration_r
 
 SEMANTIC_REVIEW_WARNINGS = {'unresolved_semantics', 'suggested_attribution', 'suggested_split'}
 WORD_IMPORT_MODEL_WAIT_SECONDS = 40
+LOCAL_WORD_IMPORT_MAX_WAIT_SECONDS = 180
+LOCAL_WORD_IMPORT_DEFAULT_MAX_TOKENS = 2048
+LOCAL_WORD_IMPORT_MAX_TOKENS = 4096
+
+
+def _max_tokens_validation_limit(response):
+    """Return a local OpenAI-compatible server's advertised token ceiling."""
+    if response.status_code != 422:
+        return None
+    try:
+        detail = response.json().get('detail', [])
+    except Exception:
+        return None
+    if not isinstance(detail, list):
+        detail = [detail]
+    for item in detail:
+        if not isinstance(item, dict) or 'max_tokens' not in item.get('loc', []):
+            continue
+        limit = item.get('ctx', {}).get('le')
+        if isinstance(limit, int) and 1 <= limit <= 1_000_000:
+            return limit
+    return None
+
+
+def _language_request_timeout_seconds(service, snapshot):
+    """Use the configured bounded timeout for local cold starts, not for cloud calls."""
+    if service.provider != 'local_llm' or snapshot.get('is_cloud'):
+        return WORD_IMPORT_MODEL_WAIT_SECONDS
+    try:
+        configured = int(snapshot.get('settings', {}).get('timeout', WORD_IMPORT_MODEL_WAIT_SECONDS))
+    except (TypeError, ValueError):
+        configured = WORD_IMPORT_MODEL_WAIT_SECONDS
+    return min(max(configured, WORD_IMPORT_MODEL_WAIT_SECONDS), LOCAL_WORD_IMPORT_MAX_WAIT_SECONDS)
 
 
 def content_fingerprint(blocks):
@@ -86,7 +119,12 @@ def ambiguities(session, preview):
         text=item.get('text','').strip()
         if text and not text.startswith(structural):
             issues.append('未归类原文：'+text[:160])
-    return list(dict.fromkeys(issues))
+    # Unrecognized items from 【基础设定】/【氛围与画质】/【画面内容】 blocks are
+    # production constraints, not ambiguities — treat them as informational only.
+    # The visual_prompt on each shot carries the full scene description, so
+    # these blocks do not need to be resolved before generation can proceed.
+    blocking = [i for i in issues if not i.startswith('未归类原文：')]
+    return list(dict.fromkeys(blocking)) if blocking else list(dict.fromkeys(issues))
 
 
 def check_import_target(session, project_id, new_revision):
@@ -138,13 +176,53 @@ async def language_extract(session, settings, project_id, blocks, allow_cloud_co
     # The service snapshot and credential are enough for inference. Release the
     # read transaction before waiting for an external reply.
     session.rollback()
-    try:
-        response=await asyncio.wait_for(service_request(settings,snapshot,'POST','/chat/completions',secret,json={
+    is_local = service.provider == 'local_llm' and not snapshot.get('is_cloud')
+    requested_max_tokens=int(parameters.get('max_tokens',snapshot['settings'].get(
+        'max_tokens',LOCAL_WORD_IMPORT_DEFAULT_MAX_TOKENS if is_local else 12000)))
+    if is_local and requested_max_tokens > LOCAL_WORD_IMPORT_MAX_TOKENS:
+        receipt['max_tokens_capped']={
+            'requested_max_tokens':requested_max_tokens,
+            'max_tokens':LOCAL_WORD_IMPORT_MAX_TOKENS,
+            'reason':'local_word_parser_bounded_output',
+        }
+        requested_max_tokens=LOCAL_WORD_IMPORT_MAX_TOKENS
+    request_timeout=_language_request_timeout_seconds(service,snapshot)
+    payload={
             'model':snapshot['model_id'],'messages':[{'role':'system','content':instructions},
                 {'role':'user','content':json.dumps(source,ensure_ascii=False)}],
-            'response_format':{'type':'json_object'},'max_tokens':int(parameters.get('max_tokens',snapshot['settings'].get('max_tokens',12000))),
-            **({'temperature':parameters['temperature']} if 'temperature' in parameters else {})}),
-            timeout=WORD_IMPORT_MODEL_WAIT_SECONDS)
+            'response_format':{'type':'json_object'},'max_tokens':requested_max_tokens,
+            **({'temperature':parameters['temperature']} if 'temperature' in parameters else {})}
+
+    async def submit_request():
+        response=await asyncio.wait_for(service_request(settings,snapshot,'POST','/chat/completions',secret,json=payload),
+            timeout=request_timeout)
+        limit=_max_tokens_validation_limit(response)
+        # A local schema validation rejection means inference did not begin. Retry
+        # once at the server-declared ceiling; cloud calls and all other 422s remain
+        # single-attempt to avoid ambiguous cost or semantic failures.
+        if is_local and limit is not None and limit<requested_max_tokens:
+            retry_payload={**payload,'max_tokens':limit}
+            receipt['max_tokens_validation_retry']={
+                'first_status':response.status_code,
+                'requested_max_tokens':requested_max_tokens,
+                'retry_max_tokens':limit,
+            }
+            response=await asyncio.wait_for(service_request(settings,snapshot,'POST','/chat/completions',secret,json=retry_payload),
+                timeout=request_timeout)
+        return response
+
+    try:
+        if is_local:
+            from app.services.gpu_gate import local_llm_gpu_admission
+            from app.services.screenplay_runtime import ensure_local_service
+            await ensure_local_service(snapshot)
+            async with local_llm_gpu_admission(settings) as admission:
+                if admission is None:
+                    receipt.update(status='deferred',reason='本地GPU正在处理其他模型任务；已等待安全释放，未发送剧本文本')
+                    return None,receipt
+                response=await submit_request()
+        else:
+            response=await submit_request()
         receipt.update(http_status=response.status_code,provider_request_id=response.headers.get('x-request-id'))
         response.raise_for_status()
         payload=response.json();content=payload['choices'][0]['message']['content']
@@ -201,12 +279,15 @@ async def import_word(session, settings, filename, data, *, project_id=None,
     session.rollback()
     preview=await run_in_threadpool(build_ir,blocks,parse_blocks)
     parser={'mode':'local_source_preserving_rules','language_model_called':False}
-    issues=ambiguities(session,match_characters(session,deepcopy(preview)))
     # Explicit shots can go straight to review, with every unclassified source
     # line intact. Only incomplete or inferred shot structure needs extraction.
     needs_structure = (any(warning.get('kind') in SEMANTIC_REVIEW_WARNINGS for warning in preview['parse_warnings'])
         or any(not (shot['visual_prompt'] or shot['action'] or shot['dialogues']) for shot in preview['shots']))
-    if issues and needs_structure and not duration_review_issues(preview):
+    # A free-form Word can contain a complete narrative without producing a
+    # separate ambiguity record. Its unresolved-structure warning is itself
+    # sufficient reason to ask the configured local extractor for a grounded
+    # shot breakdown.
+    if needs_structure and not duration_review_issues(preview):
         session.rollback()
         try:
             extracted,parser=await language_extract(session,settings,project_id,blocks,allow_cloud_costs,allow_paid_fallback)
@@ -241,9 +322,14 @@ def _persist_word_import(session, settings, filename, data, blocks, sha, preview
         session.flush()
         check_import_target(session,project_id,new_revision)
         batch.preview_json=match_characters(session,deepcopy(preview))
-        issues=ambiguities(session,batch.preview_json)
-        if issues:
-            batch.error_message='；'.join(issues)[:12000]
+        all_issues=ambiguities(session,batch.preview_json)
+        # Split structural warnings (未归类原文) from real blockers.
+        # Unrecognized lines from bracket sections are production constraints
+        # that do not block generation; only identity/dialogue ambiguities do.
+        blocking=[i for i in all_issues if not i.startswith('未归类原文：')]
+        issues=all_issues
+        if blocking:
+            batch.error_message='；'.join(blocking)[:12000]
             return batch,issues
 
         payload=ImportConfirm(revision=batch.revision,duplicate_strategy='new_revision' if project_id else 'new_project',

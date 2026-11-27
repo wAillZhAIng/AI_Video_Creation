@@ -11,7 +11,7 @@ const mocked=vi.mocked(request);
 const ir={project:{name:' 原样项目 '},characters:[{key:'a',name:'记录员',profile:{age:32,description:'原创成年记录员'}}],scenes:[{key:'room',name:'控制室',environment:{lighting:'自然顶灯'}}],shots:[{key:'s1',scene_key:'room',title:'核对记录',duration_seconds:5,participants:[{character_key:'a',performance:{action:'查看记录'}}],dialogues:[{character_key:'a',text:'记录已核对。'}]}]};
 const baseJob=()=>({id:'job-1',project_name:' 原样项目 ',input_mode:'text',status:'awaiting_review',stage:'awaiting_review',revision:1,creative_prompt:'写实短片',story_text:'记录员核对记录。',screenplay:ir,counts:{characters:1,scenes:1,shots:1,dialogues:1},documents:[{id:'doc-1',version:1,download_url:'/api/screenplay/documents/doc-1/download',review_state:'pending',sha256:'a'.repeat(64)}],latest_document_id:'doc-1',project_id:null,uncertainties:[]});
 let eligible:boolean,job:any;
-function options(){return {modes:['text','image','video'].map(mode=>({input_mode:mode,slot:'screenplay_from_'+mode,name:mode,candidates:[{service_id:'local',model_id:'qwen',name:'本地视觉语言模型',provider:'local_llm',module:'language_processing',enabled:true,is_cloud:false,eligible,verification:eligible?'verified':'not_tested',reasons:eligible?[]:['没有该模式真实输出']}],default_service_id:'local',limits:{max_bytes:20*1024**2,max_duration_seconds:60,formats:mode==='image'?['PNG','JPEG','WebP']:['MP4','WebM']}})),services:[{id:'local',name:'本地视觉语言模型',enabled:true,provider:'local_llm',default_model:'qwen'}]};}
+function options(){return {modes:['text','image','video'].map(mode=>({input_mode:mode,slot:'screenplay_from_'+mode,name:mode,candidates:[{service_id:'local',model_id:'qwen',name:'本地视觉语言模型',provider:'local_llm',module:'language_processing',enabled:true,is_cloud:false,eligible,verification:eligible?'verified':'not_tested',reasons:eligible?[]:['没有该模式真实输出']}],default_service_id:'local',limits:{max_bytes:20*1024**2,formats:mode==='image'?['PNG','JPEG','WebP']:['MP4','WebM']}})),services:[{id:'local',name:'本地视觉语言模型',enabled:true,provider:'local_llm',default_model:'qwen'}]};}
 beforeEach(()=>{eligible=true;job=baseJob();mocked.mockImplementation(async(url,init)=>{
   if(url==='/api/screenplay/options')return options();
   if(url==='/api/screenplay/jobs'&&!init?.method)return [];
@@ -139,7 +139,7 @@ it('exports a new Word version from saved IR without submitting another model re
   const user=userEvent.setup();mount('?job=job-1');await screen.findByRole('button',{name:'使用已有剧本导出新 Word 版本'});
   await user.click(screen.getByLabelText('剧本内容审核通过'));await user.click(screen.getByRole('button',{name:'使用已有剧本导出新 Word 版本'}));
   await screen.findByText('已使用保存的结构化剧本导出独立 Word 版本，没有重新调用创作模型。');
-  expect(screen.getByLabelText('剧本内容审核通过')).not.toBeChecked();expect(screen.getByLabelText('本次审核的 Word 版本')).toHaveValue('doc-2');
+  expect(screen.getByLabelText('剧本内容审核通过')).not.toBeChecked();expect(screen.getByLabelText('Word 版本')).toHaveValue('doc-2');
   expect(screen.queryByLabelText('审核通过后创建项目')).not.toBeInTheDocument();
   expect(mocked.mock.calls.filter(([,init])=>init?.method==='POST').map(([url])=>url)).toEqual(['/api/screenplay/jobs/job-1/export-new-version']);
 });

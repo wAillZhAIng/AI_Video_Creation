@@ -206,10 +206,9 @@ def _adapt_prompt(prompt: str, negative: str):
                    'camera, timing, dialogue and sound.' + tail)
         result = result.replace(matches[0], compact, 1)
         adjustment = 'system_rules_compacted'
-        if len(result) > 7000:
-            result, compacted = _compact_placeholder_contacts(result)
-            if compacted:
-                adjustment = 'system_rules_and_placeholder_contacts_compacted'
+        result, compacted = _compact_placeholder_contacts(result)
+        if compacted:
+            adjustment = 'system_rules_and_placeholder_contacts_compacted'
         if len(result) > 7000:
             previous = result
             result, aliases = _compact_repeated_references(result)

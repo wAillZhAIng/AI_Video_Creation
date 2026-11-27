@@ -81,7 +81,7 @@ export default function App() {
           <Route path="/review" element={<ReviewPage />} />
           <Route path="/final" element={<AssemblyPage />} />
           <Route path="/final/legacy" element={<FinalPage />} />
-          <Route path="/publishing" element={<PublishingPage />} />
+          <Route path="/publishing" element={<Navigate to="/" replace />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/settings/ai-services" element={<SettingsPage />} />
           <Route path="/settings/:section" element={<SettingsPage />} />
