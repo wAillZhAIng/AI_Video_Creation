@@ -79,11 +79,11 @@ export function ProjectCustomLoras({ projectId, shots, disabled }: { projectId: 
     <div className="studio-section-heading"><div><h3>自定义 LoRA（可选）</h3>
       <p>自动扫描 <code>{scan?.lora_dir || 'ComfyUI/models/loras'}</code>，新放入的 <code>.safetensors</code> 点“重新扫描”即可使用。开启后在 H3 模型链（加速 LoRA 之后）动态串联；关闭时工作流完全不变。</p></div>
       <button type="button" className="button button-secondary button-small" disabled={locked} onClick={() => setReload(value => value + 1)}>重新扫描</button></div>
-    {scan ? <p className="form-hint">当前基座：<code>{scan.base_model || '未识别'}</code> · 可用 {usable.length} / {scan.items.length} 个（不兼容的 LoRA 不可选择）</p> : null}
+    {scan ? <p className="form-hint">当前基座：<code>{scan.base_model || '未识别'}</code> · 可用 {usable.length} / {(scan?.items || []).length} 个（不兼容的 LoRA 不可选择）</p> : null}
     {loading ? <p role="status">扫描 LoRA 目录并校验基座兼容性…</p> : null}
     {error ? <p role="alert" className="inline-notice warning">{error}</p> : null}
     {notice ? <p role="status" className="inline-notice">{notice}</p> : null}
-    {scan?.items.length ? <ul className="custom-lora-scan">{scan.items.map(item => <li key={item.name}>
+    {(scan?.items || []).length ? <ul className="custom-lora-scan">{(scan?.items || []).map(item => <li key={item.name}>
       <strong>{item.name}</strong> · {(item.size_bytes / 1048576).toFixed(0)} MB · <span className={`custom-lora-status custom-lora-${item.compatibility.status}`}>{STATUS_LABELS[item.compatibility.status]}</span>
       {item.available_in_comfyui === false ? ' · ComfyUI 尚未识别（需刷新 ComfyUI 模型列表）' : ''}<br/><small>{item.compatibility.reason}</small></li>)}</ul>
       : (!loading ? <p className="form-hint">LoRA 目录中没有可选的自定义 LoRA。</p> : null)}
