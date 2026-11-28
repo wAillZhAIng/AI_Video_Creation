@@ -50,6 +50,9 @@ def detect_video_shots(
     source_path: Path,
     source_duration: float,
     sha256: str,
+    *,
+    scene_threshold: float = SCENE_THRESHOLD,
+    timeout_seconds: int = DETECT_TIMEOUT_SECONDS,
 ) -> list[tuple[float, float]]:
     """Detect clean single-shot intervals with fast downscaled FFmpeg probe + cache.
 
@@ -58,11 +61,14 @@ def detect_video_shots(
     """
     if not math.isfinite(source_duration) or source_duration <= 0:
         return []
-    cache_key = f"{sha256}:{round(source_duration, 3)}"
+    threshold = max(0.05, min(0.95, float(scene_threshold)))
+    threshold_suffix = "" if abs(threshold - SCENE_THRESHOLD) < 1e-6 else f":t{round(threshold, 3)}"
+    cache_key = f"{sha256}:{round(source_duration, 3)}{threshold_suffix}"
     if cache_key in _MEMORY_CACHE:
         return list(_MEMORY_CACHE[cache_key])
 
-    cache_file = _CACHE_DIR / f"{sha256}-{round(source_duration, 3)}.json"
+    file_suffix = "" if not threshold_suffix else f"-t{round(threshold, 3)}"
+    cache_file = _CACHE_DIR / f"{sha256}-{round(source_duration, 3)}{file_suffix}.json"
     try:
         if cache_file.is_file():
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
@@ -93,7 +99,7 @@ def detect_video_shots(
             "-sn",
             "-dn",
             "-vf",
-            f"scale=320:-1,select='gt(scene,{SCENE_THRESHOLD})',showinfo",
+            f"scale=320:-1,select='gt(scene,{threshold})',showinfo",
             "-f",
             "null",
             "-",
@@ -102,7 +108,7 @@ def detect_video_shots(
             cmd,
             capture_output=True,
             text=True,
-            timeout=DETECT_TIMEOUT_SECONDS,
+            timeout=max(10, int(timeout_seconds)),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if proc.returncode != 0:
@@ -120,6 +126,103 @@ def detect_video_shots(
         return list(segments)
     except Exception:
         return fallback
+
+
+def plan_long_video_shots(
+    segments: list[tuple[float, float]],
+    source_duration: float,
+    *,
+    min_shot_seconds: float = 2.5,
+    max_shot_seconds: float = 8.0,
+    target_shot_seconds: float = 5.0,
+    guard_margin_seconds: float = 0.12,
+) -> list[dict[str, Any]]:
+    """Convert raw scene segments from a long video into H3-safe, physically stable shots.
+
+    Guarantees:
+    - Merges sub-``min_shot_seconds`` flash fragments into neighboring shots.
+    - Subdivides long continuous takes exceeding ``max_shot_seconds`` (capped at 15s)
+      into balanced sub-shots around ``target_shot_seconds`` to prevent physical drift.
+    - Applies an interior boundary guard margin at scene cuts so adjacent transition
+      frames never bleed into a shot's reference clip.
+    """
+    if not math.isfinite(source_duration) or source_duration <= 0:
+        return []
+    duration = round(float(source_duration), 3)
+    safe_max = max(2.0, min(15.0, float(max_shot_seconds)))
+    safe_min = max(1.0, min(safe_max, float(min_shot_seconds)))
+    safe_target = max(safe_min, min(safe_max, float(target_shot_seconds)))
+    safe_guard = max(0.0, min(0.5, float(guard_margin_seconds)))
+
+    cleaned = sorted(
+        (max(0.0, round(float(s), 3)), min(duration, round(float(e), 3)))
+        for s, e in (segments or [(0.0, duration)])
+        if math.isfinite(s) and math.isfinite(e) and min(duration, float(e)) > max(0.0, float(s)) + 0.05
+    )
+    if not cleaned:
+        cleaned = [(0.0, duration)]
+
+    # 1. Merge fragments shorter than safe_min with adjacent segments.
+    merged: list[list[float]] = []
+    for start, end in cleaned:
+        if not merged:
+            merged.append([start, end])
+            continue
+        seg_len = end - start
+        prev_len = merged[-1][1] - merged[-1][0]
+        if seg_len < safe_min or prev_len < safe_min:
+            merged[-1][1] = end
+        else:
+            merged.append([start, end])
+    if len(merged) >= 2 and (merged[-1][1] - merged[-1][0]) < safe_min:
+        merged[-2][1] = merged[-1][1]
+        merged.pop()
+
+    # 2. Subdivide segments exceeding safe_max into balanced windows.
+    planned_raw: list[tuple[float, float, str]] = []
+    single_source = len(merged) == 1
+    for start, end in merged:
+        seg_len = end - start
+        if seg_len <= safe_max + 1e-6:
+            strategy = "single_segment" if single_source else "scene_cut"
+            planned_raw.append((round(start, 3), round(end, 3), strategy))
+            continue
+        pieces = max(2, int(math.ceil(seg_len / safe_target)))
+        while (seg_len / pieces) > safe_max + 1e-6:
+            pieces += 1
+        step = seg_len / pieces
+        for idx in range(pieces):
+            sub_start = start + idx * step
+            sub_end = end if idx == pieces - 1 else start + (idx + 1) * step
+            planned_raw.append((round(sub_start, 3), round(sub_end, 3), "subdivided_long_take"))
+
+    # 3. Apply interior guard margin at cut boundaries without collapsing below safe floor.
+    results: list[dict[str, Any]] = []
+    total_count = len(planned_raw)
+    min_floor = min(duration, max(0.5, min(2.0, safe_min)))
+    for idx, (raw_start, raw_end, strategy) in enumerate(planned_raw, start=1):
+        trim_start, trim_end = raw_start, raw_end
+        if total_count > 1 and safe_guard > 0:
+            left_pad = safe_guard if idx > 1 else 0.0
+            right_pad = safe_guard if idx < total_count else 0.0
+            if (trim_end - trim_start) - (left_pad + right_pad) >= min_floor:
+                trim_start = round(trim_start + left_pad, 3)
+                trim_end = round(trim_end - right_pad, 3)
+        trim_start = max(0.0, min(trim_start, max(0.0, duration - 0.05)))
+        trim_end = min(duration, max(trim_start + 0.05, trim_end))
+        clip_duration = round(trim_end - trim_start, 2)
+        shot_duration = round(max(1.0, min(15.0, clip_duration)), 1)
+        results.append({
+            "index": idx,
+            "raw_start_seconds": raw_start,
+            "raw_end_seconds": raw_end,
+            "trim_start_seconds": round(trim_start, 3),
+            "trim_end_seconds": round(trim_end, 3),
+            "clip_duration_seconds": clip_duration,
+            "duration_seconds": shot_duration,
+            "source_cut_strategy": strategy,
+        })
+    return results
 
 
 def _safe_clamp(

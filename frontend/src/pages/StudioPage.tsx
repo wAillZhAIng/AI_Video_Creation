@@ -6,6 +6,7 @@ import type { PipelineStart, StudioOverview } from '../lib/studio-contract';
 import { PageHeader, EmptyState, LoadingState, FormField } from '../components/ui';
 import { useStudio, StudioProjectPicker, StudioStatus, recordText, shotTime, studioAssetPath, studioVideoDuration } from '../lib/studio-ui';
 import { WORD_FILE_ACCEPT, WordImportPanel } from '../components/WordImportPanel';
+import { LongVideoReplicationPanel } from '../components/LongVideoReplicationPanel';
 import { ProjectProductPreparation } from '../components/ProjectProductPreparation';
 import { ProjectProductReferences, type ProductReferenceState } from '../components/ProjectProductReferences';
 import { ProjectProductionModels } from '../components/ProjectProductionModels';
@@ -231,6 +232,15 @@ export function StudioPage() {
         <div className="studio-import-bottom"><div className="studio-actions"><button type="submit" value="automatic" className="button button-primary" disabled={importDisabled}><FileUp size={16}/>{busy === 'import' ? '正在导入…' : '导入并自动成片'}</button><button type="submit" value="prepare" className="button button-secondary" disabled={importDisabled}>仅导入，先配置素材</button></div></div>
       </form>
     </section>
+    <LongVideoReplicationPanel
+      disabled={pageBusy||preparationUnsettled||Boolean(pendingImport)}
+      quality={quality.profile && quality.supported ? quality.settings : undefined}
+      onCreated={async created => {
+        await studio.refreshList();
+        studio.selectProject(created.project_id);
+        setNotice(`已从长视频「${created.video_name}」自动拆分为 ${created.shot_count} 个分镜（画幅 ${created.aspect_ratio}）。可按需补充人物/产品参考图，再点击「开始／增量续作」。`);
+      }}
+    />
     {pendingImport?<div id="word-import-review">
       <p className="inline-notice" role="status">{notice || 'Word 已保存，正在等待审核。'}</p>
       <WordImportPanel key={pendingImport.id} importId={pendingImport.id} studioMode initialProjectId={pendingImport.projectId} onBusyChange={setImportReviewBusy} onClose={()=>{setPendingImport(null);setNotice('');}} onImported={async id=>{

@@ -35,7 +35,7 @@ from app.models.reference_video import ReferenceVideo, VideoAnalysis, StyleProfi
 from app.services.gpu_gate import gpu_submission
 
 ANALYSIS_VERSION = 'reference-video-local-1'
-MAX_BYTES = 256 * 1024**2
+MAX_BYTES = 1024 * 1024**2
 FORMATS = {'.mp4', '.mov', '.mkv', '.webm'}
 LOCAL_SNAPSHOT = {'provider': 'local_llm', 'base_url': 'http://127.0.0.1:8771/v1',
                   'model_id': 'Qwen/Qwen3-VL-2B-Instruct', 'is_cloud': False}
@@ -97,7 +97,7 @@ def import_video(session, settings, filename, data, *, name='', category='', sou
     if extension not in FORMATS:
         raise AppError(415, 'reference_video_format', '参考视频支持MP4、MOV、MKV和WebM')
     if not data or len(data) > MAX_BYTES:
-        raise AppError(413, 'reference_video_size', '参考视频为空或超过256MiB')
+        raise AppError(413, 'reference_video_size', '参考视频为空或超过1GiB')
     sha = digest(data)
     existing = session.scalar(select(ReferenceVideo).where(ReferenceVideo.sha256 == sha, ReferenceVideo.state == 'active'))
     if existing:
